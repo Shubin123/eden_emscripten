@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "common/assert.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -16,6 +18,10 @@
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#ifdef HAS_WEBGPU
+#include "video_core/renderer_webgpu/renderer_webgpu.h"
+#include "video_core/renderer_webgpu/wgpu_thread.h"
+#endif
 
 namespace VideoCommon::GPUThread {
 
@@ -25,8 +31,53 @@ ThreadManager::ThreadManager(Core::System& system_)
 
 ThreadManager::~ThreadManager() = default;
 
+void ThreadManager::ProcessCommand(VideoCore::RendererBase& renderer, Tegra::Control::Scheduler& scheduler,
+                                   CommandDataContainer& next) {
+    if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+        scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+    } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+        system.GPU().TickWork();
+    } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
+        renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
+    } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
+        renderer.ReadRasterizer()->OnCacheInvalidation(invalidate->addr, invalidate->size);
+    } else {
+        ASSERT(false);
+    }
+    state.signaled_fence.store(next.fence);
+    if (next.block) {
+        // We have to lock the write_lock to ensure that the condition_variable wait not get a
+        // race between the check and the lock itself.
+        std::scoped_lock lk{state.write_lock};
+        state.cv.notify_all();
+    }
+}
+
 void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Frontend::GraphicsContext& context, Tegra::Control::Scheduler& scheduler) {
     rasterizer = renderer.ReadRasterizer();
+#ifdef HAS_WEBGPU
+    if (renderer.GetDeviceVendor() == "WebGPU") {
+        auto* webgpu = static_cast<WebGPU::RendererWebGPU*>(&renderer);
+        // WebGPU needs its thread to return to the browser event loop, so commands are pumped
+        // from there instead of a blocking loop.
+        auto& gpu_thread = WebGPU::Thread::Get();
+        gpu_thread.RunSync([&] { system.RegisterHostThread(); });
+        uses_pump = true;
+        gpu_thread.SetPump([this, &renderer, &scheduler, webgpu] {
+            const auto start = std::chrono::steady_clock::now();
+            CommandDataContainer next;
+            while (state.queue.TryPop(next)) {
+                ProcessCommand(renderer, scheduler, next);
+                if (webgpu->TakePresented() ||
+                    std::chrono::steady_clock::now() - start > std::chrono::milliseconds(12)) {
+                    return true;
+                }
+            }
+            return false;
+        });
+        return;
+    }
+#endif
     thread = std::jthread([&](std::stop_token stop_token) {
         Common::SetCurrentThreadName("GPU");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
@@ -40,24 +91,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             if (stop_token.stop_requested()) {
                 break;
             }
-            if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
-                scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
-            } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
-                system.GPU().TickWork();
-            } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
-                renderer.ReadRasterizer()->FlushRegion(flush->addr, flush->size);
-            } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
-                renderer.ReadRasterizer()->OnCacheInvalidation(invalidate->addr, invalidate->size);
-            } else {
-                ASSERT(false);
-            }
-            state.signaled_fence.store(next.fence);
-            if (next.block) {
-                // We have to lock the write_lock to ensure that the condition_variable wait not get a
-                // race between the check and the lock itself.
-                std::scoped_lock lk{state.write_lock};
-                state.cv.notify_all();
-            }
+            ProcessCommand(renderer, scheduler, next);
         }
     });
 }
@@ -104,6 +138,11 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+#ifdef HAS_WEBGPU
+    if (uses_pump) {
+        WebGPU::Thread::Get().Notify();
+    }
+#endif
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
@@ -115,6 +154,12 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 }
 
 void ThreadManager::NotifyShutdown() {
+#ifdef HAS_WEBGPU
+    if (uses_pump) {
+        WebGPU::Thread::Get().SetPump(nullptr);
+        uses_pump = false;
+    }
+#endif
     if (thread.joinable()) {
         thread.request_stop();
         thread.join();

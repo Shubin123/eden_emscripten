@@ -800,6 +800,20 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
     const Tegra::FramebufferConfig& config, DAddr cpu_addr) {
     // TODO: Properly implement this
     const auto it = page_table.find(cpu_addr >> YUZU_PAGEBITS);
+    static u32 fb_debug_logs = 0;
+    if (fb_debug_logs < 20) {
+        ++fb_debug_logs;
+        LOG_INFO(Render, "TryFindFramebufferImageView addr {:#x} page {:#x} hit_page {}",
+                 cpu_addr, cpu_addr >> YUZU_PAGEBITS, it != page_table.end());
+        if (it != page_table.end()) {
+            for (const ImageMapId map_id : it->second) {
+                const ImageMapView& map = slot_map_views[map_id];
+                const ImageBase& image = slot_images[map.image_id];
+                LOG_INFO(Render, "  map_id {} image_id {} image.cpu_addr {:#x} views {}",
+                         map_id.index, map.image_id.index, image.cpu_addr, image.image_view_ids.size());
+            }
+        }
+    }
     if (it == page_table.end()) {
         return {};
     }

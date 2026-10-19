@@ -15,6 +15,10 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_null/renderer_null.h"
+#ifdef HAS_WEBGPU
+// Before the Vulkan headers, which define X11 macros such as Success.
+#include "video_core/renderer_webgpu/renderer_webgpu.h"
+#endif
 #ifdef HAS_OPENGL
 #include "video_core/renderer_opengl/renderer_opengl.h"
 #endif
@@ -33,6 +37,10 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
         return std::make_unique<OpenGL::RendererOpenGL>(emu_window, device_memory, gpu, std::move(context));
 #endif
     case Settings::RendererBackend::Vulkan:
+#ifdef HAS_WEBGPU
+        // Browsers have no Vulkan; WebGPU takes its place.
+        return std::make_unique<WebGPU::RendererWebGPU>(emu_window, device_memory, gpu, std::move(context));
+#endif
         return std::make_unique<Vulkan::RendererVulkan>(emu_window, device_memory, gpu, std::move(context));
     case Settings::RendererBackend::Null:
         return std::make_unique<Null::RendererNull>(emu_window, gpu, std::move(context));

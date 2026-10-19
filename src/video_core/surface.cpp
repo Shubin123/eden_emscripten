@@ -199,6 +199,8 @@ PixelFormat PixelFormatFromRenderTargetFormat(Tegra::RenderTargetFormat format) 
         return PixelFormat::R8_SINT;
     case Tegra::RenderTargetFormat::R8_UINT:
         return PixelFormat::R8_UINT;
+    case Tegra::RenderTargetFormat::NONE:
+        return PixelFormat::Invalid;
     default:
         UNIMPLEMENTED_MSG("Unimplemented format={}", format);
         return PixelFormat::A8B8G8R8_UNORM;

@@ -405,6 +405,40 @@ if (ENABLE_OPENGL)
     )
 endif()
 
+if (EMSCRIPTEN)
+    target_sources(video_core PRIVATE
+        renderer_webgpu/renderer_webgpu.cpp
+        renderer_webgpu/renderer_webgpu.h
+        renderer_webgpu/wgpu_present.cpp
+        renderer_webgpu/wgpu_present.h
+        renderer_webgpu/wgpu_rasterizer.cpp
+        renderer_webgpu/wgpu_rasterizer.h
+        renderer_webgpu/wgpu_thread.cpp
+        renderer_webgpu/wgpu_thread.h
+        renderer_webgpu/maxwell_to_wgpu.h
+        renderer_webgpu/wgpu_blit.cpp
+        renderer_webgpu/wgpu_blit.h
+        renderer_webgpu/wgpu_buffer_cache.cpp
+        renderer_webgpu/wgpu_buffer_cache.h
+        renderer_webgpu/wgpu_buffer_cache_base.cpp
+        renderer_webgpu/wgpu_pipeline_cache.cpp
+        renderer_webgpu/wgpu_pipeline_cache.h
+        renderer_webgpu/wgpu_formats.cpp
+        renderer_webgpu/wgpu_formats.h
+        renderer_webgpu/wgpu_scheduler.cpp
+        renderer_webgpu/wgpu_scheduler.h
+        renderer_webgpu/wgpu_texture_cache.cpp
+        renderer_webgpu/wgpu_texture_cache.h
+        renderer_webgpu/wgpu_texture_cache_base.cpp
+        renderer_webgpu/wgpu_uniform_ring.cpp
+        renderer_webgpu/wgpu_uniform_ring.h
+    )
+    target_compile_options(video_core PRIVATE --use-port=emdawnwebgpu)
+    target_link_options(video_core INTERFACE --use-port=emdawnwebgpu
+        "--js-library=${CMAKE_CURRENT_SOURCE_DIR}/renderer_webgpu/eden_webgpu.js")
+    target_compile_definitions(video_core PUBLIC HAS_WEBGPU)
+endif()
+
 target_link_libraries(video_core PUBLIC common core)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
 if (ENABLE_OPENGL)

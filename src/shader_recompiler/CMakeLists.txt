@@ -246,6 +246,36 @@ if (ENABLE_OPENGL)
         backend/glsl/var_alloc.h)
 endif()
 
+if (EMSCRIPTEN)
+    target_sources(shader_recompiler PRIVATE
+        backend/wgsl/emit_wgsl.cpp
+        backend/wgsl/emit_wgsl.h
+        backend/wgsl/emit_wgsl_atomic.cpp
+        backend/wgsl/emit_wgsl_barriers.cpp
+        backend/wgsl/emit_wgsl_bitwise_conversion.cpp
+        backend/wgsl/emit_wgsl_composite.cpp
+        backend/wgsl/emit_wgsl_context_get_set.cpp
+        backend/wgsl/emit_wgsl_control_flow.cpp
+        backend/wgsl/emit_wgsl_convert.cpp
+        backend/wgsl/emit_wgsl_floating_point.cpp
+        backend/wgsl/emit_wgsl_image.cpp
+        backend/wgsl/emit_wgsl_instructions.h
+        backend/wgsl/emit_wgsl_integer.cpp
+        backend/wgsl/emit_wgsl_logical.cpp
+        backend/wgsl/emit_wgsl_memory.cpp
+        backend/wgsl/emit_wgsl_not_implemented.cpp
+        backend/wgsl/emit_wgsl_select.cpp
+        backend/wgsl/emit_wgsl_shared_memory.cpp
+        backend/wgsl/emit_wgsl_special.cpp
+        backend/wgsl/emit_wgsl_undefined.cpp
+        backend/wgsl/emit_wgsl_warp.cpp
+        backend/wgsl/var_alloc.cpp
+        backend/wgsl/var_alloc.h
+        backend/wgsl/wgsl_emit_context.cpp
+        backend/wgsl/wgsl_emit_context.h
+    )
+endif()
+
 target_link_libraries(shader_recompiler PUBLIC common fmt::fmt sirit::sirit)
 
 if (MSVC)

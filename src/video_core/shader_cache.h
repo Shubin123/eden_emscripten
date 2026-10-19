@@ -71,7 +71,6 @@ public:
     /// @brief Flushes delayed removal operations
     void SyncGuestHost();
 
-protected:
     struct GraphicsEnvironments {
         std::array<GraphicsEnvironment, NUM_PROGRAMS> envs;
         std::array<Shader::Environment*, NUM_PROGRAMS> env_ptrs{};
@@ -81,6 +80,7 @@ protected:
         }
     };
 
+protected:
     explicit ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory);
 
     /// @brief Update the hashes and information of shader stages
