@@ -227,6 +227,10 @@ endif()
 option(YUZU_USE_BUNDLED_SDL3 "Download bundled SDL3 build" ${EXT_DEFAULT})
 
 # ffmpeg
+option(ENABLE_FFMPEG "Enable FFmpeg video decoding" ON)
+if (EMSCRIPTEN)
+    set(ENABLE_FFMPEG OFF)
+endif()
 option(YUZU_USE_BUNDLED_FFMPEG "Download bundled FFmpeg" ${EXT_DEFAULT})
 cmake_dependent_option(YUZU_USE_EXTERNAL_FFMPEG "Build FFmpeg from external source" "${SOLARIS}" "NOT WIN32 AND NOT ANDROID" OFF)
 
@@ -399,6 +403,16 @@ endif()
 
 if (OpenSSL_ADDED)
     add_compile_definitions(YUZU_BUNDLED_OPENSSL)
+endif()
+
+if (EMSCRIPTEN)
+    if (NOT TARGET OpenSSL::Crypto)
+        add_library(OpenSSL::Crypto INTERFACE IMPORTED GLOBAL)
+    endif()
+    if (NOT TARGET OpenSSL::SSL)
+        add_library(OpenSSL::SSL INTERFACE IMPORTED GLOBAL)
+        target_link_libraries(OpenSSL::SSL INTERFACE OpenSSL::Crypto)
+    endif()
 endif()
 
 message(STATUS "Fetching needed dependencies with CPM")
@@ -648,7 +662,7 @@ if (ENABLE_QT)
     AddJsonPackage(quazip)
 endif()
 
-if (NOT YUZU_STATIC_ROOM AND NOT (YUZU_USE_BUNDLED_FFMPEG OR YUZU_USE_EXTERNAL_FFMPEG))
+if (ENABLE_FFMPEG AND NOT YUZU_STATIC_ROOM AND NOT (YUZU_USE_BUNDLED_FFMPEG OR YUZU_USE_EXTERNAL_FFMPEG))
     # Use system installed FFmpeg
     find_package(FFmpeg REQUIRED QUIET COMPONENTS ${FFmpeg_COMPONENTS})
 

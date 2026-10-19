@@ -415,10 +415,14 @@ if (YUZU_USE_EXTERNAL_FFMPEG)
     add_dependencies(video_core ffmpeg-build)
 endif()
 
-target_include_directories(video_core PUBLIC ${FFmpeg_INCLUDE_DIR})
-
-target_link_libraries(video_core PRIVATE ${FFmpeg_LIBRARIES})
-target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
+if (ENABLE_FFMPEG)
+    target_include_directories(video_core PUBLIC ${FFmpeg_INCLUDE_DIR})
+    target_link_libraries(video_core PRIVATE ${FFmpeg_LIBRARIES})
+    target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
+    target_compile_definitions(video_core PUBLIC ENABLE_FFMPEG=1)
+else()
+    target_compile_definitions(video_core PUBLIC ENABLE_FFMPEG=0)
+endif()
 
 add_dependencies(video_core host_shaders)
 target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
