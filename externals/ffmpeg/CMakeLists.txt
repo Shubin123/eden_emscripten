@@ -11,7 +11,23 @@ set(FFmpeg_HWACCEL_LDFLAGS)
 
 if (NOT YUZU_USE_BUNDLED_FFMPEG)
     set(FFmpeg_CROSS_COMPILE_FLAGS "")
-    if (ANDROID)
+    if (EMSCRIPTEN)
+        # Plain C only: no assembly or platform-specific code paths exist for Wasm.
+        list(APPEND FFmpeg_CROSS_COMPILE_FLAGS
+            --enable-cross-compile
+            --arch=x86_64
+            --target-os=none
+            --disable-asm
+            --disable-runtime-cpudetect
+            --disable-autodetect
+            --ld=${CMAKE_C_COMPILER}
+            --ar=${CMAKE_AR}
+            --ranlib=${CMAKE_RANLIB}
+            --nm=${EMSCRIPTEN_ROOT_PATH}/emnm
+            "--extra-ldflags=${CMAKE_EXE_LINKER_FLAGS}"
+        )
+        set(FFmpeg_IS_CROSS_COMPILING TRUE)
+    elseif (ANDROID)
         # TODO: Maybe use CMAKE_SYSROOT? and probably provide a toolchain file for android
         # I mean isn't that the "proper" way anyways?
         string(TOLOWER "${CMAKE_HOST_SYSTEM_NAME}" FFmpeg_HOST_SYSTEM_NAME)
@@ -54,7 +70,7 @@ if (NOT YUZU_USE_BUNDLED_FFMPEG)
     endif()
 endif()
 
-if (OPENORBIS OR MANAGARM)
+if (OPENORBIS OR MANAGARM OR EMSCRIPTEN)
     # Doesn't support VA-API, don't go thru the embarrassment of trying to enable it
     list(APPEND FFmpeg_HWACCEL_FLAGS --disable-vaapi)
 elseif (ANDROID)
@@ -215,9 +231,10 @@ else()
     endif()
 
     find_program(AUTOCONF autoconf)
-    if ("${AUTOCONF}" STREQUAL "AUTOCONF-NOTFOUND")
+    if ("${AUTOCONF}" STREQUAL "AUTOCONF-NOTFOUND" AND NOT EMSCRIPTEN)
         message(FATAL_ERROR "Required program `autoconf` not found.")
     endif()
+    find_program(FFmpeg_MAKE_PROGRAM NAMES gmake make REQUIRED)
 
     AddJsonPackage(ffmpeg)
 
@@ -307,7 +324,7 @@ else()
         OUTPUT
             ${FFmpeg_BUILD_LIBRARIES}
         COMMAND
-            gmake ${FFmpeg_MAKE_ARGS}
+            ${FFmpeg_MAKE_PROGRAM} ${FFmpeg_MAKE_ARGS}
         WORKING_DIRECTORY
             ${FFmpeg_BUILD_DIR}
     )

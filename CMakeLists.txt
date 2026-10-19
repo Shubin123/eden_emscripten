@@ -40,6 +40,12 @@ elseif (NETBSD)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L${CMAKE_SYSROOT}/usr/X11R7/lib")
 endif()
 
+# Eden assumes a 64-bit host and needs more than 4 GiB of address space, so Wasm builds target
+# Memory64 with pthreads. The flags must be present before project() (see tools/web/build.sh).
+if (EMSCRIPTEN AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "Emscripten builds require -sMEMORY64=1 in CFLAGS/CXXFLAGS; use tools/web/build.sh")
+endif()
+
 # NetBSD: Fun for the whole family!
 if (NETBSD)
     set(ENV{PKG_CONFIG_PATH} "${PKG_CONFIG_PATH}:${CMAKE_SYSROOT}/usr/pkg/lib/ffmpeg7/pkgconfig")
@@ -228,11 +234,13 @@ option(YUZU_USE_BUNDLED_SDL3 "Download bundled SDL3 build" ${EXT_DEFAULT})
 
 # ffmpeg
 option(ENABLE_FFMPEG "Enable FFmpeg video decoding" ON)
-if (EMSCRIPTEN)
-    set(ENABLE_FFMPEG OFF)
-endif()
 option(YUZU_USE_BUNDLED_FFMPEG "Download bundled FFmpeg" ${EXT_DEFAULT})
 cmake_dependent_option(YUZU_USE_EXTERNAL_FFMPEG "Build FFmpeg from external source" "${SOLARIS}" "NOT WIN32 AND NOT ANDROID" OFF)
+if (EMSCRIPTEN)
+    # There is no system FFmpeg to link against for Wasm.
+    set(YUZU_USE_BUNDLED_FFMPEG OFF)
+    set(YUZU_USE_EXTERNAL_FFMPEG ON)
+endif()
 
 # sirit
 set(BUNDLED_SIRIT_DEFAULT OFF)
@@ -392,27 +400,30 @@ if (YUZU_USE_BUNDLED_OPENSSL)
     set(BUILD_SHARED_LIBS OFF)
     AddJsonPackage(openssl-ci)
 else()
-    AddJsonPackage(openssl)
+    if (EMSCRIPTEN)
+        # Reconfiguring would otherwise pick up the cached results as a "system" package.
+        AddJsonPackage(NAME openssl FORCE_BUNDLED_PACKAGE ON)
+    else()
+        AddJsonPackage(openssl)
+    endif()
     set(OPENSSL_BUILD_VERBOSE ON)
     set(OPENSSL_CONFIGURE_VERBOSE ON)
 
     if (OpenSSL_ADDED)
+        if (EMSCRIPTEN)
+            # OpenSSL's Configure takes the compiler and extra targets from the environment.
+            set(OPENSSL_TARGET_PLATFORM emscripten-wasm64)
+            set(ENV{OPENSSL_LOCAL_CONFIG_DIR} "${PROJECT_SOURCE_DIR}/tools/web/openssl")
+            set(ENV{CC} "${CMAKE_C_COMPILER}")
+            set(ENV{AR} "${CMAKE_AR}")
+            set(ENV{RANLIB} "${CMAKE_RANLIB}")
+        endif()
         AddJsonPackage(openssl-cmake)
     endif()
 endif()
 
 if (OpenSSL_ADDED)
     add_compile_definitions(YUZU_BUNDLED_OPENSSL)
-endif()
-
-if (EMSCRIPTEN)
-    if (NOT TARGET OpenSSL::Crypto)
-        add_library(OpenSSL::Crypto INTERFACE IMPORTED GLOBAL)
-    endif()
-    if (NOT TARGET OpenSSL::SSL)
-        add_library(OpenSSL::SSL INTERFACE IMPORTED GLOBAL)
-        target_link_libraries(OpenSSL::SSL INTERFACE OpenSSL::Crypto)
-    endif()
 endif()
 
 message(STATUS "Fetching needed dependencies with CPM")
@@ -425,6 +436,14 @@ set(ENABLE_TESTING OFF)
 set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers process filesystem crc variant)
 
 AddJsonPackage(boost)
+
+# Boost.Asio links Boost.Context, whose assembly has no Wasm port. Nothing calls into it on
+# Emscripten (fibers are thread-backed), so build the library without the context switch routines.
+if (EMSCRIPTEN AND TARGET boost_context)
+    get_target_property(boost_context_sources boost_context SOURCES)
+    list(FILTER boost_context_sources EXCLUDE REGEX "\\.S$")
+    set_property(TARGET boost_context PROPERTY SOURCES ${boost_context_sources})
+endif()
 
 # really annoying thing where boost::headers doesn't work with cpm
 # TODO(crueter) investigate
