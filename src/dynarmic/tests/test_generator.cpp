@@ -410,16 +410,11 @@ void RunTestInstance(Dynarmic::A32::Jit& jit,
     const u32 code_mem_size = num_words + static_cast<u32>(instructions.size());
 
     if (show_disas) {
-        fmt::print("instructions:\n");
-        auto current_pc = initial_pc;
+        fmt::print("instructions:");
         for (auto instruction : instructions) {
-            if constexpr (sizeof(decltype(instruction)) == 2) {
-                fmt::print("{:04x} ?\n", instruction);
-            } else {
-                fmt::print("{}", Dynarmic::Common::DisassembleAArch64(instruction, current_pc));
-            }
-            current_pc += sizeof(decltype(instruction));
+            fmt::print(" {:x}", instruction);
         }
+        fmt::print("\n");
 
         fmt::print("initial_regs:");
         for (u32 i : regs)

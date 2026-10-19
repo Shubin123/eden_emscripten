@@ -518,6 +518,10 @@ public:
     {}
 
     bool Init() {
+#ifdef __EMSCRIPTEN__
+        // Wasm linear memory cannot alias pages, so fastmem is unavailable.
+        return false;
+#endif
         long page_size = sysconf(_SC_PAGESIZE);
         ASSERT_MSG(page_size == 0x1000, "page size {:#x} is incompatible with 4K paging", page_size);
         // Backing memory initialization
@@ -583,6 +587,16 @@ public:
     }
 
     void* Allocate(size_t size) {
+#ifdef __EMSCRIPTEN__
+        // Anonymous mmap zero-fills eagerly, committing the whole region. Memory past the break is
+        // already zero and only committed by the browser when touched.
+        void* base = sbrk(intptr_t(size + PageAlignment));
+        if (base == reinterpret_cast<void*>(-1)) {
+            LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}", size);
+            return nullptr;
+        }
+        return reinterpret_cast<void*>(AlignUp(reinterpret_cast<uintptr_t>(base), PageAlignment));
+#endif
         auto* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (ptr == MAP_FAILED) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, {}", size, strerror(errno));
@@ -738,6 +752,8 @@ HostMemory::~HostMemory() {
     if (fallback_buffer) {
         VirtualFree(backing_base, backing_size, MEM_RELEASE);
     }
+#elif defined(__EMSCRIPTEN__)
+    // The fallback buffer comes from sbrk and cannot be returned.
 #else
     if (fallback_buffer) {
         munmap(backing_base, backing_size);

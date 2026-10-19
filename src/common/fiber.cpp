@@ -10,9 +10,147 @@
 #include "common/assert.h"
 #include "common/fiber.h"
 
+#ifdef __EMSCRIPTEN__
+#include <atomic>
+#include <cmath>
+#include <emscripten/threading.h>
+#include <pthread.h>
+#else
 #include <boost/context/detail/fcontext.hpp>
+#endif
 
 namespace Common {
+
+#ifdef __EMSCRIPTEN__
+
+// Wasm has no way to switch stacks, so every fiber runs on its own pthread and only one of them is
+// runnable at a time. YieldTo hands a token to the target and parks the caller until it gets it back.
+
+constexpr size_t DEFAULT_STACK_SIZE = 1024 * 1024;
+
+struct Fiber::FiberImpl {
+    std::function<void()> entry_point;
+    std::atomic<u32> resume{0};
+    std::atomic<bool> abandoned{false};
+    void* logical_context = nullptr;
+    bool started = false;
+    bool is_thread_fiber = false;
+};
+
+namespace {
+
+thread_local void* t_logical_context = nullptr;
+thread_local bool t_is_fiber_thread = false;
+
+/// Retires the calling host thread. Its stack usually sits inside a noexcept destructor several
+/// frames up, and pthread_exit unwinds by throwing on Emscripten, which would terminate the
+/// process there, so the thread stays asleep instead.
+[[noreturn]] void SleepForever() {
+    u32 never = 0;
+    for (;;) {
+        emscripten_futex_wait(&never, 0, INFINITY);
+    }
+}
+
+/// Blocks until the fiber is resumed. Never returns if the fiber was destroyed while parked.
+void Park(std::shared_ptr<Fiber::FiberImpl> impl) {
+    // Guest threads that yield to each other hand the token back within microseconds; spinning
+    // briefly avoids paying for a futex wake on every switch.
+    for (u32 spin = 0; spin < 20000; ++spin) {
+        if (impl->resume.load(std::memory_order_relaxed) != 0) {
+            break;
+        }
+    }
+    // Wait on the futex directly: libc++'s atomic wait goes through a shared contention table
+    // that can miss this wake-up until an unrelated notification arrives.
+    while (impl->resume.exchange(0, std::memory_order_acquire) == 0) {
+        emscripten_futex_wait(&impl->resume, 0, INFINITY);
+    }
+    if (impl->abandoned.load(std::memory_order_acquire)) {
+        impl.reset();
+        SleepForever();
+    }
+    t_logical_context = impl->logical_context;
+}
+
+void Unpark(Fiber::FiberImpl& impl) {
+    impl.resume.store(1, std::memory_order_release);
+    emscripten_futex_wake(&impl.resume, 1);
+}
+
+void* FiberThreadEntry(void* arg) {
+    auto* owner = static_cast<std::shared_ptr<Fiber::FiberImpl>*>(arg);
+    std::shared_ptr<Fiber::FiberImpl> impl = std::move(*owner);
+    delete owner;
+    t_is_fiber_thread = true;
+    Park(impl);
+    auto entry_point = std::move(impl->entry_point);
+    impl.reset();
+    entry_point();
+    return nullptr;
+}
+
+} // Anonymous namespace
+
+void Fiber::SetRewindPoint(std::function<void()>&&) {}
+
+Fiber::Fiber(std::function<void()>&& entry_point_func) : impl{std::make_shared<FiberImpl>()} {
+    impl->entry_point = std::move(entry_point_func);
+}
+
+Fiber::Fiber() : impl{std::make_shared<FiberImpl>()} {}
+
+Fiber::~Fiber() {
+    if (impl->started && !impl->is_thread_fiber) {
+        // Release the host thread parked inside this fiber.
+        impl->abandoned.store(true, std::memory_order_release);
+        Unpark(*impl);
+    }
+}
+
+void Fiber::Exit() {
+    ASSERT_MSG(impl->is_thread_fiber, "Exiting non main thread fiber");
+}
+
+void Fiber::YieldTo(std::weak_ptr<Fiber> weak_from, Fiber& to) {
+    std::shared_ptr<FiberImpl> from_impl;
+    if (auto from = weak_from.lock()) {
+        from_impl = from->impl;
+    }
+    to.impl->logical_context = t_logical_context;
+    if (!to.impl->started) {
+        to.impl->started = true;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_t thread;
+        auto* owner = new std::shared_ptr<FiberImpl>(to.impl);
+        const int result = pthread_create(&thread, &attr, FiberThreadEntry, owner);
+        pthread_attr_destroy(&attr);
+        ASSERT_MSG(result == 0, "Failed to create fiber thread: {}", result);
+    }
+    Unpark(*to.impl);
+    if (from_impl) {
+        Park(std::move(from_impl));
+    } else if (t_is_fiber_thread) {
+        // The calling fiber no longer exists; nothing can resume it.
+        SleepForever();
+    }
+}
+
+std::shared_ptr<Fiber> Fiber::ThreadToFiber() {
+    std::shared_ptr<Fiber> fiber = std::shared_ptr<Fiber>{new Fiber()};
+    fiber->impl->is_thread_fiber = true;
+    fiber->impl->started = true;
+    return fiber;
+}
+
+void*& Fiber::LogicalThreadContext() {
+    return t_logical_context;
+}
+
+#else
 
 #ifdef __OPENORBIS__
 constexpr size_t DEFAULT_STACK_SIZE = 128 * 4096;
@@ -109,5 +247,12 @@ std::shared_ptr<Fiber> Fiber::ThreadToFiber() {
     fiber->impl->is_thread_fiber = true;
     return fiber;
 }
+
+void*& Fiber::LogicalThreadContext() {
+    thread_local void* context = nullptr;
+    return context;
+}
+
+#endif
 
 } // namespace Common

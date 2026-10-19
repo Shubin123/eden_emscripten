@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/common_types.h"
 
 #if _MSC_VER
@@ -102,6 +104,59 @@ template <>
     _InterlockedCompareExchange128(reinterpret_cast<volatile __int64*>(pointer), result[1],
                                    result[0], reinterpret_cast<__int64*>(result.data()));
     return result;
+}
+
+#elif defined(ARCHITECTURE_wasm)
+
+// Wasm has native compare-exchange up to 64 bits. There is no 128-bit atomic, so those
+// operations are serialized through a lock.
+inline std::atomic_flag g_atomic128_lock = ATOMIC_FLAG_INIT;
+
+struct Atomic128Guard {
+    Atomic128Guard() {
+        while (g_atomic128_lock.test_and_set(std::memory_order_acquire)) {
+        }
+    }
+    ~Atomic128Guard() {
+        g_atomic128_lock.clear(std::memory_order_release);
+    }
+};
+
+template <typename T>
+[[nodiscard]] inline bool AtomicCompareAndSwap(T* pointer, T value, T expected) {
+    return __sync_bool_compare_and_swap(pointer, expected, value);
+}
+
+[[nodiscard]] inline bool AtomicCompareAndSwap(u64* pointer, u128 value, u128 expected) {
+    Atomic128Guard guard;
+    if (pointer[0] != expected[0] || pointer[1] != expected[1]) {
+        return false;
+    }
+    pointer[0] = value[0];
+    pointer[1] = value[1];
+    return true;
+}
+
+template <typename T>
+[[nodiscard]] inline bool AtomicCompareAndSwap(T* pointer, T value, T expected, T& actual) {
+    actual = __sync_val_compare_and_swap(pointer, expected, value);
+    return actual == expected;
+}
+
+[[nodiscard]] inline bool AtomicCompareAndSwap(u64* pointer, u128 value, u128 expected, u128& actual) {
+    Atomic128Guard guard;
+    actual = {pointer[0], pointer[1]};
+    if (actual != expected) {
+        return false;
+    }
+    pointer[0] = value[0];
+    pointer[1] = value[1];
+    return true;
+}
+
+[[nodiscard]] inline u128 AtomicLoad128(u64* pointer) {
+    Atomic128Guard guard;
+    return {pointer[0], pointer[1]};
 }
 
 #else

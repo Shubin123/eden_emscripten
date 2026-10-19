@@ -1210,7 +1210,13 @@ if (MSVC)
 endif()
 
 if (BOOST_NO_HEADERS)
-    target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::process Boost::crc)
+    target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::crc)
+    if (EMSCRIPTEN)
+        # Only the header-only v1 async_pipe is used; the compiled library needs Boost.Context.
+        target_include_directories(core PRIVATE ${Boost_SOURCE_DIR}/libs/process/include)
+    else()
+        target_link_libraries(core PUBLIC Boost::process)
+    endif()
 else()
     target_link_libraries(core PUBLIC Boost::headers)
 endif()
@@ -1248,7 +1254,7 @@ if (HAS_NCE)
     target_link_libraries(core PRIVATE merry::oaknut)
 endif()
 
-if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64)
+if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64 OR ARCHITECTURE_wasm)
     target_sources(core PRIVATE
         arm/dynarmic/arm_dynarmic.h
         arm/dynarmic/arm_dynarmic_64.cpp

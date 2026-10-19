@@ -239,7 +239,11 @@ else()
     target_link_libraries(common PUBLIC Boost::headers)
 endif()
 target_link_libraries(common PRIVATE OpenSSL::SSL)
-target_link_libraries(common PUBLIC Boost::filesystem Boost::context httplib::httplib nlohmann_json::nlohmann_json)
+target_link_libraries(common PUBLIC Boost::filesystem httplib::httplib nlohmann_json::nlohmann_json)
+# Emscripten fibers are thread-backed since Wasm cannot switch stacks.
+if (NOT EMSCRIPTEN)
+    target_link_libraries(common PUBLIC Boost::context)
+endif()
 
 if (lz4_ADDED)
     target_include_directories(common PRIVATE ${lz4_SOURCE_DIR}/lib)

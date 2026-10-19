@@ -37,6 +37,9 @@
 #include <sched.h>
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -529,6 +532,8 @@ void SetCurrentThreadName(const char* name) {
         buf[len] = '\0';
         pthread_setname_np(pthread_self(), buf);
     }
+#elif defined(__EMSCRIPTEN__)
+    emscripten_set_thread_name(pthread_self(), name);
 #elif defined(_WIN32)
     // MinGW with the POSIX threading model does not support pthread_setname_np
     // See for reference

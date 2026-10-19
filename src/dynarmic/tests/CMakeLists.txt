@@ -119,6 +119,9 @@ endif()
 target_include_directories(dynarmic_test_reader PRIVATE . ../src)
 target_compile_options(dynarmic_test_reader PRIVATE ${DYNARMIC_CXX_FLAGS})
 target_compile_definitions(dynarmic_test_reader PRIVATE FMT_USE_USER_DEFINED_LITERALS=1)
+if (EMSCRIPTEN)
+    target_link_options(dynarmic_test_reader PRIVATE -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sENVIRONMENT=node -sSTACK_SIZE=4MB --profiling-funcs)
+endif()
 
 #
 create_target_directory_groups(dynarmic_tests)

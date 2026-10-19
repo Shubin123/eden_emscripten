@@ -247,12 +247,18 @@ void RunTestInstance(A64::Jit& jit,
     }
     fmt::print("\n");
 
-    fmt::print("interrupts:\n");
-    for (const auto& i : jit_env.interrupts) {
-        std::puts(i.c_str());
-    }
-
     fmt::print("===\n");
+}
+
+// The generator budgets one tick per instruction; 32-bit Thumb instructions span two halfwords.
+size_t CountThumbInstructions(const std::vector<u16>& halfwords) {
+    size_t count = 0;
+    for (size_t i = 0; i < halfwords.size(); ++i, ++count) {
+        if ((halfwords[i] & 0xF800) >= 0xE800) {
+            ++i;
+        }
+    }
+    return count;
 }
 
 void RunThumb(bool noopt) {
@@ -262,12 +268,17 @@ void RunThumb(bool noopt) {
     u32 initial_cpsr = 0;
     u32 initial_fpcr = 0;
 
+    ThumbTestEnv jit_env{};
+    A32::Jit jit{GetA32UserConfig(jit_env, noopt)};
+
+    // Tests are separated by "===" lines, as printed by dynarmic_test_generator.
     std::string line;
     while (std::getline(std::cin, line)) {
         std::string_view sv{line};
 
         if (sv.starts_with("instructions:")) {
             SkipHeader(sv);
+            instructions.clear();
             while (!sv.empty()) {
                 instructions.emplace_back((u16)ParseHex(NextToken(sv)));
             }
@@ -287,19 +298,19 @@ void RunThumb(bool noopt) {
         } else if (sv.starts_with("initial_fpcr:")) {
             SkipHeader(sv);
             initial_fpcr = (u32)ParseHex(NextToken(sv));
+        } else if (sv.starts_with("===") && !instructions.empty()) {
+            jit_env.interrupts.clear();
+            RunTestInstance(jit,
+                            jit_env,
+                            initial_regs,
+                            initial_vecs,
+                            instructions,
+                            initial_cpsr,
+                            initial_fpcr,
+                            CountThumbInstructions(instructions));
+            instructions.clear();
         }
     }
-
-    ThumbTestEnv jit_env{};
-    A32::Jit jit{GetA32UserConfig(jit_env, noopt)};
-    RunTestInstance(jit,
-                    jit_env,
-                    initial_regs,
-                    initial_vecs,
-                    instructions,
-                    initial_cpsr,
-                    initial_fpcr,
-                    instructions.size());
 }
 
 void RunArm(bool noopt) {
@@ -309,12 +320,17 @@ void RunArm(bool noopt) {
     u32 initial_cpsr = 0;
     u32 initial_fpcr = 0;
 
+    ArmTestEnv jit_env{};
+    A32::Jit jit{GetA32UserConfig(jit_env, noopt)};
+
+    // Tests are separated by "===" lines, as printed by dynarmic_test_generator.
     std::string line;
     while (std::getline(std::cin, line)) {
         std::string_view sv{line};
 
         if (sv.starts_with("instructions:")) {
             SkipHeader(sv);
+            instructions.clear();
             while (!sv.empty()) {
                 instructions.emplace_back((u32)ParseHex(NextToken(sv)));
             }
@@ -334,19 +350,19 @@ void RunArm(bool noopt) {
         } else if (sv.starts_with("initial_fpcr:")) {
             SkipHeader(sv);
             initial_fpcr = (u32)ParseHex(NextToken(sv));
+        } else if (sv.starts_with("===") && !instructions.empty()) {
+            jit_env.interrupts.clear();
+            RunTestInstance(jit,
+                            jit_env,
+                            initial_regs,
+                            initial_vecs,
+                            instructions,
+                            initial_cpsr,
+                            initial_fpcr,
+                            instructions.size());
+            instructions.clear();
         }
     }
-
-    ArmTestEnv jit_env{};
-    A32::Jit jit{GetA32UserConfig(jit_env, noopt)};
-    RunTestInstance(jit,
-                    jit_env,
-                    initial_regs,
-                    initial_vecs,
-                    instructions,
-                    initial_cpsr,
-                    initial_fpcr,
-                    instructions.size());
 }
 
 void RunA64(bool noopt) {
@@ -408,11 +424,15 @@ void RunA64(bool noopt) {
 
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 3) {
-        fmt::print("Usage: {} <thumb|arm|a64> [noopt]\n", argv[0]);
+        fmt::print("Usage: {} <thumb|arm|a64> [noopt|jit]\n", argv[0]);
         return 1;
     }
 
     const bool noopt = argc == 3 && (strcmp(argv[2], "noopt") == 0);
+    if (argc == 3 && strcmp(argv[2], "jit") == 0) {
+        // Compile regions on first entry so that compiled code is what gets tested.
+        setenv("EDEN_JIT_THRESHOLD", "1", 1);
+    }
 
     if (strcmp(argv[1], "thumb") == 0) {
         RunThumb(noopt);

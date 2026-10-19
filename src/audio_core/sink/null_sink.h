@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <chrono>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "audio_core/sink/sink.h"
@@ -23,10 +25,25 @@ public:
     explicit NullSinkStreamImpl(Core::System& system_, StreamType type_)
         : SinkStream{system_, type_} {}
     ~NullSinkStreamImpl() override {}
-    void AppendBuffer(SinkBuffer&, std::span<s16>) override {}
+    void AppendBuffer(SinkBuffer& buffer, std::span<s16>) override {
+        // Consume samples in real time; otherwise the renderer, and the guest audio thread
+        // waiting on it, would spin without pause.
+        if (type == StreamType::In) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (next_deadline < now - std::chrono::milliseconds(50)) {
+            next_deadline = now;
+        }
+        next_deadline += std::chrono::microseconds(buffer.frames * 1'000'000 / TargetSampleRate);
+        std::this_thread::sleep_until(next_deadline);
+    }
     std::vector<s16> ReleaseBuffer(u64) override {
         return {};
     }
+
+private:
+    std::chrono::steady_clock::time_point next_deadline{};
 };
 
 /**

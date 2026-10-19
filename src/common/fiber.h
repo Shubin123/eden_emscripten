@@ -48,11 +48,21 @@ public:
     void SetRewindPoint(std::function<void()>&& rewind_func);
     /// Only call from main thread's fiber
     void Exit();
+
+    /// Pointer-sized slot that follows the logical thread of execution across YieldTo. Where fibers
+    /// are backed by host threads (Emscripten), thread-local state that must be shared by every
+    /// fiber running on behalf of one host thread should be reached through this slot.
+    [[nodiscard]] static void*& LogicalThreadContext();
+
+    struct FiberImpl;
 private:
     Fiber();
+#ifdef __EMSCRIPTEN__
+    std::shared_ptr<FiberImpl> impl;
+#else
     void Start(boost::context::detail::transfer_t& transfer);
-    struct FiberImpl;
     std::unique_ptr<FiberImpl> impl;
+#endif
 };
 
 } // namespace Common

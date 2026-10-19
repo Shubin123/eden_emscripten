@@ -11,6 +11,7 @@
 #include <mutex>
 #else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 #include "common/alignment.h"
@@ -147,6 +148,12 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
         base = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
     }
     ASSERT_MSG(base, "Failed to reserve {:#x} sized region with error {}", size, GetLastError());
+#elif defined(__EMSCRIPTEN__)
+    // Anonymous mmap memsets the whole reservation. Memory past the break is guaranteed zero and
+    // only committed by the browser once touched. It is never returned, see FreeMemoryPages.
+    void* base = sbrk(intptr_t(AlignUp(size, HostPageSize) + HostPageSize));
+    ASSERT_MSG(base != reinterpret_cast<void*>(-1), "Failed to allocate {:#x} sized region", size);
+    base = reinterpret_cast<void*>(AlignUp(reinterpret_cast<uintptr_t>(base), HostPageSize));
 #else
     void* base = mmap(nullptr, size, PROT_READ, MAP_ANON | MAP_PRIVATE | MAP_NOCORE, -1, 0);
     if (base == MAP_FAILED)
@@ -166,6 +173,8 @@ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
     std::lock_guard lock(vector_regions_mutex);
     std::erase_if(vector_regions, [base](const auto& r) {return r.first == reinterpret_cast<u64>(base); });
     ASSERT(VirtualFree(base, 0, MEM_RELEASE));
+#elif defined(__EMSCRIPTEN__)
+    // Linear memory obtained through sbrk cannot be given back.
 #else
     ASSERT(munmap(base, size) == 0);
 #endif

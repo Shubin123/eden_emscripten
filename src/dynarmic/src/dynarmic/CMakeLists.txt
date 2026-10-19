@@ -323,7 +323,34 @@ if ("loongarch64" IN_LIST ARCHITECTURE)
     message(WARNING "TODO: Incomplete frontend for this host architecture")
 endif()
 
-if (WIN32)
+if ("wasm" IN_LIST ARCHITECTURE)
+    target_sources(dynarmic PRIVATE
+        backend/interp/a32_interface.cpp
+        backend/interp/a64_interface.cpp
+        backend/interp/exclusive_monitor.cpp
+        backend/interp/interp.h
+        backend/interp/interp_compile.cpp
+        backend/interp/interp_exec.h
+        backend/interp/interp_fp.h
+        backend/interp/interp_vector.h
+        backend/interp/ops_a32.inc
+        backend/interp/ops_a64.inc
+        backend/interp/ops_common.inc
+        backend/interp/ops_fp.inc
+        backend/interp/ops_packed.inc
+        backend/interp/ops_vector.inc
+        backend/interp/sm4_sbox.h
+        backend/interp/wasm_emitter.h
+        backend/interp/wasm_jit.cpp
+        backend/interp/wasm_jit.h
+
+        common/spin_lock_generic.cpp
+    )
+endif()
+
+if (EMSCRIPTEN)
+    # The interpreter backend has no fastmem and needs no exception handler.
+elseif (WIN32)
     target_sources(dynarmic PRIVATE backend/exception_handler_windows.cpp)
 elseif (APPLE)
     find_path(MACH_EXC_DEFS_DIR "mach/mach_exc.defs")
