@@ -30,7 +30,7 @@ emcmake cmake -S "$root" -B "$build_dir" -G Ninja \
   -DUSE_DISCORD_PRESENCE=OFF \
   "$@"
 
-echo "Building Eden WebAssembly targets..."
-cmake --build "$build_dir" --parallel "${EDEN_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+echo "Building Eden WebAssembly targets and syncing to web/..."
+cmake --build "$build_dir" --target eden_web_assets --parallel "${EDEN_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
-echo "Build complete. Artifacts in $build_dir"
+echo "Build complete. Artifacts in $build_dir and synchronized to ../eden_web/web/"
