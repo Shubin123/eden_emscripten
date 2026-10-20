@@ -4,6 +4,7 @@
 // extracted entry has to fit in memory.
 
 #include <errno.h>
+#include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +70,9 @@ EMSCRIPTEN_KEEPALIVE Reader* ea_open(double size) {
         return NULL;
     }
     r->size = (int64_t)size;
+    // libarchive is built without iconv; with a UTF-8 locale it can still convert the
+    // UTF-16 and legacy names that RAR and ZIP archives store.
+    setlocale(LC_ALL, "C.UTF-8");
     r->archive = archive_read_new();
     archive_read_support_filter_all(r->archive);
     archive_read_support_format_all(r->archive);
