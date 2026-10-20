@@ -40,6 +40,8 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/perf_stats.h"
+#include "hid_core/hid_core.h"
+#include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "video_core/gpu.h"
 
@@ -72,8 +74,14 @@ enum class EmuState : int {
 };
 
 struct Request {
-    enum class Kind { Boot, Pause, Resume, Shutdown } kind;
+    enum class Kind { Boot, Pause, Resume, Shutdown, Button, Stick } kind;
     std::string path;
+    /// Input: player index, VirtualGamepad button or stick id, and its state.
+    int player = 0;
+    int id = 0;
+    bool pressed = false;
+    float x = 0.0f;
+    float y = 0.0f;
 };
 
 std::mutex g_request_mutex;
@@ -135,6 +143,8 @@ public:
             return false;
         }
 
+        // Controllers bind to their input devices when the application is loaded.
+        system.HIDCore().ReloadInputDevices();
         system.GPU().Start();
         system.GetCpuManager().OnGpuReady();
         system.RegisterExitCallback([] { PushRequest({Request::Kind::Shutdown, {}}); });
@@ -203,10 +213,26 @@ public:
         }
     }
 
+    void SetButton(int player, int button, bool pressed) {
+        input_subsystem.GetVirtualGamepad()->SetButtonState(static_cast<size_t>(player), button,
+                                                            pressed);
+    }
+
+    void SetStick(int player, int stick, float x, float y) {
+        input_subsystem.GetVirtualGamepad()->SetStickPosition(static_cast<size_t>(player), stick,
+                                                              x, y);
+    }
+
     void UpdatePerfStats() {
         if (g_state != int(EmuState::Running)) {
             return;
         }
+        // Stats average over the time between calls; input requests wake the loop far more often.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_stats < std::chrono::seconds(1)) {
+            return;
+        }
+        last_stats = now;
         const Core::PerfStatsResults stats = system.GetAndResetPerfStats();
         g_game_fps = stats.average_game_fps;
         g_system_fps = stats.system_fps;
@@ -217,6 +243,7 @@ public:
     Core::System system;
     WebEmuWindow window;
     InputCommon::InputSubsystem input_subsystem;
+    std::chrono::steady_clock::time_point last_stats{};
 };
 
 } // Anonymous namespace
@@ -241,6 +268,19 @@ EMSCRIPTEN_KEEPALIVE void eden_resume() {
 
 EMSCRIPTEN_KEEPALIVE void eden_shutdown() {
     PushRequest({Request::Kind::Shutdown, {}});
+}
+
+/// Presses or releases a controller button. `button` is a VirtualGamepad::VirtualButton
+/// (0 A, 1 B, 2 X, 3 Y, 4 L stick, 5 R stick, 6 L, 7 R, 8 ZL, 9 ZR, 10 +, 11 -, 12 left,
+/// 13 up, 14 right, 15 down, 16 SL, 17 SR, 18 home, 19 capture).
+EMSCRIPTEN_KEEPALIVE void eden_set_button(int player, int button, int pressed) {
+    PushRequest({.kind = Request::Kind::Button, .player = player, .id = button,
+                 .pressed = pressed != 0});
+}
+
+/// Moves a stick (0 left, 1 right) to x, y in [-1, 1], with +y up.
+EMSCRIPTEN_KEEPALIVE void eden_set_stick(int player, int stick, float x, float y) {
+    PushRequest({.kind = Request::Kind::Stick, .player = player, .id = stick, .x = x, .y = y});
 }
 
 /// 0 idle, 1 booting, 2 running, 3 paused, 4 failed, 5 stopped.
@@ -281,6 +321,8 @@ int main(int argc, char** argv) {
     ApplyWebSettings();
     emulator->system.Initialize();
     emulator->system.ApplySettings();
+    // Registers the input engines, including the virtual gamepad the page drives.
+    emulator->input_subsystem.Initialize();
 
 #ifdef EDEN_WEB_HEADLESS
     if (argc < 2) {
@@ -335,6 +377,12 @@ int main(int argc, char** argv) {
                 break;
             case Request::Kind::Shutdown:
                 emulator->Shutdown();
+                break;
+            case Request::Kind::Button:
+                emulator->SetButton(request->player, request->id, request->pressed);
+                break;
+            case Request::Kind::Stick:
+                emulator->SetStick(request->player, request->id, request->x, request->y);
                 break;
             }
         }
