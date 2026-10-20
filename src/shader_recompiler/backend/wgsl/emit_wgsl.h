@@ -35,6 +35,9 @@ struct Options {
     /// Components the vertex format provides per attribute; zero when the pipeline provides no
     /// data for it (the shader then reads the default (0, 0, 0, 1)).
     std::array<u8, 32> attribute_components{};
+    /// Attributes in signed A2B10G10R10, which WebGPU cannot fetch: they are read as one u32 and
+    /// unpacked in the shader.
+    std::array<bool, 32> attribute_snorm_1010102{};
     /// Whether a depth attachment exists; fragment depth writes are dropped otherwise.
     bool has_depth_target = true;
     /// Bind group holding the per-draw info uniform.

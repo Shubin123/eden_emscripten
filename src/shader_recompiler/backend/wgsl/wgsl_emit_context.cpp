@@ -326,7 +326,9 @@ std::string EmitContext::Finish(const IR::Program& program) {
             if (info.loads.Generic(index) && type != AttributeType::Disabled &&
                 options.attribute_components[index] != 0) {
                 entry += fmt::format("@location({}) attr{}: {},\n", index, index,
-                                     AttributeInputType(type));
+                                     options.attribute_snorm_1010102[index]
+                                         ? "u32"
+                                         : AttributeInputType(type));
             }
         }
         entry += "}\nstruct VSOutput {\n@builtin(position) position: vec4<f32>,\n";
@@ -337,12 +339,25 @@ std::string EmitContext::Finish(const IR::Program& program) {
                                      index);
             }
         }
-        entry += "}\n@vertex fn main(input: VSInput) -> VSOutput {\n"
+        entry += "}\n";
+        if (std::ranges::any_of(options.attribute_snorm_1010102, [](bool flag) { return flag; })) {
+            // Sign-extends each field; the most negative value clamps to -1 as with SNORM formats.
+            entry += "fn UnpackSnorm1010102(v: u32) -> vec4<f32> {\n"
+                     "let x = i32(v << 22u) >> 22u;\nlet y = i32(v << 12u) >> 22u;\n"
+                     "let z = i32(v << 2u) >> 22u;\nlet w = i32(v) >> 30u;\n"
+                     "return max(vec4<f32>(vec3<f32>(f32(x), f32(y), f32(z)) / 511.0, f32(w)),"
+                     " vec4<f32>(-1.0));\n}\n";
+        }
+        entry += "@vertex fn main(input: VSInput) -> VSOutput {\n"
                  "v_vertex_id = input.vertex_index;\nv_instance_id = input.instance_index;\n";
         for (size_t index = 0; index < IR::NUM_GENERICS; ++index) {
             const AttributeType type{runtime_info.generic_input_types[index]};
             if (!info.loads.Generic(index) || type == AttributeType::Disabled ||
                 options.attribute_components[index] == 0) {
+                continue;
+            }
+            if (options.attribute_snorm_1010102[index]) {
+                entry += fmt::format("in_attr{} = UnpackSnorm1010102(input.attr{});\n", index, index);
                 continue;
             }
             entry += fmt::format("in_attr{} = {};\n", index,

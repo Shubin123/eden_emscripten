@@ -260,6 +260,10 @@ inline wgpu::VertexFormat VertexFormat(Maxwell::VertexAttribute::Type type,
         components = 1;
         return pick8(VF::Unorm8, VF::Snorm8, VF::Uint8, VF::Sint8);
     case S::Size_A2_B10_G10_R10:
+        if (type == T::SNorm) {
+            // No signed 10:10:10:2 vertex format; the shader unpacks the raw word.
+            return VF::Uint32;
+        }
         return type == T::UNorm ? VF::Unorm10_10_10_2 : INVALID_VERTEX_FORMAT;
     default:
         return INVALID_VERTEX_FORMAT;

@@ -500,6 +500,11 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
             if (program.stage == Shader::Stage::VertexB) {
                 for (size_t attr = 0; attr < Maxwell::NumVertexAttributes; ++attr) {
                     options.attribute_components[attr] = ProvidedComponents(key.state, attr);
+                    const auto& attribute = key.state.attributes[attr];
+                    options.attribute_snorm_1010102[attr] =
+                        attribute.enabled &&
+                        attribute.Size() == Maxwell::VertexAttribute::Size::Size_A2_B10_G10_R10 &&
+                        attribute.Type() == Maxwell::VertexAttribute::Type::SNorm;
                 }
             }
             codes[stage] = EmitWGSL(cache.profile, runtime_info, program, binding, options);
