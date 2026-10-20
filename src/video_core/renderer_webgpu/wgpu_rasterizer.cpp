@@ -516,6 +516,9 @@ void RasterizerWebGPU::InitializeChannel(Tegra::Control::ChannelState& channel) 
         buffer_cache.CreateChannel(channel);
     }
     pipeline_cache.CreateChannel(channel);
+    // Without these tables Maxwell3D register writes never mark render targets, shaders, blending
+    // or vertex state dirty, and the caches and pipeline keys keep the state they first saw.
+    state_tracker.SetupTables(channel);
 }
 void RasterizerWebGPU::BindChannel(Tegra::Control::ChannelState& channel) {
     BindToChannel(channel.bind_id);
@@ -525,6 +528,8 @@ void RasterizerWebGPU::BindChannel(Tegra::Control::ChannelState& channel) {
         buffer_cache.BindToChannel(channel.bind_id);
     }
     pipeline_cache.BindToChannel(channel.bind_id);
+    state_tracker.ChangeChannel(channel);
+    state_tracker.InvalidateState();
 }
 void RasterizerWebGPU::ReleaseChannel(s32 channel_id) {
     EraseChannel(channel_id);

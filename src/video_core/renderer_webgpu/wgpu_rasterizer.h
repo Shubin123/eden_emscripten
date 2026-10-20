@@ -18,6 +18,7 @@
 #include "video_core/renderer_webgpu/wgpu_scheduler.h"
 #include "video_core/renderer_webgpu/wgpu_texture_cache.h"
 #include "video_core/renderer_webgpu/wgpu_uniform_ring.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
 
 namespace Core {
 class System;
@@ -118,6 +119,7 @@ public:
     u64 debug_last_serial = 0;
 
 private:
+    Vulkan::StateTracker state_tracker;
     Scheduler scheduler;
     UniformRing uniform_ring;
     Blitter blitter;
