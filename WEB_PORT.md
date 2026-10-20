@@ -38,6 +38,13 @@ Frontend presentation, ROM mounting, touch/gamepad input mapping, and browser te
 bash tools/web/build.sh
 ```
 
+The browser frontend loads games from 7z, RAR, tar and other archives with a separate libarchive
+decoder. Build it once (it fetches pinned libarchive, xz and zstd sources):
+
+```bash
+bash tools/web/build-archive.sh
+```
+
 ### Syncing to Frontend
 
 Once the WebAssembly artifacts (`.wasm`, `.js`) are generated in `build-web/`:
