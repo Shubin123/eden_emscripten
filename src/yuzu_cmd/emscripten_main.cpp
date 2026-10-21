@@ -297,7 +297,8 @@ public:
             {"titleId", fmt::format("{:016X}", FileSys::GetBaseTitleID(program_id))},
             {"programId", fmt::format("{:016X}", program_id)},
             {"fileType", Loader::GetFileTypeString(loader.GetFileType())},
-            {"path", path},
+            // Only the file name, so results and reports never carry where the user keeps games.
+            {"fileName", std::filesystem::path{path}.filename().string()},
         };
         const FileSys::PatchManager pm{program_id, system.GetFileSystemController(),
                                        system.GetContentProvider()};
@@ -471,7 +472,7 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_build_info() {
 }
 
 /// JSON for the loaded game, or "{}" when none is: titleId, programId, name, displayVersion,
-/// version, fileType, path, is64Bit. Fields that could not be read are left out.
+/// version, fileType, fileName, is64Bit. Fields that could not be read are left out.
 EMSCRIPTEN_KEEPALIVE const char* eden_get_game_info() {
     thread_local std::string buffer;
     std::scoped_lock lock{g_game_info_mutex};
