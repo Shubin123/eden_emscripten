@@ -89,7 +89,25 @@ if (EMSCRIPTEN)
         --emit-symbol-map
     )
 
+    # Build details reported by eden_get_build_info(); the commit itself comes from scm_rev.
+    option(EDEN_WEB_DEV "Development build linked without whole-program optimization" OFF)
+    find_package(Git QUIET)
+    run_git_command(EDEN_WEB_GIT_STATUS status --porcelain --untracked-files=no)
+    if ("${EDEN_WEB_GIT_STATUS}" MATCHES "NOTFOUND")
+        set(EDEN_WEB_GIT_DIRTY -1)
+    elseif ("${EDEN_WEB_GIT_STATUS}" STREQUAL "")
+        set(EDEN_WEB_GIT_DIRTY 0)
+    else()
+        set(EDEN_WEB_GIT_DIRTY 1)
+    endif()
+    set(EDEN_WEB_DEFINITIONS
+        EDEN_WEB_GIT_DIRTY=${EDEN_WEB_GIT_DIRTY}
+        EDEN_WEB_DEV_BUILD=$<BOOL:${EDEN_WEB_DEV}>
+        EDEN_WEB_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+    )
+
     add_executable(eden_web emscripten_main.cpp)
+    target_compile_definitions(eden_web PRIVATE ${EDEN_WEB_DEFINITIONS})
     target_link_libraries(eden_web PRIVATE common core input_common frontend_common video_core Threads::Threads)
     set_target_properties(eden_web PROPERTIES OUTPUT_NAME "eden")
     target_link_options(eden_web PRIVATE
@@ -98,12 +116,13 @@ if (EMSCRIPTEN)
         -sMODULARIZE=1
         -sEXPORT_NAME=createEdenModule
         -sEXIT_RUNTIME=0
-        "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','ENV']"
+        "-sEXPORTED_FUNCTIONS=['_main','_malloc','_free']"
+        "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','ENV','UTF8ToString','HEAPF64']"
     )
 
     add_executable(eden_headless emscripten_main.cpp)
     target_link_libraries(eden_headless PRIVATE common core input_common frontend_common video_core Threads::Threads)
-    target_compile_definitions(eden_headless PRIVATE EDEN_WEB_HEADLESS)
+    target_compile_definitions(eden_headless PRIVATE EDEN_WEB_HEADLESS ${EDEN_WEB_DEFINITIONS})
     target_link_options(eden_headless PRIVATE
         ${EDEN_WEB_LINK_OPTIONS}
         -sENVIRONMENT=node

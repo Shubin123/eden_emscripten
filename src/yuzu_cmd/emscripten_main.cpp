@@ -8,6 +8,8 @@
 // Built for Node.js (EDEN_WEB_HEADLESS), main() boots the ROM given on the command line and
 // reports performance until the requested number of seconds has elapsed.
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -20,6 +22,9 @@
 #include <string_view>
 
 #include <emscripten.h>
+#include <emscripten/heap.h>
+#include <emscripten/version.h>
+#include <nlohmann/json.hpp>
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -28,6 +33,9 @@
 #include "core/core.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
+#include "core/file_sys/common_funcs.h"
+#include "core/file_sys/control_metadata.h"
+#include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/frontend/emu_window.h"
@@ -39,13 +47,19 @@
 #include "core/memory.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/loader/loader.h"
 #include "core/perf_stats.h"
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "video_core/gpu.h"
+#include "video_core/renderer_webgpu/wgpu_stats.h"
 
 namespace {
+
+/// Version of the exported C API. 1 is the original boot/input/stats set; later versions only add
+/// exports, so the page can check this before using newer ones.
+constexpr int ApiVersion = 2;
 
 /// Window without a native surface; the web renderer presents to the page canvas itself.
 class WebEmuWindow final : public Core::Frontend::EmuWindow {
@@ -95,6 +109,32 @@ std::atomic<double> g_system_fps{0.0};
 std::atomic<double> g_emulation_speed{0.0};
 std::atomic<double> g_frametime_ms{0.0};
 
+/// Frametimes (ms) of presented frames that the page has not drained yet.
+std::mutex g_frame_mutex;
+std::array<double, 4096> g_frame_times{};
+u64 g_frame_times_written = 0;
+u64 g_frame_times_read = 0;
+std::atomic<u64> g_frames{0};
+
+std::mutex g_game_info_mutex;
+std::string g_game_info = "{}";
+
+std::string ToJson(const nlohmann::json& json) {
+    return json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+/// Copies `text` into a buffer owned by the calling thread, which stays valid until that thread
+/// next calls the same export.
+const char* ReturnString(std::string text, std::string& buffer) {
+    buffer = std::move(text);
+    return buffer.c_str();
+}
+
+bool CpuJitEnabled() {
+    const char* jit = std::getenv("EDEN_INTERP_JIT");
+    return !(jit && jit[0] == '0');
+}
+
 void PushRequest(Request request) {
     {
         std::scoped_lock lock{g_request_mutex};
@@ -124,8 +164,10 @@ public:
         g_state = int(EmuState::Booting);
         LOG_INFO(Frontend, "Booting {}", path);
         // The page picks the CPU core by setting EDEN_INTERP_JIT before the runtime starts.
-        const char* jit = std::getenv("EDEN_INTERP_JIT");
-        LOG_INFO(Frontend, "CPU core: {}", jit && jit[0] == '0' ? "IR interpreter" : "Wasm JIT");
+        LOG_INFO(Frontend, "CPU core: {}", CpuJitEnabled() ? "Wasm JIT" : "IR interpreter");
+        SetGameInfo("{}");
+        ResetFrameTimes();
+        WebGPU::pipeline_stats.Reset();
 
         // Keys and firmware are mounted by the page after the runtime starts.
         Core::Crypto::KeyManager::Instance().ReloadKeys();
@@ -148,6 +190,7 @@ public:
 
         // Controllers bind to their input devices when the application is loaded.
         system.HIDCore().ReloadInputDevices();
+        CacheGameInfo(path);
         system.GPU().Start();
         system.GetCpuManager().OnGpuReady();
         system.RegisterExitCallback([] { PushRequest({Request::Kind::Shutdown, {}}); });
@@ -174,9 +217,27 @@ public:
     void Shutdown() {
         if (g_state == int(EmuState::Running) || g_state == int(EmuState::Paused)) {
             void(system.Pause());
+            CollectFrameTimes();
             system.ShutdownMainProcess();
         }
+        SetGameInfo("{}");
         g_state = int(EmuState::Stopped);
+    }
+
+    /// Moves the frametimes PerfStats recorded since the last call into the ring the page drains.
+    void CollectFrameTimes() {
+        if (g_state != int(EmuState::Running) && g_state != int(EmuState::Paused)) {
+            return;
+        }
+        const auto& perf_stats = system.GetPerfStats();
+        std::array<double, 256> samples;
+        while (const size_t count = perf_stats.ReadRecentFrametimes(frame_cursor, samples)) {
+            std::scoped_lock lock{g_frame_mutex};
+            for (size_t i = 0; i < count; ++i) {
+                g_frame_times[g_frame_times_written++ % g_frame_times.size()] = samples[i];
+            }
+        }
+        g_frames = perf_stats.GetSystemFrameCount();
     }
 
     /// Debug aid for the headless runner: prints the application's guest threads.
@@ -216,6 +277,56 @@ public:
         }
     }
 
+    void ResetFrameTimes() {
+        frame_cursor = 0;
+        g_frames = 0;
+        std::scoped_lock lock{g_frame_mutex};
+        g_frame_times_read = g_frame_times_written;
+    }
+
+    static void SetGameInfo(std::string info) {
+        std::scoped_lock lock{g_game_info_mutex};
+        g_game_info = std::move(info);
+    }
+
+    /// Title metadata, gathered the same way the Qt frontend titles its window.
+    void CacheGameInfo(const std::string& path) {
+        const u64 program_id = system.GetApplicationProcessProgramID();
+        auto& loader = system.GetAppLoader();
+        nlohmann::json info{
+            {"titleId", fmt::format("{:016X}", FileSys::GetBaseTitleID(program_id))},
+            {"programId", fmt::format("{:016X}", program_id)},
+            {"fileType", Loader::GetFileTypeString(loader.GetFileType())},
+            {"path", path},
+        };
+        const FileSys::PatchManager pm{program_id, system.GetFileSystemController(),
+                                       system.GetContentProvider()};
+        std::string name;
+        std::string display_version;
+        if (const auto metadata = pm.GetControlMetadata(); metadata.first) {
+            name = metadata.first->GetApplicationName();
+            display_version = metadata.first->GetVersionString();
+        } else if (FileSys::NACP nacp; loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
+            // Content opened straight from a file is not installed, so read the file's own NACP.
+            name = nacp.GetApplicationName();
+            display_version = nacp.GetVersionString();
+        }
+        if (name.empty()) {
+            void(loader.ReadTitle(name));
+        }
+        if (!display_version.empty()) {
+            info["displayVersion"] = display_version;
+        }
+        info["name"] = name;
+        if (const auto version = pm.GetGameVersion()) {
+            info["version"] = *version;
+        }
+        if (const auto* process = system.ApplicationProcess()) {
+            info["is64Bit"] = process->Is64Bit();
+        }
+        SetGameInfo(ToJson(info));
+    }
+
     void SetButton(int player, int button, bool pressed) {
         input_subsystem.GetVirtualGamepad()->SetButtonState(static_cast<size_t>(player), button,
                                                             pressed);
@@ -247,6 +358,7 @@ public:
     WebEmuWindow window;
     InputCommon::InputSubsystem input_subsystem;
     std::chrono::steady_clock::time_point last_stats{};
+    u64 frame_cursor = 0;
 };
 
 } // Anonymous namespace
@@ -309,6 +421,132 @@ EMSCRIPTEN_KEEPALIVE double eden_get_emulation_speed() {
 
 EMSCRIPTEN_KEEPALIVE double eden_get_frametime() {
     return g_frametime_ms;
+}
+
+EMSCRIPTEN_KEEPALIVE int eden_get_api_version() {
+    return ApiVersion;
+}
+
+/// The returned strings below stay valid until the calling thread next calls the same export.
+/// Read them with ccall(name, 'string', [], []) or UTF8ToString(Number(Module._eden_xxx())).
+
+EMSCRIPTEN_KEEPALIVE const char* eden_get_build_info() {
+    static const std::string info = ToJson({
+        {"apiVersion", ApiVersion},
+        {"commit", std::string{Common::g_scm_rev}},
+        {"branch", std::string{Common::g_scm_branch}},
+        {"describe", std::string{Common::g_scm_desc}},
+        {"dirty", EDEN_WEB_GIT_DIRTY < 0 ? nlohmann::json() : nlohmann::json(EDEN_WEB_GIT_DIRTY != 0)},
+        {"buildDate", std::string{Common::g_build_date}},
+        {"buildType", EDEN_WEB_BUILD_TYPE},
+        {"devBuild", EDEN_WEB_DEV_BUILD != 0},
+        {"compiler", std::string{Common::g_compiler_id}},
+        {"emscripten", fmt::format("{}.{}.{}", __EMSCRIPTEN_major__, __EMSCRIPTEN_minor__,
+                                   __EMSCRIPTEN_tiny__)},
+        {"flags",
+         {
+#ifdef __wasm64__
+             {"memory64", true},
+#else
+             {"memory64", false},
+#endif
+#ifdef __wasm_simd128__
+             {"simd128", true},
+#else
+             {"simd128", false},
+#endif
+#ifdef __WASM_EXCEPTIONS__
+             {"wasmExceptions", true},
+#else
+             {"wasmExceptions", false},
+#endif
+#ifdef __EMSCRIPTEN_PTHREADS__
+             {"pthreads", true},
+#else
+             {"pthreads", false},
+#endif
+         }},
+    });
+    return info.c_str();
+}
+
+/// JSON for the loaded game, or "{}" when none is: titleId, programId, name, displayVersion,
+/// version, fileType, path, is64Bit. Fields that could not be read are left out.
+EMSCRIPTEN_KEEPALIVE const char* eden_get_game_info() {
+    thread_local std::string buffer;
+    std::scoped_lock lock{g_game_info_mutex};
+    return ReturnString(g_game_info, buffer);
+}
+
+/// Moves up to `max` frametimes (ms, oldest first) recorded since the last call into `out` and
+/// returns how many were written. A frametime is the wall time between the guest's presents, the
+/// same quantity eden_get_frametime averages; the first one after boot includes loading. Samples
+/// reach this buffer about once a second and only the latest 4096 are kept.
+///
+/// The module is MEMORY64, so `out` is an i64 that JS passes as a BigInt:
+///   const ptr = Module._malloc(max * 8);  // once
+///   const n = Module._eden_get_frame_times(BigInt(ptr), max);
+///   const ms = Module.HEAPF64.slice(ptr / 8, ptr / 8 + n);
+EMSCRIPTEN_KEEPALIVE int eden_get_frame_times(double* out, int max) {
+    if (!out || max <= 0) {
+        return 0;
+    }
+    std::scoped_lock lock{g_frame_mutex};
+    g_frame_times_read = std::max(g_frame_times_read, g_frame_times_written - std::min<u64>(
+                                                          g_frame_times_written, g_frame_times.size()));
+    int count = 0;
+    for (; count < max && g_frame_times_read < g_frame_times_written; ++count) {
+        out[count] = g_frame_times[g_frame_times_read++ % g_frame_times.size()];
+    }
+    return count;
+}
+
+/// Counters since the last boot. Pipeline build time is the CPU time translating guest shaders
+/// and requesting pipelines; pipeline creation time is the wall time until the browser finished
+/// each asynchronous creation.
+EMSCRIPTEN_KEEPALIVE const char* eden_get_runtime_stats() {
+    const auto& pipelines = WebGPU::pipeline_stats;
+    const auto load = [](const std::atomic<u64>& counter) {
+        return counter.load(std::memory_order_relaxed);
+    };
+    const auto ms = [&](const std::atomic<u64>& counter) {
+        return static_cast<double>(load(counter)) / 1000.0;
+    };
+    const u64 lookups = load(pipelines.lookups);
+    const u64 misses = load(pipelines.misses);
+    thread_local std::string buffer;
+    return ReturnString(ToJson({
+                            {"frames", g_frames.load()},
+                            {"pipelineCacheHits", lookups - std::min(lookups, misses)},
+                            {"pipelineCacheMisses", misses},
+                            {"shaderCompiles", load(pipelines.builds)},
+                            {"shaderCompileMs", ms(pipelines.build_us)},
+                            {"shaderCompileFailures", load(pipelines.build_failures)},
+                            {"pipelineCreations", load(pipelines.creations)},
+                            {"pipelineCreationMs", ms(pipelines.creation_us)},
+                            {"pipelineCreationFailures", load(pipelines.creation_failures)},
+                            {"heapBytes", emscripten_get_heap_size()},
+                        }),
+                        buffer);
+}
+
+EMSCRIPTEN_KEEPALIVE const char* eden_get_capabilities() {
+    thread_local std::string buffer;
+    return ReturnString(ToJson({
+                            {"apiVersion", ApiVersion},
+                            {"cpuBackends", nlohmann::json::array({"jit", "interpreter"})},
+                            {"cpuBackend", CpuJitEnabled() ? "jit" : "interpreter"},
+#ifdef EDEN_WEB_HEADLESS
+                            {"renderer", "null"},
+#else
+                            {"renderer", "webgpu"},
+#endif
+                            {"operations", nlohmann::json::array({"boot", "pause", "resume",
+                                                                  "shutdown", "input", "frameTimes",
+                                                                  "gameInfo", "buildInfo",
+                                                                  "runtimeStats"})},
+                        }),
+                        buffer);
 }
 
 } // extern "C"
@@ -391,6 +629,7 @@ int main(int argc, char** argv) {
         }
 
         emulator->UpdatePerfStats();
+        emulator->CollectFrameTimes();
 
 #ifdef EDEN_WEB_HEADLESS
         static int dump_tick = 0;

@@ -9,9 +9,11 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 dev="${EDEN_DEV:-0}"
 build_dir="$root/build-web"
 link_flags=""
+dev_option=OFF
 if [ "$dev" = 1 ]; then
   build_dir="$root/build-web-dev"
   link_flags="-O1"
+  dev_option=ON
 fi
 
 # Activate emsdk if emcc is not in PATH
@@ -44,6 +46,7 @@ emcmake cmake -S "$root" -B "$build_dir" -G Ninja \
   -DYUZU_TESTS=OFF \
   -DENABLE_CUBEB=OFF \
   -DUSE_DISCORD_PRESENCE=OFF \
+  -DEDEN_WEB_DEV=$dev_option \
   "$@"
 
 [ "${EDEN_CONFIGURE_ONLY:-0}" = 1 ] && exit 0
