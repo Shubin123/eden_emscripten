@@ -72,10 +72,11 @@ void PerfStats::EndSystemFrame() {
 
     auto frame_end = Clock::now();
     const auto frame_time = frame_end - frame_begin;
+    const double frame_time_ms = std::chrono::duration<double, std::milli>(frame_time).count();
     if (current_index < perf_history.size()) {
-        perf_history[current_index++] =
-            std::chrono::duration<double, std::milli>(frame_time).count();
+        perf_history[current_index++] = frame_time_ms;
     }
+    recent_frametimes[recent_frame_count++ % recent_frametimes.size()] = frame_time_ms;
     accumulated_frametime += frame_time;
     system_frames += 1;
 
@@ -126,6 +127,23 @@ PerfStatsResults PerfStats::GetAndResetStats(microseconds current_system_time_us
     previous_fps = current_fps;
 
     return results;
+}
+
+std::size_t PerfStats::ReadRecentFrametimes(u64& cursor, std::span<double> out) const {
+    std::scoped_lock lock{object_mutex};
+
+    cursor = std::max(cursor, recent_frame_count - std::min<u64>(recent_frame_count,
+                                                                 recent_frametimes.size()));
+    std::size_t count = 0;
+    for (; count < out.size() && cursor < recent_frame_count; ++count, ++cursor) {
+        out[count] = recent_frametimes[cursor % recent_frametimes.size()];
+    }
+    return count;
+}
+
+u64 PerfStats::GetSystemFrameCount() const {
+    std::scoped_lock lock{object_mutex};
+    return recent_frame_count;
 }
 
 double PerfStats::GetLastFrameTimeScale() const {

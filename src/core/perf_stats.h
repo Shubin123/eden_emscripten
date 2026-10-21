@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <mutex>
+#include <span>
 #include "common/common_types.h"
 
 namespace Core {
@@ -51,6 +52,16 @@ public:
      */
     double GetLastFrameTimeScale() const;
 
+    /**
+     * Copies the frametimes (ms) of the system frames recorded after `cursor` into `out`, oldest
+     * first, and advances `cursor` past them. Frames that fell out of the recent window are
+     * skipped. Returns the number of samples written.
+     */
+    std::size_t ReadRecentFrametimes(u64& cursor, std::span<double> out) const;
+
+    /// Number of system frames recorded since this object was created.
+    u64 GetSystemFrameCount() const;
+
 private:
     mutable std::mutex object_mutex;
 
@@ -61,6 +72,9 @@ private:
     /// Stores an hour of historical frametime data useful for processing and tracking performance
     /// regressions with code changes.
     std::array<double, 216000> perf_history{};
+    /// Ring of the most recent frametimes (ms), indexed by recent_frame_count
+    std::array<double, 4096> recent_frametimes{};
+    u64 recent_frame_count{0};
 
     /// Point when the cumulative counters were reset
     Clock::time_point reset_point = Clock::now();
