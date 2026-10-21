@@ -123,6 +123,9 @@ public:
     bool Boot(const std::string& path) {
         g_state = int(EmuState::Booting);
         LOG_INFO(Frontend, "Booting {}", path);
+        // The page picks the CPU core by setting EDEN_INTERP_JIT before the runtime starts.
+        const char* jit = std::getenv("EDEN_INTERP_JIT");
+        LOG_INFO(Frontend, "CPU core: {}", jit && jit[0] == '0' ? "IR interpreter" : "Wasm JIT");
 
         // Keys and firmware are mounted by the page after the runtime starts.
         Core::Crypto::KeyManager::Instance().ReloadKeys();
