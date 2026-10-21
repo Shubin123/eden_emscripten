@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstring>
 
 #include <boost/container/small_vector.hpp>
@@ -19,6 +20,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_webgpu/maxwell_to_wgpu.h"
 #include "video_core/renderer_webgpu/wgpu_pipeline_cache.h"
+#include "video_core/renderer_webgpu/wgpu_stats.h"
 #include "video_core/renderer_webgpu/wgpu_thread.h"
 #include "video_core/shader_environment.h"
 #include "video_core/surface.h"
@@ -307,7 +309,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
     auto [it, is_new] = graphics_cache.try_emplace(graphics_key);
+    pipeline_stats.lookups.fetch_add(1, std::memory_order_relaxed);
     if (is_new) {
+        pipeline_stats.misses.fetch_add(1, std::memory_order_relaxed);
         GraphicsEnvironments environments;
         GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
         it->second = std::make_unique<GraphicsPipeline>(*this, graphics_key, std::move(environments));
@@ -759,13 +763,20 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
         // pipeline cannot invalidate the command buffer it would be recorded into.
         device.CreateRenderPipelineAsync(
             &desc, wgpu::CallbackMode::AllowSpontaneous,
-            [slot = variant.pipeline, hash = key.Hash()](wgpu::CreatePipelineAsyncStatus status,
-                                                        wgpu::RenderPipeline pipeline,
-                                                        wgpu::StringView message) {
+            [slot = variant.pipeline, hash = key.Hash(),
+             requested = std::chrono::steady_clock::now()](wgpu::CreatePipelineAsyncStatus status,
+                                                           wgpu::RenderPipeline pipeline,
+                                                           wgpu::StringView message) {
+                const auto elapsed = std::chrono::steady_clock::now() - requested;
+                pipeline_stats.creation_us.fetch_add(
+                    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count(),
+                    std::memory_order_relaxed);
                 if (status == wgpu::CreatePipelineAsyncStatus::Success) {
+                    pipeline_stats.creations.fetch_add(1, std::memory_order_relaxed);
                     *slot = std::move(pipeline);
                     return;
                 }
+                pipeline_stats.creation_failures.fetch_add(1, std::memory_order_relaxed);
                 LOG_ERROR(Render, "WebGPU pipeline {:016x}: {}", hash,
                           std::string_view{message.data, message.length});
             });
@@ -781,8 +792,17 @@ GraphicsPipeline::Variant* GraphicsPipeline::FindVariant(const VariantKey& varia
         return last_variant;
     }
     auto [it, is_new] = variants.try_emplace(variant_key);
-    if (is_new && !Translate(variant_key, it->second, false)) {
-        it->second.failed = true;
+    if (is_new) {
+        const auto start = std::chrono::steady_clock::now();
+        if (!Translate(variant_key, it->second, false)) {
+            it->second.failed = true;
+            pipeline_stats.build_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        pipeline_stats.builds.fetch_add(1, std::memory_order_relaxed);
+        pipeline_stats.build_us.fetch_add(
+            std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count(),
+            std::memory_order_relaxed);
     }
     last_variant = &it->second;
     last_variant_key = variant_key;

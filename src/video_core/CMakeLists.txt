@@ -423,6 +423,7 @@ if (EMSCRIPTEN)
         renderer_webgpu/wgpu_buffer_cache_base.cpp
         renderer_webgpu/wgpu_pipeline_cache.cpp
         renderer_webgpu/wgpu_pipeline_cache.h
+        renderer_webgpu/wgpu_stats.h
         renderer_webgpu/wgpu_formats.cpp
         renderer_webgpu/wgpu_formats.h
         renderer_webgpu/wgpu_scheduler.cpp
