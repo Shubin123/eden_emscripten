@@ -467,6 +467,9 @@ private:
     }
 
     bool BuildRegion(CompiledBlock& entry) {
+        if (!RegionAllowedAt(A64::LocationDescriptor{entry.location}.PC())) {
+            return false;
+        }
         std::vector<CompiledBlock*> blocks{&entry};
         std::unordered_set<u64> seen{entry.location.Value()};
         for (size_t i = 0; i < blocks.size() && blocks.size() < kMaxRegionBlocks; ++i) {

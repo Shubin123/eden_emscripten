@@ -88,4 +88,11 @@ bool WasmJitEnabled();
 /// Entries into a block before a region is compiled for it (EDEN_JIT_THRESHOLD, default 8).
 u32 RegionThreshold();
 
+/// Whether a region may be compiled at this guest PC. EDEN_JIT_PC_RANGE=lo-hi (hex) limits
+/// compilation to entry PCs in [lo, hi), for bisecting miscompiled regions.
+bool RegionAllowedAt(u64 pc);
+
+/// Debug: opcodes in EDEN_JIT_HELPER_OPS=lo-hi (decimal) run through interpreter helpers.
+bool ForcedHelperOp(IR::Opcode opcode);
+
 }  // namespace Dynarmic::Backend::Interp

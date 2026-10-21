@@ -388,7 +388,8 @@ private:
                 const u32 parent = op.args[0];
                 inline_op[i] = IsFlagPseudoOp(op.opcode) && parent < count && inline_op[parent];
             } else {
-                inline_op[i] = IsInlineOpcode(op.opcode, target.a32) || IsInlineA32Special(op) || IsInlineFloat(op);
+                inline_op[i] = (IsInlineOpcode(op.opcode, target.a32) || IsInlineA32Special(op) || IsInlineFloat(op)) &&
+                               !ForcedHelperOp(op.opcode);
             }
         }
 
@@ -3272,6 +3273,34 @@ u32 RegionThreshold() {
         return value ? std::max(1, std::atoi(value)) : 8;
     }();
     return u32(threshold);
+}
+
+bool ForcedHelperOp(IR::Opcode opcode) {
+    static const std::pair<u32, u32> range = [] {
+        const char* value = std::getenv("EDEN_JIT_HELPER_OPS");
+        if (!value) {
+            return std::pair<u32, u32>{0, 0};
+        }
+        char* end = nullptr;
+        const u32 lo = u32(std::strtoul(value, &end, 10));
+        const u32 hi = *end == '-' ? u32(std::strtoul(end + 1, nullptr, 10)) : lo + 1;
+        return std::pair<u32, u32>{lo, hi};
+    }();
+    return u32(opcode) >= range.first && u32(opcode) < range.second;
+}
+
+bool RegionAllowedAt(u64 pc) {
+    static const std::pair<u64, u64> range = [] {
+        const char* value = std::getenv("EDEN_JIT_PC_RANGE");
+        if (!value) {
+            return std::pair<u64, u64>{0, ~u64{0}};
+        }
+        char* end = nullptr;
+        const u64 lo = std::strtoull(value, &end, 16);
+        const u64 hi = *end == '-' ? std::strtoull(end + 1, nullptr, 16) : ~u64{0};
+        return std::pair<u64, u64>{lo, hi};
+    }();
+    return pc >= range.first && pc < range.second;
 }
 
 bool WasmJitEnabled() {
