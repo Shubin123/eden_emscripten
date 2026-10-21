@@ -40,6 +40,6 @@ emcmake cmake -S "$root" -B "$build_dir" -G Ninja \
 [ "${EDEN_CONFIGURE_ONLY:-0}" = 1 ] && exit 0
 
 echo "Building Eden WebAssembly targets..."
-cmake --build "$build_dir" --target eden_web eden_headless --parallel "${EDEN_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+cmake --build "$build_dir" --target eden_web eden_headless --parallel "${EDEN_BUILD_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
 echo "Build complete. Artifacts are in $build_dir/bin; run 'npm run sync' in ../eden_web to install them."
