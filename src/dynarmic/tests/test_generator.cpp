@@ -521,12 +521,11 @@ void RunTestInstance(Dynarmic::A64::Jit& jit,
     }
 
     if (show_disas) {
-        fmt::print("instructions:\n");
-        auto current_pc = start_address;
+        fmt::print("instructions:");
         for (u32 instruction : instructions) {
-            fmt::print("{}", Dynarmic::Common::DisassembleAArch64(instruction, current_pc));
-            current_pc += 4;
+            fmt::print(" {:08x}", instruction);
         }
+        fmt::print("\n");
 
         fmt::print("initial_regs:");
         for (u64 i : regs)

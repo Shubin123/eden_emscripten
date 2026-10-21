@@ -120,7 +120,10 @@ target_include_directories(dynarmic_test_reader PRIVATE . ../src)
 target_compile_options(dynarmic_test_reader PRIVATE ${DYNARMIC_CXX_FLAGS})
 target_compile_definitions(dynarmic_test_reader PRIVATE FMT_USE_USER_DEFINED_LITERALS=1)
 if (EMSCRIPTEN)
-    target_link_options(dynarmic_test_reader PRIVATE -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sENVIRONMENT=node -sSTACK_SIZE=4MB --profiling-funcs)
+    foreach(target dynarmic_test_generator dynarmic_test_reader)
+        target_link_options(${target} PRIVATE -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sENVIRONMENT=node -sSTACK_SIZE=4MB --profiling-funcs
+            --pre-js ${CMAKE_CURRENT_SOURCE_DIR}/emscripten_env_pre.js)
+    endforeach()
 endif()
 
 #
