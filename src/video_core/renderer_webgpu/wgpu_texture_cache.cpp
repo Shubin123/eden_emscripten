@@ -402,6 +402,11 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         } else if (format_info.stencil && !format_info.depth && sampled) {
             desc.aspect = wgpu::TextureAspect::StencilOnly;
         }
+        if (desc.aspect != wgpu::TextureAspect::All) {
+            // A single-aspect view of a combined format must use that aspect's format
+            // (Depth24Plus for Depth24PlusStencil8); Undefined resolves to it.
+            desc.format = wgpu::TextureFormat::Undefined;
+        }
         if (sampled && can_swizzle) {
             desc.nextInChain = &swizzle_desc;
         }

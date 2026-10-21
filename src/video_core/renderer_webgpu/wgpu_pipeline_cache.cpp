@@ -406,6 +406,8 @@ wgpu::TextureView PipelineCache::FeedbackCopy(const ImageView& view, Shader::Tex
                                      : 1;
     if (view.Kind() == TextureKind::Depth) {
         desc.aspect = wgpu::TextureAspect::DepthOnly;
+        // Undefined resolves to the depth aspect's format, which combined formats require.
+        desc.format = wgpu::TextureFormat::Undefined;
     }
     return entry.copy.CreateView(&desc);
 }
