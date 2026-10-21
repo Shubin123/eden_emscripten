@@ -16,6 +16,13 @@ Frontend presentation, ROM mounting, touch/gamepad input mapping, and browser te
 - **Audio Engine**: Web Audio PCM streaming sink via low-latency ring buffers.
 - **Host Bridge**: Emscripten HTML5 library, MEMFS/IDBFS virtual filesystem for ROM loading, NAND simulation, and save-data persistence.
 
+## Credits
+
+- **Eden** by the Eden Emulator Project, continuing the **yuzu** Emulator Project.
+- **dynarmic** by MerryMage and contributors; the IR interpreter and Wasm JIT backends build on it.
+- **WebAssembly port** (Wasm JIT, WebGPU renderer, browser runtime) by Shubin123.
+- **Emscripten** and its contributors.
+
 ## Upstream Provenance
 
 - Upstream Source: https://github.com/eden-emulator/mirror (and `https://git.eden-emu.dev/eden-emu/eden.git`)
@@ -44,6 +51,10 @@ decoder. Build it once (it fetches pinned libarchive, xz and zstd sources):
 ```bash
 bash tools/web/build-archive.sh
 ```
+
+It is built from libarchive (Tim Kientzle and contributors), xz/liblzma (Lasse Collin and the
+Tukaani Project), zstd (Yann Collet and Meta), zlib (Jean-loup Gailly and Mark Adler) and bzip2
+(Julian Seward), fetched at pinned, checksummed releases.
 
 ### Syncing to Frontend
 
