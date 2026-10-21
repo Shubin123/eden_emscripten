@@ -86,6 +86,7 @@ if (EMSCRIPTEN)
         -sSTACK_SIZE=4MB
         -sDEFAULT_PTHREAD_STACK_SIZE=2MB
         -sASSERTIONS=0
+        -sEXCEPTION_STACK_TRACES=1
         --emit-symbol-map
     )
 

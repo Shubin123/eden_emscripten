@@ -8,6 +8,9 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #include "audio_core/common/common.h"
 #include "audio_core/sink/sdl3_sink.h"
@@ -39,6 +42,13 @@ namespace {
             LOG_CRITICAL(Audio_Sink, "SDL_InitSubSystem audio failed: {}", SDL_GetError());
             return false;
         }
+#if defined(__EMSCRIPTEN__) && defined(__wasm64__)
+        // Current Emscripten EM_ASM passes pointers as Numbers; SDL also accepts
+        // BigInts here for older toolchains. Division avoids truncating addresses above 4 GB.
+        MAIN_THREAD_EM_ASM({
+            Module['SDL3'].CPtrToHeap32Index = function(ptr) { return Number(ptr) / 4; };
+        });
+#endif
         LOG_INFO(Audio_Sink, "SDL audio driver: {}", SDL_GetCurrentAudioDriver());
     }
     return true;

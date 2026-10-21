@@ -59,7 +59,7 @@ namespace {
 
 /// Version of the exported C API. 1 is the original boot/input/stats set; later versions only add
 /// exports, so the page can check this before using newer ones.
-constexpr int ApiVersion = 2;
+constexpr int ApiVersion = 3;
 
 /// Window without a native surface; the web renderer presents to the page canvas itself.
 class WebEmuWindow final : public Core::Frontend::EmuWindow {
@@ -118,16 +118,11 @@ std::atomic<u64> g_frames{0};
 
 std::mutex g_game_info_mutex;
 std::string g_game_info = "{}";
+std::string g_build_info;
+std::atomic<bool> g_build_info_ready{false};
 
 std::string ToJson(const nlohmann::json& json) {
     return json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-}
-
-/// Copies `text` into a buffer owned by the calling thread, which stays valid until that thread
-/// next calls the same export.
-const char* ReturnString(std::string text, std::string& buffer) {
-    buffer = std::move(text);
-    return buffer.c_str();
 }
 
 bool CpuJitEnabled() {
@@ -155,7 +150,11 @@ void ApplyWebSettings() {
 #endif
     Settings::values.use_asynchronous_gpu_emulation.SetValue(true);
     Settings::values.use_disk_shader_cache.SetValue(false);
+#ifdef EDEN_WEB_HEADLESS
     Settings::values.sink_id.SetValue(Settings::AudioEngine::Null);
+#else
+    Settings::values.sink_id.SetValue(Settings::AudioEngine::Sdl3);
+#endif
 }
 
 class Emulator {
@@ -424,6 +423,53 @@ EMSCRIPTEN_KEEPALIVE double eden_get_frametime() {
     return g_frametime_ms;
 }
 
+/// Browser audio controls run on the calling UI thread; no emulation locks are needed.
+EMSCRIPTEN_KEEPALIVE int eden_get_audio_state() {
+#ifdef EDEN_WEB_HEADLESS
+    return -1;
+#else
+    return EM_ASM_INT({
+        var context = Module['SDL3'] && Module['SDL3'].audioContext;
+        if (!context) return 0;
+        return context.state === 'running' ? 2 : context.state === 'closed' ? -1 : 1;
+    });
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE void eden_set_audio_volume(int percent, int muted) {
+#ifndef EDEN_WEB_HEADLESS
+    EM_ASM({
+        var audio = Module['SDL3'];
+        var context = audio && audio.audioContext;
+        var source = audio && audio.audio_playback && audio.audio_playback.scriptProcessorNode;
+        if (!context || !source) return;
+        var gain = Module['edenAudioGain'];
+        if (!gain || gain.context !== context) {
+            gain = Module['edenAudioGain'] = context.createGain();
+            gain.connect(context.destination);
+        }
+        if (Module['edenAudioSource'] !== source) {
+            source.disconnect();
+            source.connect(gain);
+            Module['edenAudioSource'] = source;
+        }
+        gain.gain.setTargetAtTime($1 ? 0 : Math.max(0, Math.min(100, $0)) / 100,
+                                  context.currentTime, 0.01);
+    }, percent, muted);
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE void eden_resume_audio() {
+#ifndef EDEN_WEB_HEADLESS
+    EM_ASM({
+        var context = Module['SDL3'] && Module['SDL3'].audioContext;
+        if (context) context.resume().catch(function(error) {
+            err('Web Audio resume failed: ' + error.message);
+        });
+    });
+#endif
+}
+
 EMSCRIPTEN_KEEPALIVE int eden_get_api_version() {
     return ApiVersion;
 }
@@ -431,8 +477,8 @@ EMSCRIPTEN_KEEPALIVE int eden_get_api_version() {
 /// The returned strings below stay valid until the calling thread next calls the same export.
 /// Read them with ccall(name, 'string', [], []) or UTF8ToString(Number(Module._eden_xxx())).
 
-EMSCRIPTEN_KEEPALIVE const char* eden_get_build_info() {
-    static const std::string info = ToJson({
+static std::string MakeBuildInfo() {
+    return ToJson({
         {"apiVersion", ApiVersion},
         {"commit", std::string{Common::g_scm_rev}},
         {"branch", std::string{Common::g_scm_branch}},
@@ -468,15 +514,23 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_build_info() {
 #endif
          }},
     });
-    return info.c_str();
+}
+
+EMSCRIPTEN_KEEPALIVE const char* eden_get_build_info() {
+    return g_build_info_ready.load() ? g_build_info.c_str() : "{}";
 }
 
 /// JSON for the loaded game, or "{}" when none is: titleId, programId, name, displayVersion,
 /// version, fileType, fileName, is64Bit. Fields that could not be read are left out.
 EMSCRIPTEN_KEEPALIVE const char* eden_get_game_info() {
-    thread_local std::string buffer;
+    thread_local std::array<char, 16384> buffer{};
     std::scoped_lock lock{g_game_info_mutex};
-    return ReturnString(g_game_info, buffer);
+    if (g_game_info.size() >= buffer.size()) {
+        return "{}";
+    }
+    std::copy(g_game_info.begin(), g_game_info.end(), buffer.begin());
+    buffer[g_game_info.size()] = '\0';
+    return buffer.data();
 }
 
 /// Moves up to `max` frametimes (ms, oldest first) recorded since the last call into `out` and
@@ -510,44 +564,48 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_runtime_stats() {
     const auto load = [](const std::atomic<u64>& counter) {
         return counter.load(std::memory_order_relaxed);
     };
-    const auto ms = [&](const std::atomic<u64>& counter) {
-        return static_cast<double>(load(counter)) / 1000.0;
-    };
+    const auto number = [](u64 value) { return static_cast<unsigned long long>(value); };
     const u64 lookups = load(pipelines.lookups);
     const u64 misses = load(pipelines.misses);
-    thread_local std::string buffer;
-    return ReturnString(ToJson({
-                            {"frames", g_frames.load()},
-                            {"pipelineCacheHits", lookups - std::min(lookups, misses)},
-                            {"pipelineCacheMisses", misses},
-                            {"shaderCompiles", load(pipelines.builds)},
-                            {"shaderCompileMs", ms(pipelines.build_us)},
-                            {"shaderCompileFailures", load(pipelines.build_failures)},
-                            {"pipelineCreations", load(pipelines.creations)},
-                            {"pipelineCreationMs", ms(pipelines.creation_us)},
-                            {"pipelineCreationFailures", load(pipelines.creation_failures)},
-                            {"heapBytes", emscripten_get_heap_size()},
-                        }),
-                        buffer);
+    // UI getters must not allocate: a worker growing the heap can hold the allocator
+    // lock while waiting for a synchronous proxy request on this same UI thread.
+    thread_local std::array<char, 2048> buffer{};
+    std::snprintf(buffer.data(), buffer.size(),
+                  R"({"frames":%llu,"pipelineCacheHits":%llu,"pipelineCacheMisses":%llu,)"
+                  R"("shaderCompiles":%llu,"shaderCompileMs":%.3f,"shaderCompileFailures":%llu,)"
+                  R"("pipelineCreations":%llu,"pipelineCreationMs":%.3f,)"
+                  R"("pipelineCreationFailures":%llu,"heapBytes":%zu})",
+                  number(g_frames.load()), number(lookups - std::min(lookups, misses)),
+                  number(misses), number(load(pipelines.builds)),
+                  static_cast<double>(load(pipelines.build_us)) / 1000.0,
+                  number(load(pipelines.build_failures)), number(load(pipelines.creations)),
+                  static_cast<double>(load(pipelines.creation_us)) / 1000.0,
+                  number(load(pipelines.creation_failures)), emscripten_get_heap_size());
+    return buffer.data();
 }
 
 EMSCRIPTEN_KEEPALIVE const char* eden_get_capabilities() {
-    thread_local std::string buffer;
-    return ReturnString(ToJson({
-                            {"apiVersion", ApiVersion},
-                            {"cpuBackends", nlohmann::json::array({"jit", "interpreter"})},
-                            {"cpuBackend", CpuJitEnabled() ? "jit" : "interpreter"},
 #ifdef EDEN_WEB_HEADLESS
-                            {"renderer", "null"},
+    constexpr const char* renderer = "null";
+    constexpr const char* audio = "null";
 #else
-                            {"renderer", "webgpu"},
+    constexpr const char* renderer = "webgpu";
+    constexpr const char* audio = "webaudio";
 #endif
-                            {"operations", nlohmann::json::array({"boot", "pause", "resume",
-                                                                  "shutdown", "input", "frameTimes",
-                                                                  "gameInfo", "buildInfo",
-                                                                  "runtimeStats"})},
-                        }),
-                        buffer);
+    thread_local std::array<char, 1024> buffer{};
+    std::snprintf(buffer.data(), buffer.size(),
+                  R"({"apiVersion":%d,"cpuBackends":["jit","interpreter"],)"
+                  R"("cpuBackend":"%s","renderer":"%s","audio":"%s",)"
+                  R"("operations":["boot","pause","resume","shutdown","input","frameTimes",)"
+                  R"("gameInfo","buildInfo","runtimeStats"%s]})",
+                  ApiVersion, CpuJitEnabled() ? "jit" : "interpreter", renderer, audio,
+#ifdef EDEN_WEB_HEADLESS
+                  ""
+#else
+                  ",\"audio\""
+#endif
+    );
+    return buffer.data();
 }
 
 } // extern "C"
@@ -558,6 +616,9 @@ int main(int argc, char** argv) {
     Common::Log::Start();
     LOG_INFO(Frontend, "Eden WebAssembly {} | {}-{}", Common::g_build_fullname,
              Common::g_scm_branch, Common::g_scm_desc);
+
+    g_build_info = MakeBuildInfo();
+    g_build_info_ready = true;
 
     auto emulator = std::make_unique<Emulator>();
     ApplyWebSettings();
