@@ -1753,6 +1753,14 @@ private:
         code.Set(wrote_pc_local);
         for (size_t i = 0; i < block.ops.size() && !failed; ++i) {
             if (inline_op[i]) {
+                // Ops without carry or overflow (And, Or, ...) leave these unset, and locals are
+                // shared by every block of the region, so clear them to match the interpreter.
+                for (const u32 local : {carry_local[i], overflow_local[i]}) {
+                    if (local != kNone) {
+                        code.I64Const(0);
+                        code.Set(local);
+                    }
+                }
                 EmitInline(i);
                 SpillFlags(i);
             } else {
