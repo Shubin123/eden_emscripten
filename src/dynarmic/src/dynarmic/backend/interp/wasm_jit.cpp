@@ -10,9 +10,11 @@
 #include <optional>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <unordered_map>
 
 #include <emscripten.h>
+#include <emscripten/heap.h>
 #include <fmt/format.h>
 
 #include "dynarmic/backend/interp/wasm_emitter.h"
@@ -2922,6 +2924,20 @@ public:
     }
 
     bool Compile(std::vector<u8>& out) {
+        try {
+            return CompileImpl(out);
+        } catch (const std::bad_alloc&) {
+            EM_ASM({
+                err('dynarmic: region allocation failure: entry=' + $0.toString(16) +
+                    ' blocks=' + $1 + ' active=' + $2 + ' code=' + $3 +
+                    ' capacity=' + $4 + ' heap=' + $5 + '; using interpreter');
+            }, blocks.front()->location.Value(), blocks.size(), current_index,
+               code.bytes.size(), code.bytes.capacity(), emscripten_get_heap_size());
+            return false;
+        }
+    }
+
+    bool CompileImpl(std::vector<u8>& out) {
         const u32 n = u32(blocks.size());
         u32 locals_end = kLocalBase;
 

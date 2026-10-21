@@ -11,11 +11,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -54,12 +56,13 @@
 #include "input_common/main.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_webgpu/wgpu_stats.h"
+#include "yuzu_cmd/emscripten_rom.h"
 
 namespace {
 
 /// Version of the exported C API. 1 is the original boot/input/stats set; later versions only add
 /// exports, so the page can check this before using newer ones.
-constexpr int ApiVersion = 3;
+constexpr int ApiVersion = 4;
 
 /// Window without a native surface; the web renderer presents to the page canvas itself.
 class WebEmuWindow final : public Core::Frontend::EmuWindow {
@@ -150,6 +153,8 @@ void ApplyWebSettings() {
 #endif
     Settings::values.use_asynchronous_gpu_emulation.SetValue(true);
     Settings::values.use_disk_shader_cache.SetValue(false);
+    // Browser controllers use the virtual gamepad, without a Cemuhook UDP transport.
+    Settings::values.udp_input_servers.SetValue("");
 #ifdef EDEN_WEB_HEADLESS
     Settings::values.sink_id.SetValue(Settings::AudioEngine::Null);
 #else
@@ -172,7 +177,11 @@ public:
         Core::Crypto::KeyManager::Instance().ReloadKeys();
 
         system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
-        system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+        auto filesystem = CreateBrowserRomFilesystem(path);
+        if (!filesystem) {
+            filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
+        }
+        system.SetFilesystem(std::move(filesystem));
         system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
         system.GetUserChannel().clear();
 
@@ -364,6 +373,26 @@ public:
 } // Anonymous namespace
 
 extern "C" {
+
+#ifdef EDEN_WEB_ALLOC_DIAGNOSTICS
+void* __real_malloc(size_t size);
+void* __wrap_malloc(size_t size) {
+    void* result = __real_malloc(size);
+    thread_local bool reporting = false;
+    if (!result && !reporting) {
+        reporting = true;
+        const int allocation_error = errno;
+        const auto program_break = std::atomic_ref<uintptr_t>(*emscripten_get_sbrk_ptr()).load();
+        EM_ASM({
+            err('Eden allocation failed: requested=' + $0 + ' heap=' + $1 +
+                ' max=' + $2 + ' break=' + $3 + ' errno=' + $4);
+        }, size, emscripten_get_heap_size(), emscripten_get_heap_max(), program_break,
+           allocation_error);
+        reporting = false;
+    }
+    return result;
+}
+#endif
 
 EMSCRIPTEN_KEEPALIVE int eden_boot(const char* path) {
     if (!path || !path[0]) {
@@ -602,7 +631,7 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_capabilities() {
 #ifdef EDEN_WEB_HEADLESS
                   ""
 #else
-                  ",\"audio\""
+                  ",\"audio\",\"browserRom\""
 #endif
     );
     return buffer.data();
@@ -614,6 +643,19 @@ int main(int argc, char** argv) {
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+    std::set_terminate([] {
+        try {
+            if (const auto exception = std::current_exception()) {
+                std::rethrow_exception(exception);
+            }
+            EM_ASM({ err('Eden native termination: no active C++ exception'); });
+        } catch (const std::exception& exception) {
+            EM_ASM({ err('Eden native termination: ' + UTF8ToString($0)); }, exception.what());
+        } catch (...) {
+            EM_ASM({ err('Eden native termination: unknown C++ exception'); });
+        }
+        std::abort();
+    });
     LOG_INFO(Frontend, "Eden WebAssembly {} | {}-{}", Common::g_build_fullname,
              Common::g_scm_branch, Common::g_scm_desc);
 

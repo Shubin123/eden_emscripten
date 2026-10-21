@@ -107,7 +107,14 @@ if (EMSCRIPTEN)
         EDEN_WEB_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
     )
 
-    add_executable(eden_web emscripten_main.cpp)
+    option(EDEN_WEB_ALLOC_DIAGNOSTICS "Log failed browser heap allocations" OFF)
+    if (EDEN_WEB_ALLOC_DIAGNOSTICS)
+        list(APPEND EDEN_WEB_LINK_OPTIONS "-Wl,--wrap=malloc"
+            "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/emscripten_alloc_pre.js\"")
+        list(APPEND EDEN_WEB_DEFINITIONS EDEN_WEB_ALLOC_DIAGNOSTICS)
+    endif()
+
+    add_executable(eden_web emscripten_main.cpp emscripten_rom.cpp)
     target_compile_definitions(eden_web PRIVATE ${EDEN_WEB_DEFINITIONS})
     target_link_libraries(eden_web PRIVATE common core input_common frontend_common video_core Threads::Threads)
     set_target_properties(eden_web PROPERTIES OUTPUT_NAME "eden")
@@ -121,7 +128,7 @@ if (EMSCRIPTEN)
         "-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','ENV','UTF8ToString','HEAPF64']"
     )
 
-    add_executable(eden_headless emscripten_main.cpp)
+    add_executable(eden_headless emscripten_main.cpp emscripten_rom.cpp)
     target_link_libraries(eden_headless PRIVATE common core input_common frontend_common video_core Threads::Threads)
     target_compile_definitions(eden_headless PRIVATE EDEN_WEB_HEADLESS ${EDEN_WEB_DEFINITIONS})
     target_link_options(eden_headless PRIVATE

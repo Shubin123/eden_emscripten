@@ -26,6 +26,38 @@ Uncaught C++ exceptions include their message and stack trace in browser/worker
 logs. The frontend must stop querying a crashed runtime; a dead worker may have
 held a lock when it failed.
 
+API version 4 adds the browser ROM reader. `eden_register_browser_rom(path, size)`
+registers one read-only file before boot. The filesystem delegates other paths,
+including keys, firmware and saves, to the usual runtime filesystem.
+
+| Export | Contract |
+| --- | --- |
+| `eden_get_rom_io_control()` | Address of the shared control structure |
+| `eden_get_rom_io_buffer()` | Address of the fixed 4 MB read buffer |
+| `eden_get_rom_io_buffer_size()` | Read buffer capacity in bytes |
+| `eden_register_browser_rom(path, size)` | 0 on success, -1 for an invalid path or size; call before boot |
+
+The control structure contains four 32-bit fields (`status`, `length`, `result`,
+reserved), followed by a 64-bit unsigned byte offset at byte 16. Native readers
+serialize requests, set status to 1 and wake the reader worker. That worker reads
+the browser `File`, copies into the buffer, sets the result count and status 2
+(or -1 on failure), then notifies the native waiter. Native code copies the result
+before resetting status to 0. Requests time out after ten seconds. Browser main
+thread reads are rejected; reads must happen on engine threads. The browser keeps
+the worker alive until the engine instance is discarded.
+
+Raw ROMs use their original browser `File`. Archives are decoded sequentially to
+OPFS before registration. Neither path retains an entire decoded ROM in JS heap.
+The frontend can use its legacy block-backed mount with older cores or when OPFS
+is unavailable. Headless builds retain regular filesystem input and do not
+advertise the `browserRom` operation.
+
+`-DEDEN_WEB_ALLOC_DIAGNOSTICS=ON` enables optional failed-malloc and memory-growth
+logging. It is off by default. Web builds also report the active exception from
+the terminate handler, or explicitly report when no exception is active. If a
+JIT region cannot allocate its temporary code buffer, it falls back to interpreting
+that region; this does not promise recovery from general memory exhaustion.
+
 Frame stepping, emulator save-state serialization and browser LDN transport are
 not exposed by this API. In-game save persistence is handled separately by the
 frontend's IndexedDB save watcher.
