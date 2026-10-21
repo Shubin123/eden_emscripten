@@ -3,7 +3,16 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
+# EDEN_DEV=1 builds into build-web-dev and links with -O1 instead of -O3. Object code is the same
+# -O3 as a release build, so emulation behaves identically; only the whole-program wasm-opt pass
+# at link time is lighter (seconds instead of minutes, larger wasm). Never publish a dev build.
+dev="${EDEN_DEV:-0}"
 build_dir="$root/build-web"
+link_flags=""
+if [ "$dev" = 1 ]; then
+  build_dir="$root/build-web-dev"
+  link_flags="-O1"
+fi
 
 # Activate emsdk if emcc is not in PATH
 if ! command -v emcc >/dev/null 2>&1; then
@@ -28,7 +37,7 @@ emcmake cmake -S "$root" -B "$build_dir" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   "-DCMAKE_C_FLAGS=$web_flags" \
   "-DCMAKE_CXX_FLAGS=$web_flags" \
-  "-DCMAKE_EXE_LINKER_FLAGS=$web_flags" \
+  "-DCMAKE_EXE_LINKER_FLAGS=$web_flags $link_flags" \
   -DENABLE_QT=OFF \
   -DENABLE_WEB_SERVICE=OFF \
   -DENABLE_LIBUSB=OFF \
