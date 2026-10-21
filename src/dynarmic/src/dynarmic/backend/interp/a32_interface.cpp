@@ -605,11 +605,13 @@ private:
     }
 
     /// Fallback used by compiled blocks for operations that are not emitted inline.
-    static void ExecuteOpHelper(void* impl, void* block, u32 index) {
+    static void ExecuteOpHelper(void* impl, void* block, u32 index, u32 end) {
         auto& self = *static_cast<Impl*>(impl);
         auto& compiled = *static_cast<CompiledBlock*>(block);
-        CountHelperOp(compiled.ops[index].opcode);
-        self.ExecuteOp(compiled.ops[index], self.frame.data(), compiled);
+        for (; index < end; ++index) {
+            CountHelperOp(compiled.ops[index].opcode);
+            self.ExecuteOp(compiled.ops[index], self.frame.data(), compiled);
+        }
     }
 
     JitTarget MakeJitTarget() const {

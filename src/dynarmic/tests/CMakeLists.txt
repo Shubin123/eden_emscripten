@@ -26,6 +26,11 @@ add_executable(dynarmic_tests
 )
 target_link_libraries(dynarmic_tests PRIVATE merry::oaknut)
 
+if (EMSCRIPTEN)
+    target_sources(dynarmic_tests PRIVATE wasm_jit.cpp)
+    target_link_options(dynarmic_tests PRIVATE -sALLOW_MEMORY_GROWTH=1 -sALLOW_TABLE_GROWTH=1 -sMAXIMUM_MEMORY=16GB -sENVIRONMENT=node -sSTACK_SIZE=4MB)
+endif()
+
 if (DYNARMIC_TESTS_USE_UNICORN)
     target_link_libraries(dynarmic_tests PRIVATE Unicorn::Unicorn)
     target_sources(dynarmic_tests PRIVATE

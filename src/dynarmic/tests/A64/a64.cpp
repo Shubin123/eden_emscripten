@@ -2444,6 +2444,37 @@ TEST_CASE("A64: {S,U}MINP.B, {S,U}MAXP.B", "[a64]") {
     CHECK(jit.GetVector(9) == vectors[9]);
 }
 
+TEST_CASE("A64: dependent floating-point fallbacks preserve results and flags", "[a64][interp]") {
+    A64TestEnv env;
+    A64::UserConfig config{};
+    config.callbacks = &env;
+    A64::Jit jit{config};
+
+    oaknut::VectorCodeGenerator code{env.code_mem, nullptr};
+    code.FADD(S2, S0, S1);
+    code.FMUL(S3, S2, S1);
+    code.FSUB(S4, S3, S0);
+    code.FDIV(S5, S6, S6);
+    code.MRS(X0, oaknut::SystemReg::FPSR);
+    env.code_mem.emplace_back(0x14000000);
+
+    for (size_t iteration = 0; iteration < 16; ++iteration) {
+        jit.SetPC(0);
+        jit.SetFpsr(0);
+        jit.SetVector(0, {0x3f800000, 0});
+        jit.SetVector(1, {0x40000000, 0});
+        jit.SetVector(6, {0, 0});
+        env.ticks_left = env.code_mem.size();
+        jit.Run();
+
+        REQUIRE(jit.GetVector(2)[0] == 0x40400000);
+        REQUIRE(jit.GetVector(3)[0] == 0x40c00000);
+        REQUIRE(jit.GetVector(4)[0] == 0x40a00000);
+        REQUIRE(jit.GetVector(5)[0] == 0x7fc00000);
+        REQUIRE((jit.GetRegister(0) & 1) == 1);
+    }
+}
+
 TEST_CASE("A64: SQABS", "[a64]") {
     A64TestEnv env;
     A64::UserConfig jit_user_config{};

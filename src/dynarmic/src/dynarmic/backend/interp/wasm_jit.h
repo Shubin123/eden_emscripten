@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Compiles interpreter blocks to WebAssembly. Scalar operations are emitted inline; anything else
-// calls back into the interpreter for that single operation, so both paths share one frame.
+// calls back into the interpreter in consecutive runs, so both paths share one frame.
 
 #pragma once
 
@@ -18,8 +18,8 @@ namespace Dynarmic::Backend::Interp {
 
 /// Signature of a compiled block: (state, frame, impl, block).
 using CompiledBlockFn = void (*)(void*, void*, void*, void*);
-/// Signature of the interpreter fallback: (impl, block, op index).
-using OpHelperFn = void (*)(void*, void*, u32);
+/// Signature of the interpreter fallback: (impl, block, first op, exclusive end).
+using OpHelperFn = void (*)(void*, void*, u32, u32);
 
 /// Describes the guest state layout and memory configuration a block is compiled against.
 struct JitTarget {

@@ -388,7 +388,8 @@ private:
             const Op& op = block.ops[i];
             if (IR::IsAPseudoOperation(op.opcode)) {
                 const u32 parent = op.args[0];
-                inline_op[i] = IsFlagPseudoOp(op.opcode) && parent < count && inline_op[parent];
+                inline_op[i] = op.opcode == Opcode::IsZero32 || op.opcode == Opcode::IsZero64 ||
+                               (IsFlagPseudoOp(op.opcode) && parent < count && inline_op[parent]);
             } else {
                 inline_op[i] = (IsInlineOpcode(op.opcode, target.a32) || IsInlineA32Special(op) || IsInlineFloat(op)) &&
                                !ForcedHelperOp(op.opcode);
@@ -652,21 +653,31 @@ private:
         code.Byte(Insn::I32WrapI64);
     }
 
-    void CallHelper(size_t index) {
-        const bool touches_state = cached && HelperTouchesState(block.ops[index].opcode);
+    void CallHelper(size_t index, size_t end) {
+        bool touches_state = false;
+        if (cached) {
+            for (size_t current = index; current < end; ++current) {
+                touches_state |= HelperTouchesState(block.ops[current].opcode);
+            }
+        }
         if (touches_state) {
             FlushState();
         }
-        CallHelperRaw(index);
+        CallHelperRaw(index, end);
         if (touches_state) {
             ReloadState();
         }
     }
 
-    void CallHelperRaw(size_t index) {
+    void CallHelper(size_t index) {
+        CallHelper(index, index + 1);
+    }
+
+    void CallHelperRaw(size_t index, size_t end) {
         code.Get(kImpl);
         code.I64Const(reinterpret_cast<u64>(&block));
         code.I32Const(u32(index));
+        code.I32Const(u32(end));
         code.I64Const(reinterpret_cast<u64>(target.helper));
         code.Byte(Insn::CallIndirect);
         code.U32(1);  // helper type
@@ -1766,7 +1777,12 @@ private:
                 EmitInline(i);
                 SpillFlags(i);
             } else {
-                CallHelper(i);
+                size_t end = i + 1;
+                while (end < block.ops.size() && !inline_op[end]) {
+                    ++end;
+                }
+                CallHelper(i, end);
+                i = end - 1;
             }
         }
     }
@@ -3153,7 +3169,7 @@ private:
         Writer module;
         module.bytes = {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00};
 
-        // Types: 0 = region (i64 i64 i64 i64) -> (), 1 = helper (i64 i64 i32) -> ().
+        // Types: 0 = region (i64 i64 i64 i64) -> (), 1 = helper (i64 i64 i32 i32) -> ().
         Writer types;
         types.U32(2);
         types.Byte(0x60);
@@ -3163,9 +3179,10 @@ private:
         }
         types.U32(0);
         types.Byte(0x60);
-        types.U32(3);
+        types.U32(4);
         types.Byte(u8(ValType::I64));
         types.Byte(u8(ValType::I64));
+        types.Byte(u8(ValType::I32));
         types.Byte(u8(ValType::I32));
         types.U32(0);
         Section(module, 1, types);
