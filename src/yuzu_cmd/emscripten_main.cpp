@@ -153,6 +153,7 @@ void ApplyWebSettings() {
 #endif
     Settings::values.use_asynchronous_gpu_emulation.SetValue(true);
     Settings::values.use_disk_shader_cache.SetValue(false);
+    Settings::values.astc_recompression.SetValue(Settings::AstcRecompression::Uncompressed);
     // Browser controllers use the virtual gamepad, without a Cemuhook UDP transport.
     Settings::values.udp_input_servers.SetValue("");
 #ifdef EDEN_WEB_HEADLESS

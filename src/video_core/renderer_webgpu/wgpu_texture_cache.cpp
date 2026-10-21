@@ -256,12 +256,26 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     const FormatInfo& format_info = GetFormatInfo(info.format);
     host_format = format_info.format;
     conversion = format_info.conversion;
+    const bool decode_astc =
+        VideoCore::Surface::IsPixelFormatASTC(info.format) &&
+        (host_format == wgpu::TextureFormat::Undefined ||
+         !Device().HasFeature(wgpu::FeatureName::TextureCompressionASTC));
+    if (decode_astc) {
+        flags |= VideoCommon::ImageFlagBits::Converted | VideoCommon::ImageFlagBits::CostlyLoad;
+        host_format = VideoCore::Surface::IsPixelFormatSRGB(info.format)
+                          ? wgpu::TextureFormat::RGBA8UnormSrgb
+                          : wgpu::TextureFormat::RGBA8Unorm;
+    }
     if (host_format == wgpu::TextureFormat::Undefined || info.type == ImageType::Buffer) {
         LOG_WARNING(Render, "WebGPU: unsupported image format {}", info.format);
         return;
     }
     wgpu::TextureDescriptor desc{};
     desc.size = TextureExtent(info);
+    if (decode_astc) {
+        desc.size.width = std::max(info.size.width, 1u);
+        desc.size.height = std::max(info.size.height, 1u);
+    }
     desc.dimension = info.type == ImageType::e3D ? wgpu::TextureDimension::e3D
                                                  : wgpu::TextureDimension::e2D;
     desc.format = host_format;
@@ -278,14 +292,17 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         desc.viewFormats = &twin;
     }
     texture = Device().CreateTexture(&desc);
-    runtime->memory_usage += guest_size_bytes;
+    runtime->memory_usage += decode_astc ? converted_size_bytes : guest_size_bytes;
 }
 
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
 
 Image::~Image() {
     if (runtime && texture) {
-        runtime->memory_usage -= std::min<u64>(runtime->memory_usage, guest_size_bytes);
+        const u64 host_size = True(flags & VideoCommon::ImageFlagBits::Converted)
+                                  ? converted_size_bytes
+                                  : guest_size_bytes;
+        runtime->memory_usage -= std::min(runtime->memory_usage, host_size);
         texture.Destroy();
     }
 }
@@ -310,10 +327,11 @@ void Image::UploadMemory(const StagingBufferMap& map,
     }
     runtime->scheduler.BeforeQueueWrite();
     auto& queue = Thread::Get().queue;
-    const u32 block_w = DefaultBlockWidth(info.format);
-    const u32 block_h = DefaultBlockHeight(info.format);
-    const u32 guest_bpb = BytesPerBlock(info.format);
-    const u32 host_bpb = HostBytesPerBlock(info.format);
+    const bool decoded = True(flags & VideoCommon::ImageFlagBits::Converted);
+    const u32 block_w = decoded ? 1 : DefaultBlockWidth(info.format);
+    const u32 block_h = decoded ? 1 : DefaultBlockHeight(info.format);
+    const u32 guest_bpb = decoded ? 4 : BytesPerBlock(info.format);
+    const u32 host_bpb = decoded ? 4 : HostBytesPerBlock(info.format);
     const bool is_3d = info.type == ImageType::e3D;
     for (const VideoCommon::BufferImageCopy& copy : copies) {
         const u32 row_blocks = Common::DivCeil(copy.buffer_row_length, block_w);
@@ -357,6 +375,12 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
     texture = image.Texture();
     const FormatInfo& format_info = GetFormatInfo(format);
     host_format = format_info.format;
+    if (True(image.flags & VideoCommon::ImageFlagBits::Converted) &&
+        VideoCore::Surface::IsPixelFormatASTC(format)) {
+        host_format = VideoCore::Surface::IsPixelFormatSRGB(format)
+                          ? wgpu::TextureFormat::RGBA8UnormSrgb
+                          : wgpu::TextureFormat::RGBA8Unorm;
+    }
     if (!IsViewCompatible(image.Format(), host_format)) {
         // WebGPU views cannot reinterpret formats; view the image as what it is.
         host_format = image.Format();

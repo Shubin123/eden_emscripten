@@ -107,7 +107,7 @@ if (EMSCRIPTEN)
         EDEN_WEB_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
     )
 
-    option(EDEN_WEB_ALLOC_DIAGNOSTICS "Log failed browser heap allocations" OFF)
+    option(EDEN_WEB_ALLOC_DIAGNOSTICS "Log browser heap growth and texture allocation failures" OFF)
     if (EDEN_WEB_ALLOC_DIAGNOSTICS)
         list(APPEND EDEN_WEB_LINK_OPTIONS "-Wl,--wrap=malloc"
             "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/emscripten_alloc_pre.js\"")
@@ -139,4 +139,10 @@ if (EMSCRIPTEN)
         --profiling-funcs
         --pre-js "${CMAKE_CURRENT_SOURCE_DIR}/emscripten_headless_pre.js"
     )
+    set_property(TARGET eden_headless APPEND PROPERTY LINK_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/emscripten_headless_pre.js")
+    if (EDEN_WEB_ALLOC_DIAGNOSTICS)
+        set_property(TARGET eden_web eden_headless APPEND PROPERTY LINK_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/emscripten_alloc_pre.js")
+    endif()
 endif()

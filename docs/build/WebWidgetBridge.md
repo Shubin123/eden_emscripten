@@ -58,6 +58,18 @@ the terminate handler, or explicitly report when no exception is active. If a
 JIT region cannot allocate its temporary code buffer, it falls back to interpreting
 that region; this does not promise recovery from general memory exhaustion.
 
+The WebGPU texture cache checks the device's ASTC feature before allocating
+compressed textures. When ASTC or the requested block size is unavailable, it
+marks the image for the shared CPU decoder and creates an RGBA8 texture. Uploads
+then use pixel rows instead of compressed-block rows; views preserve linear/sRGB
+interpretation, and memory counters account for the decoded allocation. Web
+settings keep ASTC recompression disabled for this RGBA path.
+
+Allocation diagnostics also record texture creation exceptions with their
+descriptors, and the start/completion of heap growth. These hooks are diagnostic
+only. CMake tracks the native JS bridge and pre-JS files as link dependencies so
+changes to them rebuild the runtime modules.
+
 Frame stepping, emulator save-state serialization and browser LDN transport are
 not exposed by this API. In-game save persistence is handled separately by the
 frontend's IndexedDB save watcher.

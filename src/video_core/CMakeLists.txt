@@ -437,6 +437,8 @@ if (EMSCRIPTEN)
     target_compile_options(video_core PRIVATE --use-port=emdawnwebgpu)
     target_link_options(video_core INTERFACE --use-port=emdawnwebgpu
         "--js-library=${CMAKE_CURRENT_SOURCE_DIR}/renderer_webgpu/eden_webgpu.js")
+    set_property(TARGET video_core APPEND PROPERTY INTERFACE_LINK_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/renderer_webgpu/eden_webgpu.js")
     target_compile_definitions(video_core PUBLIC HAS_WEBGPU)
 endif()
 
