@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+
+#include <mutex>
 
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/service.h"
@@ -62,6 +67,9 @@ private:
     KernelHelpers::ServiceContext service_context;
 
     Kernel::KEvent* notification_event;
+    std::shared_ptr<Service::Set::ISystemSettingsServer> GetSetSys();
+
+    std::once_flag m_set_sys_once;
     std::shared_ptr<Service::Set::ISystemSettingsServer> m_set_sys;
     std::array<s32, 6> m_target_volumes{{15, 15, 15, 15, 15, 15}};
     std::array<bool, 6> m_target_muted{{false, false, false, false, false, false}};

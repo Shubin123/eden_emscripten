@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/settings.h"
+#include "core/arm/debug.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
@@ -93,13 +97,16 @@ void DynarmicCallbacks64::InstructionCacheOperationRaised(Dynarmic::A64::Instruc
     case Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU: {
         static constexpr u64 ICACHE_LINE_SIZE = 64;
         const u64 cache_line_start = value & ~(ICACHE_LINE_SIZE - 1);
-        m_parent.InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);
+        // Every core of this process, not just the current one: guest threads migrate, so
+        // invalidating only the core that happened to run `ic ivau` leaves the others
+        // executing stale translations of code the guest has already rewritten.
+        Core::InvalidateInstructionCacheRange(m_process, cache_line_start, ICACHE_LINE_SIZE);
         break;
     }
     case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoU:
+    case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoUInnerSharable:
         m_parent.ClearInstructionCache();
         break;
-    case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoUInnerSharable:
     default:
         LOG_DEBUG(Core_ARM, "Unprocesseed instruction cache operation: {}", op);
         break;
@@ -444,6 +451,8 @@ void ArmDynarmic64::ClearInstructionCache() {
 }
 
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
+    // MemoryReadCode()'s page snapshot goes stale as soon as the guest rewrites that page.
+    m_cb->last_code_addr = u64(-1);
     m_jit->InvalidateCacheRange(addr, size);
 }
 

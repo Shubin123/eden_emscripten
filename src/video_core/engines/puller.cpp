@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -80,12 +83,22 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
-    const auto semaphoreOperationMask = 0xF;
-    const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
+    // MAXWELL_CHANNEL_GPFIFO_A (clb06f.h): SEMAPHORED_OPERATION is 4:0, RELEASE_SIZE is 24:24
+    // (0 = 16 bytes: payload, zero, timestamp; 1 = 4 bytes: payload only).
+    static constexpr u32 semaphore_operation_mask = 0x1F;
+    static constexpr u32 release_size_4byte = 1U << 24;
+    const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphore_operation_mask);
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
         const u32 payload = regs.semaphore_sequence;
-        dma_pusher.rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, VideoCommon::QueryPropertiesFlags::HasTimeout, payload, 0);
+        // IsAFence: write the release once the host GPU has finished the work before it, like
+        // SemaphoreRelease below. Without it the write waits in SyncOperation for some later
+        // fence, so a guest polling the semaphore without a fence of its own never sees it.
+        auto flags = VideoCommon::QueryPropertiesFlags::IsAFence;
+        if ((regs.semaphore_trigger & release_size_4byte) == 0) {
+            flags |= VideoCommon::QueryPropertiesFlags::HasTimeout;
+        }
+        dma_pusher.rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, flags, payload, 0);
     } else {
         do {
             const u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());

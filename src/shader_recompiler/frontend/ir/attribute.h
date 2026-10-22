@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// SPDX-FileCopyrightText: Copyright 2026 citron Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -237,7 +240,8 @@ constexpr size_t NUM_GENERICS = 32;
 constexpr size_t NUM_FIXEDFNCTEXTURE = 10;
 
 [[nodiscard]] inline bool IsGeneric(Attribute attribute) noexcept {
-    return attribute >= Attribute::Generic0X && attribute <= Attribute::Generic31X;
+    // Generic31W, not Generic31X: the last three components of the last generic are generic too.
+    return attribute >= Attribute::Generic0X && attribute <= Attribute::Generic31W;
 }
 
 [[nodiscard]] inline bool IsLegacyAttribute(Attribute attribute) noexcept {
