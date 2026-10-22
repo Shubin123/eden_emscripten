@@ -86,6 +86,7 @@ void PerfStats::EndSystemFrame() {
 
 void PerfStats::EndGameFrame() {
     game_frames.fetch_add(1, std::memory_order_relaxed);
+    total_game_frames.fetch_add(1, std::memory_order_relaxed);
 }
 
 double PerfStats::GetMeanFrametime() const {
@@ -139,6 +140,10 @@ std::size_t PerfStats::ReadRecentFrametimes(u64& cursor, std::span<double> out) 
         out[count] = recent_frametimes[cursor % recent_frametimes.size()];
     }
     return count;
+}
+
+u64 PerfStats::GetGameFrameCount() {
+    return total_game_frames.load(std::memory_order_relaxed);
 }
 
 u64 PerfStats::GetSystemFrameCount() const {

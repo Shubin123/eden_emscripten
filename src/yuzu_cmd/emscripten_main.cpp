@@ -476,6 +476,11 @@ EMSCRIPTEN_KEEPALIVE double eden_get_game_fps() {
     return g_game_fps;
 }
 
+/// Game frames submitted since the runtime started; test scripts time their input by it.
+EMSCRIPTEN_KEEPALIVE double eden_get_game_frames() {
+    return static_cast<double>(Core::PerfStats::GetGameFrameCount());
+}
+
 EMSCRIPTEN_KEEPALIVE double eden_get_system_fps() {
     return g_system_fps;
 }

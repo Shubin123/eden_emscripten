@@ -62,6 +62,10 @@ public:
     /// Number of system frames recorded since this object was created.
     u64 GetSystemFrameCount() const;
 
+    /// Number of game frames submitted since the process started. It is process-wide so a
+    /// frontend can read it from any thread without holding the System.
+    static u64 GetGameFrameCount();
+
 private:
     mutable std::mutex object_mutex;
 
@@ -87,6 +91,7 @@ private:
     u32 system_frames = 0;
     /// Cumulative number of game frames (GSP frame submissions) since last reset
     std::atomic<u32> game_frames = 0;
+    static inline std::atomic<u64> total_game_frames = 0;
 
     /// Point when the previous system frame ended
     Clock::time_point previous_frame_end = reset_point;
