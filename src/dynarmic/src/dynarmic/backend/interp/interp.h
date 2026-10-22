@@ -85,7 +85,7 @@ struct WasmRegion {
 
 /// Accounts executed guest cycles; prints a throughput summary every few seconds when the
 /// EDEN_INTERP_STATS environment variable is set.
-void RecordExecutedCycles(u64 cycles, u32 core);
+void RecordExecutedCycles(u64 cycles, u32 core, u64 busy_ns);
 
 /// Counts an operation executed through the interpreter fallback of a compiled region.
 void CountHelperOp(IR::Opcode opcode);

@@ -5,6 +5,7 @@
 // generator, such as WebAssembly.
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -87,6 +88,7 @@ struct Jit::Impl final {
         is_executing = true;
         state.dispatch_table = dispatch_tables.ForThisThread();
 
+        const auto started = std::chrono::steady_clock::now();
         cycles_to_run = conf.enable_cycle_counting ? s64(conf.callbacks->GetTicksRemaining()) : std::numeric_limits<s64>::max();
         cycles_remaining = cycles_to_run;
 
@@ -102,7 +104,8 @@ struct Jit::Impl final {
             block = Execute(*block, false);
         }
 
-        RecordExecutedCycles(u64(cycles_to_run - cycles_remaining), conf.processor_id);
+        RecordExecutedCycles(u64(cycles_to_run - cycles_remaining), conf.processor_id,
+                             u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
         if (conf.enable_cycle_counting) {
             conf.callbacks->AddTicks(u64(cycles_to_run - cycles_remaining));
         }
@@ -125,7 +128,7 @@ struct Jit::Impl final {
             Execute(*block, true);
         }
 
-        RecordExecutedCycles(u64(cycles_to_run - cycles_remaining), conf.processor_id);
+        RecordExecutedCycles(u64(cycles_to_run - cycles_remaining), conf.processor_id, 0);
         if (conf.enable_cycle_counting) {
             conf.callbacks->AddTicks(u64(cycles_to_run - cycles_remaining));
         }

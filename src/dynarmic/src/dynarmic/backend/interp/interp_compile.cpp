@@ -13,6 +13,8 @@
 
 #include <fmt/format.h>
 
+#include "dynarmic/interface/exec_stats.h"
+
 #include "common/assert.h"
 #include "dynarmic/backend/interp/interp.h"
 #include "dynarmic/backend/interp/wasm_jit.h"
@@ -118,7 +120,14 @@ bool SamplePC(u64 pc) {
     return false;
 }
 
-void RecordExecutedCycles(u64 cycles, u32 core) {
+namespace {
+std::array<std::atomic<u64>, 8> g_exec_cycles{};
+std::array<std::atomic<u64>, 8> g_exec_busy_ns{};
+}  // Anonymous namespace
+
+void RecordExecutedCycles(u64 cycles, u32 core, u64 busy_ns) {
+    g_exec_cycles[core & 7].fetch_add(cycles, std::memory_order_relaxed);
+    g_exec_busy_ns[core & 7].fetch_add(busy_ns, std::memory_order_relaxed);
     static const bool enabled = std::getenv("EDEN_INTERP_STATS") != nullptr;
     if (!enabled) {
         return;
@@ -281,3 +290,12 @@ void Compile(CompiledBlock& out, const IR::Block& block) {
 }
 
 }  // namespace Dynarmic::Backend::Interp
+
+namespace Dynarmic {
+
+ExecStats GetExecStats(std::uint32_t core) {
+    using namespace Backend::Interp;
+    return {g_exec_cycles[core & 7].load(std::memory_order_relaxed), g_exec_busy_ns[core & 7].load(std::memory_order_relaxed)};
+}
+
+}  // namespace Dynarmic

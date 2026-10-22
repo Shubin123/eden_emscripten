@@ -116,7 +116,7 @@ if (EMSCRIPTEN)
 
     add_executable(eden_web emscripten_main.cpp emscripten_rom.cpp)
     target_compile_definitions(eden_web PRIVATE ${EDEN_WEB_DEFINITIONS})
-    target_link_libraries(eden_web PRIVATE common core input_common frontend_common video_core Threads::Threads)
+    target_link_libraries(eden_web PRIVATE common core input_common frontend_common video_core dynarmic::dynarmic Threads::Threads)
     set_target_properties(eden_web PROPERTIES OUTPUT_NAME "eden")
     target_link_options(eden_web PRIVATE
         ${EDEN_WEB_LINK_OPTIONS}
@@ -129,7 +129,7 @@ if (EMSCRIPTEN)
     )
 
     add_executable(eden_headless emscripten_main.cpp emscripten_rom.cpp)
-    target_link_libraries(eden_headless PRIVATE common core input_common frontend_common video_core Threads::Threads)
+    target_link_libraries(eden_headless PRIVATE common core input_common frontend_common video_core dynarmic::dynarmic Threads::Threads)
     target_compile_definitions(eden_headless PRIVATE EDEN_WEB_HEADLESS ${EDEN_WEB_DEFINITIONS})
     target_link_options(eden_headless PRIVATE
         ${EDEN_WEB_LINK_OPTIONS}

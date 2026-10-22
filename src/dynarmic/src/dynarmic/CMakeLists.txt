@@ -73,6 +73,7 @@ add_library(dynarmic STATIC
     frontend/imm.h
     interface/halt_reason.h
     interface/exclusive_monitor.h
+    interface/exec_stats.h
     interface/optimization_flags.h
     ir/acc_type.h
     ir/basic_block.cpp

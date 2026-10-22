@@ -53,6 +53,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
+#include "dynarmic/interface/exec_stats.h"
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/camera.h"
 #include "input_common/drivers/virtual_gamepad.h"
@@ -644,13 +645,18 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_runtime_stats() {
                   R"({"frames":%llu,"pipelineCacheHits":%llu,"pipelineCacheMisses":%llu,)"
                   R"("shaderCompiles":%llu,"shaderCompileMs":%.3f,"shaderCompileFailures":%llu,)"
                   R"("pipelineCreations":%llu,"pipelineCreationMs":%.3f,)"
-                  R"("pipelineCreationFailures":%llu,"heapBytes":%zu})",
+                  R"("pipelineCreationFailures":%llu,"heapBytes":%zu,)"
+                  R"("guestCycles":[%llu,%llu,%llu,%llu],"guestBusyMs":[%.1f,%.1f,%.1f,%.1f]})",
                   number(g_frames.load()), number(lookups - std::min(lookups, misses)),
                   number(misses), number(load(pipelines.builds)),
                   static_cast<double>(load(pipelines.build_us)) / 1000.0,
                   number(load(pipelines.build_failures)), number(load(pipelines.creations)),
                   static_cast<double>(load(pipelines.creation_us)) / 1000.0,
-                  number(load(pipelines.creation_failures)), emscripten_get_heap_size());
+                  number(load(pipelines.creation_failures)), emscripten_get_heap_size(),
+                  number(Dynarmic::GetExecStats(0).cycles), number(Dynarmic::GetExecStats(1).cycles),
+                  number(Dynarmic::GetExecStats(2).cycles), number(Dynarmic::GetExecStats(3).cycles),
+                  double(Dynarmic::GetExecStats(0).busy_ns) / 1e6, double(Dynarmic::GetExecStats(1).busy_ns) / 1e6,
+                  double(Dynarmic::GetExecStats(2).busy_ns) / 1e6, double(Dynarmic::GetExecStats(3).busy_ns) / 1e6);
     return buffer.data();
 }
 
@@ -819,8 +825,24 @@ int main(int argc, char** argv) {
             emulator->SetButton(0, 0, tap_a_pressed);
         }
         if (g_state == int(EmuState::Running)) {
-            LOG_INFO(Frontend, "perf: game {:.1f} fps, system {:.1f} fps, speed {:.0f}%",
-                     g_game_fps.load(), g_system_fps.load(), g_emulation_speed.load() * 100.0);
+            // Guest cycles per real second, and per second the cores spent executing: the second
+            // measures CPU emulation speed even when a game is capped at its frame rate.
+            static u64 last_cycles = 0, last_busy = 0;
+            static auto last_at = std::chrono::steady_clock::now();
+            u64 cycles = 0, busy = 0;
+            for (u32 core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+                cycles += Dynarmic::GetExecStats(core).cycles;
+                busy += Dynarmic::GetExecStats(core).busy_ns;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - last_at).count();
+            LOG_INFO(Frontend, "perf: game {:.1f} fps, system {:.1f} fps, speed {:.0f}%, guest {:.1f} M cycles/s, {:.1f} M per busy s",
+                     g_game_fps.load(), g_system_fps.load(), g_emulation_speed.load() * 100.0,
+                     double(cycles - last_cycles) / seconds / 1e6,
+                     busy > last_busy ? double(cycles - last_cycles) / (double(busy - last_busy) / 1e9) / 1e6 : 0.0);
+            last_cycles = cycles;
+            last_busy = busy;
+            last_at = now;
         }
         if (g_state == int(EmuState::Failed) || g_state == int(EmuState::Stopped) ||
             std::chrono::steady_clock::now() > deadline) {
