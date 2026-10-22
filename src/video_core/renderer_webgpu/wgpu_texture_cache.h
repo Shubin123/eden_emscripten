@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <memory>
 #include <vector>
 
 #include <webgpu/webgpu_cpp.h>
@@ -42,7 +43,8 @@ enum class TextureKind : u8 {
 
 /// CPU memory standing in for a staging buffer: uploads go through queue.WriteTexture.
 struct StagingBufferMap {
-    std::vector<u8> storage;
+    /// Left uninitialized: callers overwrite the mapped span before it is read.
+    std::shared_ptr<u8[]> storage;
     std::span<u8> mapped_span;
     size_t offset = 0;
     wgpu::Buffer buffer;

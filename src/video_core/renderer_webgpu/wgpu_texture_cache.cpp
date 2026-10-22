@@ -156,13 +156,16 @@ void TextureCacheRuntime::Finish() {
 
 StagingBufferMap TextureCacheRuntime::UploadStagingBuffer(size_t size, bool) {
     StagingBufferMap map;
-    map.storage.resize(size);
-    map.mapped_span = map.storage;
+    map.storage = std::make_shared_for_overwrite<u8[]>(size);
+    map.mapped_span = std::span<u8>(map.storage.get(), size);
     return map;
 }
 
 StagingBufferMap TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool) {
-    return UploadStagingBuffer(size);
+    // Downloads are not read back from the GPU yet, so hand out zeros rather than garbage.
+    StagingBufferMap map = UploadStagingBuffer(size);
+    std::fill(map.mapped_span.begin(), map.mapped_span.end(), u8{0});
+    return map;
 }
 
 void TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst, ImageView& src,

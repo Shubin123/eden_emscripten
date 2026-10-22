@@ -38,6 +38,8 @@ NCA::NCA(VirtualFile file_, const NCA* base_nca, bool allow_missing_base)
 
     reader = std::make_shared<NcaReader>();
     if (Result rc = reader->Initialize(file, GetCryptoConfiguration(), GetNcaCompressionConfiguration()); R_FAILED(rc)) {
+        LOG_ERROR(Loader, "Cannot read the header of NCA {}: module {} description {}", file->GetName(),
+                  static_cast<u32>(rc.GetModule()), rc.GetDescription());
         status = Loader::ResultStatus::ErrorBadNCAHeader;
         return;
     }

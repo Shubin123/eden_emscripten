@@ -34,6 +34,7 @@
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/hardware_properties.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/common_funcs.h"
@@ -182,6 +183,8 @@ public:
         LOG_INFO(Frontend, "Booting {}", path);
         // The page picks the CPU core by setting EDEN_INTERP_JIT before the runtime starts.
         LOG_INFO(Frontend, "CPU core: {}", CpuJitEnabled() ? "Wasm JIT" : "IR interpreter");
+        LOG_INFO(Frontend, "CPU: {} emulated cores, multicore {}", Core::Hardware::NUM_CPU_CORES,
+                 Settings::values.use_multi_core.GetValue() ? "on" : "off");
         SetGameInfo("{}");
         ResetFrameTimes();
         WebGPU::pipeline_stats.Reset();
@@ -732,6 +735,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     const int seconds = argc > 2 ? std::atoi(argv[2]) : 60;
+    // --tap-a=<s>: from <s> seconds after start, toggle A every main-loop tick to get past menus.
+    int tap_a_after = -1;
     for (int i = 3; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (arg == "--stats") {
@@ -747,12 +752,16 @@ int main(int argc, char** argv) {
         } else if (arg.starts_with("--dump-hot")) {
             // --dump-hot[=N]: dump the hottest blocks after N stats reports.
             setenv("EDEN_INTERP_DUMP_HOT", arg.size() > 11 ? std::string{arg.substr(11)}.c_str() : "0", 1);
+        } else if (arg.starts_with("--tap-a=")) {
+            tap_a_after = std::atoi(std::string{arg.substr(8)}.c_str());
         } else if (arg.starts_with("--dump=")) {
             setenv("EDEN_INTERP_DUMP", std::string{arg.substr(7)}.c_str(), 1);
         }
     }
     PushRequest({Request::Kind::Boot, argv[1]});
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::seconds(seconds);
+    bool tap_a_pressed = false;
 #endif
 
     for (;;) {
@@ -798,6 +807,11 @@ int main(int argc, char** argv) {
         static int dump_tick = 0;
         if (g_state == int(EmuState::Running) && std::getenv("EDEN_DUMP_THREADS") && ++dump_tick % 10 == 0) {
             emulator->DumpThreads();
+        }
+        if (tap_a_after >= 0 && g_state == int(EmuState::Running) &&
+            std::chrono::steady_clock::now() > start + std::chrono::seconds(tap_a_after)) {
+            tap_a_pressed = !tap_a_pressed;
+            emulator->SetButton(0, 0, tap_a_pressed);
         }
         if (g_state == int(EmuState::Running)) {
             LOG_INFO(Frontend, "perf: game {:.1f} fps, system {:.1f} fps, speed {:.0f}%",
