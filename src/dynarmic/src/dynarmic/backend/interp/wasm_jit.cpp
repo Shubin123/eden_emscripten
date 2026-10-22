@@ -388,8 +388,9 @@ private:
             const Op& op = block.ops[i];
             if (IR::IsAPseudoOperation(op.opcode)) {
                 const u32 parent = op.args[0];
-                inline_op[i] = op.opcode == Opcode::IsZero32 || op.opcode == Opcode::IsZero64 ||
-                               (IsFlagPseudoOp(op.opcode) && parent < count && inline_op[parent]);
+                inline_op[i] = !ForcedHelperOp(op.opcode) &&
+                               (op.opcode == Opcode::IsZero32 || op.opcode == Opcode::IsZero64 ||
+                                (IsFlagPseudoOp(op.opcode) && parent < count && inline_op[parent]));
             } else {
                 inline_op[i] = (IsInlineOpcode(op.opcode, target.a32) || IsInlineA32Special(op) || IsInlineFloat(op)) &&
                                !ForcedHelperOp(op.opcode);

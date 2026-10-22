@@ -28,7 +28,10 @@ fetch() {
   local archive="$work/src/$(basename "$url")"
   if [ ! -d "$work/src/$name" ]; then
     curl -fsSL -o "$archive" "$url"
-    echo "$sha  $archive" | sha256sum -c --quiet
+    if [ "$(sha256sum "$archive" | awk '{print $1}')" != "$sha" ]; then
+      echo "Checksum mismatch: $archive" >&2
+      exit 1
+    fi
     tar -xf "$archive" -C "$work/src"
   fi
 }

@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <emscripten.h>
 #include <emscripten/heap.h>
@@ -52,6 +53,7 @@
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
 #include "hid_core/hid_core.h"
+#include "input_common/drivers/camera.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "input_common/main.h"
 #include "video_core/gpu.h"
@@ -112,6 +114,15 @@ std::atomic<double> g_system_fps{0.0};
 std::atomic<double> g_emulation_speed{0.0};
 std::atomic<double> g_frametime_ms{0.0};
 
+constexpr size_t MaxCameraWidth = 320;
+constexpr size_t MaxCameraHeight = 240;
+std::array<u32, MaxCameraWidth * MaxCameraHeight> g_camera_upload{};
+std::vector<u32> g_camera_frame;
+size_t g_camera_width = 0;
+size_t g_camera_height = 0;
+bool g_camera_pending = false;
+std::atomic<int> g_camera_requested_width{0};
+
 /// Frametimes (ms) of presented frames that the page has not drained yet.
 std::mutex g_frame_mutex;
 std::array<double, 4096> g_frame_times{};
@@ -156,6 +167,7 @@ void ApplyWebSettings() {
     Settings::values.astc_recompression.SetValue(Settings::AstcRecompression::Uncompressed);
     // Browser controllers use the virtual gamepad, without a Cemuhook UDP transport.
     Settings::values.udp_input_servers.SetValue("");
+    Settings::values.enable_ir_sensor.SetValue(true);
 #ifdef EDEN_WEB_HEADLESS
     Settings::values.sink_id.SetValue(Settings::AudioEngine::Null);
 #else
@@ -345,6 +357,26 @@ public:
     void SetStick(int player, int stick, float x, float y) {
         input_subsystem.GetVirtualGamepad()->SetStickPosition(static_cast<size_t>(player), stick,
                                                               x, y);
+    }
+
+    void UpdateCamera() {
+        std::vector<u32> frame;
+        size_t width = 0;
+        size_t height = 0;
+        {
+            std::scoped_lock lock{g_request_mutex};
+            if (g_camera_pending) {
+                frame.swap(g_camera_frame);
+                width = g_camera_width;
+                height = g_camera_height;
+                g_camera_pending = false;
+            }
+        }
+        auto* camera = input_subsystem.GetCamera();
+        if (!frame.empty()) {
+            camera->SetCameraData(width, height, frame);
+        }
+        g_camera_requested_width = int(camera->getImageWidth());
     }
 
     void UpdatePerfStats() {
@@ -614,6 +646,30 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_runtime_stats() {
     return buffer.data();
 }
 
+EMSCRIPTEN_KEEPALIVE u32* eden_camera_buffer() {
+    return g_camera_upload.data();
+}
+
+EMSCRIPTEN_KEEPALIVE void eden_submit_camera(int width, int height) {
+    if (width <= 0 || height <= 0 || size_t(width) > MaxCameraWidth ||
+        size_t(height) > MaxCameraHeight) {
+        return;
+    }
+    {
+        std::scoped_lock lock{g_request_mutex};
+        g_camera_frame.assign(g_camera_upload.begin(),
+                              g_camera_upload.begin() + size_t(width) * size_t(height));
+        g_camera_width = size_t(width);
+        g_camera_height = size_t(height);
+        g_camera_pending = true;
+    }
+    g_request_cv.notify_one();
+}
+
+EMSCRIPTEN_KEEPALIVE int eden_get_camera_width() {
+    return g_camera_requested_width;
+}
+
 EMSCRIPTEN_KEEPALIVE const char* eden_get_capabilities() {
 #ifdef EDEN_WEB_HEADLESS
     constexpr const char* renderer = "null";
@@ -632,7 +688,7 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_capabilities() {
 #ifdef EDEN_WEB_HEADLESS
                   ""
 #else
-                  ",\"audio\",\"browserRom\""
+                  ",\"audio\",\"browserRom\",\"camera\""
 #endif
     );
     return buffer.data();
@@ -703,7 +759,8 @@ int main(int argc, char** argv) {
         std::optional<Request> request;
         {
             std::unique_lock lock{g_request_mutex};
-            g_request_cv.wait_for(lock, std::chrono::seconds(1), [] { return !g_requests.empty(); });
+            g_request_cv.wait_for(lock, std::chrono::seconds(1),
+                                  [] { return !g_requests.empty() || g_camera_pending; });
             if (!g_requests.empty()) {
                 request = std::move(g_requests.front());
                 g_requests.pop_front();
@@ -733,6 +790,7 @@ int main(int argc, char** argv) {
             }
         }
 
+        emulator->UpdateCamera();
         emulator->UpdatePerfStats();
         emulator->CollectFrameTimes();
 
