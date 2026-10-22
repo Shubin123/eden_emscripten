@@ -4,6 +4,8 @@
 // Portable A64 backend that interprets optimized IR blocks. Used on hosts without a code
 // generator, such as WebAssembly.
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -54,8 +56,13 @@ struct A64State {
     u32 fpcr = 0;
     u32 fpsr = 0;
     volatile u32 halt_reason = 0;
-    u8 exclusive_state = 0;
+    u32 exclusive_state = 0;
     bool check_bit = false;
+    /// Reservation of the local exclusive monitor (Unsafe_IgnoreGlobalMonitor).
+    u64 exclusive_address = 0;
+    u64 exclusive_value = 0;
+    /// Dispatch table of the thread running the Jit, read by compiled regions.
+    DispatchEntry* dispatch_table = nullptr;
 
     IR::LocationDescriptor Location() const {
         return A64::LocationDescriptor{pc, FP::FPCR{fpcr}, false};
@@ -78,6 +85,7 @@ struct Jit::Impl final {
         ASSERT(!is_executing);
         PerformRequestedCacheInvalidation(HaltReason(Atomic::Load(&state.halt_reason)));
         is_executing = true;
+        state.dispatch_table = dispatch_tables.ForThisThread();
 
         cycles_to_run = conf.enable_cycle_counting ? s64(conf.callbacks->GetTicksRemaining()) : std::numeric_limits<s64>::max();
         cycles_remaining = cycles_to_run;
@@ -222,7 +230,14 @@ struct Jit::Impl final {
 
 private:
     CompiledBlock* GetBlock(IR::LocationDescriptor descriptor) {
-        if (const auto it = block_cache.find(descriptor.Value()); it != block_cache.end()) {
+        // Most lookups hit a small direct-mapped cache in front of the block map.
+        const u64 key = descriptor.Value();
+        FastDispatchEntry& entry = fast_dispatch[((key ^ (key >> 32)) >> 2) % fast_dispatch.size()];
+        if (entry.block && entry.location == key) {
+            return entry.block;
+        }
+        if (const auto it = block_cache.find(key); it != block_cache.end()) {
+            entry = {key, it->second.get()};
             return it->second.get();
         }
 
@@ -248,6 +263,7 @@ private:
 
         CompiledBlock* result = block.get();
         block_cache.emplace(descriptor.Value(), std::move(block));
+        entry = {key, result};
         return result;
     }
 
@@ -269,20 +285,36 @@ private:
         if (!invalidate_entire_cache && invalid_cache_ranges.empty()) {
             return;
         }
+        fast_dispatch.fill({});
+        dispatch_tables.Clear();
         if (invalidate_entire_cache) {
             block_cache.clear();
             block_ranges.ClearCache();
         } else {
+            std::vector<u64> erased_keys;
+            std::unordered_set<const CompiledBlock*> erased;
             for (const auto& location : block_ranges.InvalidateRanges(invalid_cache_ranges)) {
-                block_cache.erase(location.Value());
+                if (const auto it = block_cache.find(location.Value()); it != block_cache.end()) {
+                    erased_keys.push_back(it->first);
+                    erased.insert(it->second.get());
+                }
             }
-            // Links may point at erased blocks.
+            // Keep the links and regions that only reference surviving blocks, so an unrelated
+            // invalidation does not force the whole cache to be recompiled.
             for (auto& [_, block] : block_cache) {
-                block->link_then = nullptr;
-                block->link_else = nullptr;
-                // Regions may contain erased blocks.
-                block->region.reset();
-                block->entry_count = 0;
+                if (erased.contains(block->link_then)) {
+                    block->link_then = nullptr;
+                }
+                if (erased.contains(block->link_else)) {
+                    block->link_else = nullptr;
+                }
+                if (block->region && std::ranges::any_of(block->region->blocks, [&](const CompiledBlock* b) { return erased.contains(b); })) {
+                    block->region.reset();
+                    block->entry_count = 0;
+                }
+            }
+            for (const u64 key : erased_keys) {
+                block_cache.erase(key);
             }
         }
         invalid_cache_ranges.clear();
@@ -369,9 +401,23 @@ private:
         CheckHaltAfterMemoryCallback();
     }
 
+    /// With Unsafe_IgnoreGlobalMonitor each core keeps its own reservation and the store is a
+    /// compare-and-swap against the value that was loaded, as in the native backends.
+    bool LocalMonitor() const {
+        return conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
+    }
+
     template<typename T>
     T ExclusiveRead(u64 vaddr) {
         state.exclusive_state = 1;
+        if constexpr (!std::is_same_v<T, Vector>) {
+            if (LocalMonitor()) {
+                const T value = Read<T>(vaddr);
+                state.exclusive_address = vaddr;
+                state.exclusive_value = u64(value);
+                return value;
+            }
+        }
         return conf.global_monitor->ReadAndMark<T>(conf.processor_id, vaddr, [&]() -> T {
             if constexpr (std::is_same_v<T, Vector>) {
                 return conf.callbacks->MemoryRead128(vaddr);
@@ -387,6 +433,26 @@ private:
             return 1;
         }
         state.exclusive_state = 0;
+        if constexpr (!std::is_same_v<T, Vector>) {
+            if (LocalMonitor()) {
+                if (state.exclusive_address != vaddr) {
+                    return 1;
+                }
+                T expected = T(state.exclusive_value);
+                if (u8* ptr = HostPointer<sizeof(T)>(vaddr)) {
+                    return __atomic_compare_exchange_n(reinterpret_cast<T*>(ptr), &expected, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 0 : 1;
+                }
+                if constexpr (sizeof(T) == 1) {
+                    return conf.callbacks->MemoryWriteExclusive8(vaddr, value, expected) ? 0 : 1;
+                } else if constexpr (sizeof(T) == 2) {
+                    return conf.callbacks->MemoryWriteExclusive16(vaddr, value, expected) ? 0 : 1;
+                } else if constexpr (sizeof(T) == 4) {
+                    return conf.callbacks->MemoryWriteExclusive32(vaddr, value, expected) ? 0 : 1;
+                } else {
+                    return conf.callbacks->MemoryWriteExclusive64(vaddr, value, expected) ? 0 : 1;
+                }
+            }
+        }
         const bool ok = conf.global_monitor->DoExclusiveOperation<T>(conf.processor_id, vaddr, [&](T expected) -> bool {
             if constexpr (std::is_same_v<T, Vector>) {
                 return conf.callbacks->MemoryWriteExclusive128(vaddr, value, expected);
@@ -459,7 +525,8 @@ private:
         if (!fn) {
             return false;
         }
-        fn(&state, frame.data(), this, nullptr);
+        state.dispatch_table[DispatchTables::IndexOf(block.location.Value())] = {block.location.Value(), reinterpret_cast<uintptr_t>(fn), block.region_index, 0};
+        fn(&state, frame.data(), this, reinterpret_cast<void*>(uintptr_t{block.region_index}));
         if (SamplePC(state.pc)) {
             DumpBlock(state.Location());
         }
@@ -477,7 +544,10 @@ private:
             const auto add = [&](IR::LocationDescriptor next) {
                 const IR::LocationDescriptor location = A64::LocationDescriptor{next}.SetSingleStepping(false);
                 if (blocks.size() < kMaxRegionBlocks && seen.insert(location.Value()).second) {
-                    blocks.push_back(GetBlock(location));
+                    // Blocks already compiled elsewhere are reached through their own region.
+                    if (CompiledBlock* successor = GetBlock(location); !successor->region) {
+                        blocks.push_back(successor);
+                    }
                 }
             };
             std::visit([&](const auto& term) { AddSuccessors(term, add); }, block.terminal);
@@ -487,7 +557,18 @@ private:
         if (!CompileRegion(blocks, jit_target, region->wasm)) {
             return false;
         }
-        entry.region = std::move(region);
+        region->blocks.assign(blocks.begin(), blocks.end());
+        if (TrackRegionCode(*region)) {
+            ClearCache();
+        }
+        // Blocks without a region of their own enter this one rather than compiling another
+        // copy of the same code.
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (!blocks[i]->region) {
+                blocks[i]->region = region;
+                blocks[i]->region_index = u32(i);
+            }
+        }
         return true;
     }
 
@@ -560,6 +641,13 @@ private:
         target.unfuse_fma = conf.HasOptimization(OptimizationFlag::Unsafe_UnfuseFMA);
         target.ignore_standard_fpcr = conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreStandardFPCRValue);
         target.cycle_counting = conf.enable_cycle_counting;
+        target.chain_regions = true;
+        target.fpcr_offset = offsetof(A64State, fpcr);
+        target.dispatch_table_offset = offsetof(A64State, dispatch_table);
+        target.local_exclusive_monitor = LocalMonitor();
+        target.exclusive_state_offset = offsetof(A64State, exclusive_state);
+        target.exclusive_address_offset = offsetof(A64State, exclusive_address);
+        target.exclusive_value_offset = offsetof(A64State, exclusive_value);
         target.cycles_remaining = reinterpret_cast<u64>(&cycles_remaining);
         target.halt_reason = reinterpret_cast<u64>(&state.halt_reason);
         if (conf.page_table_log2_stride != 3 || conf.check_halt_on_memory_access) {
@@ -636,6 +724,12 @@ private:
     IR::Block ir_block = {LocationDescriptor(0, FP::FPCR(0), false)};
     Optimization::PolyfillOptions polyfill_options{.sha256 = true, .vector_multiply_widen = true};
     std::unordered_map<u64, std::unique_ptr<CompiledBlock>> block_cache;
+    struct FastDispatchEntry {
+        u64 location = 0;
+        CompiledBlock* block = nullptr;
+    };
+    std::array<FastDispatchEntry, 4096> fast_dispatch{};
+    DispatchTables dispatch_tables;
     Backend::BlockRangeInformation<u64> block_ranges;
     std::vector<Slot> frame;
     s64 cycles_to_run = 0;

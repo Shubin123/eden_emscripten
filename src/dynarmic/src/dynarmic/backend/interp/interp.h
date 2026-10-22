@@ -61,16 +61,24 @@ struct CompiledBlock {
     /// Cached successors for LinkBlock terminals, invalidated with the cache.
     CompiledBlock* link_then = nullptr;
     CompiledBlock* link_else = nullptr;
-    /// Compiled region entered at this block, if any.
+    /// Compiled region containing this block, if any, and the block's index within it.
     std::shared_ptr<struct WasmRegion> region;
+    u32 region_index = 0;
     /// Number of times the block was entered from the dispatcher.
     u32 entry_count = 0;
 };
 
 /// A compiled set of linked blocks. Each thread instantiates the module on first use.
 struct WasmRegion {
+    /// Lets every thread release its instance of the module once the region is dropped.
+    ~WasmRegion();
+
     u64 id = 0;
     std::vector<u8> wasm;
+    /// Blocks compiled into the region; it must be dropped when any of them is invalidated.
+    std::vector<const CompiledBlock*> blocks;
+    /// Whether `wasm` counts towards the live code budget (see TrackRegionCode).
+    bool tracked = false;
     std::atomic<u32> last_thread{0};
     std::atomic<void (*)(void*, void*, void*, void*)> last_function{nullptr};
 };

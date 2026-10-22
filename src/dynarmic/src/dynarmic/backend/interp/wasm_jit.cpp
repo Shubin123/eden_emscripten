@@ -10,6 +10,7 @@
 #include <optional>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <unordered_map>
 
@@ -36,6 +37,12 @@ EM_JS(uint64_t, dynarmic_wasm_instantiate, (const void* data, size_t size), {
         const bytes = HEAPU8.slice(start, start + Number(size));
         const module = new WebAssembly.Module(bytes);
         const instance = new WebAssembly.Instance(module, {e: {m: wasmMemory, t: wasmTable}});
+        const free = globalThis.dynarmicFreeSlots;
+        if (free && free.length) {
+            const index = free.pop();
+            wasmTable.set(index, instance.exports.f);
+            return index;
+        }
         return BigInt(wasmTable.grow(1n, instance.exports.f));
     } catch (e) {
         err('dynarmic: failed to instantiate compiled block: ' + e);
@@ -46,6 +53,12 @@ EM_JS(uint64_t, dynarmic_wasm_instantiate, (const void* data, size_t size), {
         }
         return 0n;
     }
+});
+
+// Clears a table slot of this thread so its instance can be collected, and keeps it for reuse.
+EM_JS(void, dynarmic_wasm_release, (uint64_t index), {
+    wasmTable.set(index, null);
+    (globalThis.dynarmicFreeSlots ??= []).push(index);
 });
 
 namespace Dynarmic::Backend::Interp {
@@ -75,7 +88,7 @@ constexpr u32 kV128C = 31;
 constexpr u32 kState = 0;
 constexpr u32 kFrame = 1;
 constexpr u32 kImpl = 2;
-constexpr u32 kBlock = 3;
+constexpr u32 kEntry = 3;
 
 bool IsFlagPseudoOp(Opcode op) {
     switch (op) {
@@ -214,6 +227,8 @@ bool IsInlineOpcode(Opcode op, bool a32) {
     case Opcode::A64WriteMemory16:
     case Opcode::A64WriteMemory32:
     case Opcode::A64WriteMemory64:
+    case Opcode::A64ReadMemory128:
+    case Opcode::A64WriteMemory128:
         return !a32;
     case Opcode::A32SetCheckBit:
     case Opcode::A32GetRegister:
@@ -259,6 +274,16 @@ bool IsMemoryOp(Opcode op) {
     case Opcode::A64WriteMemory16:
     case Opcode::A64WriteMemory32:
     case Opcode::A64WriteMemory64:
+    case Opcode::A64ReadMemory128:
+    case Opcode::A64WriteMemory128:
+    case Opcode::A64ExclusiveReadMemory8:
+    case Opcode::A64ExclusiveReadMemory16:
+    case Opcode::A64ExclusiveReadMemory32:
+    case Opcode::A64ExclusiveReadMemory64:
+    case Opcode::A64ExclusiveWriteMemory8:
+    case Opcode::A64ExclusiveWriteMemory16:
+    case Opcode::A64ExclusiveWriteMemory32:
+    case Opcode::A64ExclusiveWriteMemory64:
     case Opcode::A32ReadMemory8:
     case Opcode::A32ReadMemory16:
     case Opcode::A32ReadMemory32:
@@ -392,7 +417,7 @@ private:
                                (op.opcode == Opcode::IsZero32 || op.opcode == Opcode::IsZero64 ||
                                 (IsFlagPseudoOp(op.opcode) && parent < count && inline_op[parent]));
             } else {
-                inline_op[i] = (IsInlineOpcode(op.opcode, target.a32) || IsInlineA32Special(op) || IsInlineFloat(op)) &&
+                inline_op[i] = (IsInlineOpcode(op.opcode, target.a32) || IsInlineA32Special(op) || IsInlineExclusiveA64(op) || IsInlineFloat(op)) &&
                                !ForcedHelperOp(op.opcode);
             }
         }
@@ -413,7 +438,7 @@ private:
                     spill_flags[parent] = true;
                 }
             }
-            const bool slow_path = inline_op[i] && IsMemoryOp(op.opcode);
+            const bool slow_path = inline_op[i] && (IsMemoryOp(op.opcode) || GuardedFloat(op));
             if (inline_op[i] && !slow_path) {
                 continue;
             }
@@ -832,6 +857,75 @@ private:
     }
 
 
+    void EmitRead128(size_t index) {
+        const Op& op = block.ops[index];
+        PushArg(op, 1);
+        code.Set(tmp0);
+        EmitHostAddress(16);
+        code.Get(tmp1);
+        code.Byte(Insn::I64Eqz);
+        code.If();
+        {
+            SpillArg(op, 1);
+            CallHelper(index);
+        }
+        code.Else();
+        {
+            code.Get(kFrame);
+            code.Get(tmp1);
+            SimdOp(0);  // v128.load
+            code.U32(0);
+            code.U64(0);
+            SimdOp(11);  // v128.store
+            code.U32(0);
+            code.U64(u64(index) * kSlotSize + kLoOffset);
+        }
+        code.End();
+    }
+
+    void EmitWrite128(size_t index) {
+        const Op& op = block.ops[index];
+        PushArg(op, 1);
+        code.Set(tmp0);
+        EmitHostAddress(16);
+        code.Get(tmp1);
+        code.Byte(Insn::I64Eqz);
+        code.If();
+        {
+            SpillArg(op, 1);
+            CallHelper(index);
+        }
+        code.Else();
+        {
+            code.Get(tmp1);
+            PushV128(op, 2);
+            SimdOp(11);  // v128.store
+            code.U32(0);
+            code.U64(0);
+        }
+        code.End();
+    }
+
+    bool IsInlineExclusiveA64(const Op& op) const {
+        if (target.a32) {
+            return false;
+        }
+        switch (op.opcode) {
+        case Opcode::A64ClearExclusive:
+        case Opcode::A64ExclusiveReadMemory8:
+        case Opcode::A64ExclusiveReadMemory16:
+        case Opcode::A64ExclusiveReadMemory32:
+        case Opcode::A64ExclusiveReadMemory64:
+        case Opcode::A64ExclusiveWriteMemory8:
+        case Opcode::A64ExclusiveWriteMemory16:
+        case Opcode::A64ExclusiveWriteMemory32:
+        case Opcode::A64ExclusiveWriteMemory64:
+            return target.local_exclusive_monitor && target.page_table != 0;
+        default:
+            return false;
+        }
+    }
+
     bool IsInlineA32Special(const Op& op) const {
         if (!target.a32) {
             return false;
@@ -864,7 +958,7 @@ private:
         code.Mem(Insn::I64Store32, target.exclusive_state_offset);
         code.Get(kState);
         code.Get(tmp0);
-        code.Mem(Insn::I64Store32, target.exclusive_address_offset);
+        code.Mem(target.a32 ? Insn::I64Store32 : Insn::I64Store, target.exclusive_address_offset);
         code.Get(kState);
         code.Get(value_local[index]);
         code.Mem(Insn::I64Store, target.exclusive_value_offset);
@@ -874,14 +968,16 @@ private:
     void EmitExclusiveWrite(size_t index, u32 bytes) {
         const Op& op = block.ops[index];
         PushArg(op, 1);
-        Mask32();
+        if (target.a32) {
+            Mask32();
+        }
         code.Set(tmp0);
         // No reservation for this address: fail.
         code.Get(kState);
         code.Mem(Insn::I64Load32U, target.exclusive_state_offset);
         code.Byte(Insn::I64Eqz);
         code.Get(kState);
-        code.Mem(Insn::I64Load32U, target.exclusive_address_offset);
+        code.Mem(target.a32 ? Insn::I64Load32U : Insn::I64Load, target.exclusive_address_offset);
         code.Get(tmp0);
         code.Byte(Insn::I64Ne);
         code.Byte(Insn::I32Or);
@@ -1005,6 +1101,72 @@ private:
         return target.inaccurate_nan && ((BlockFPCR() >> 22) & 3) == 0;
     }
 
+    /// Without Unsafe_InaccurateNaN, float ops run natively and fall back to the interpreter
+    /// when a lane is NaN, or denormal under flush-to-zero; otherwise the results match exactly.
+    bool GuardedFloat(const Op& op) const {
+        if (target.inaccurate_nan) {
+            return false;
+        }
+        const auto vector_usable = [&](size_t fpcr_arg) {
+            return !(ConstantValue(op.args[fpcr_arg]) & 1) || ((BlockFPCR() >> 22) & 3) == 0;
+        };
+        const bool round_to_nearest = ((BlockFPCR() >> 22) & 3) == 0;
+        switch (op.opcode) {
+        case Opcode::FPAdd32:
+        case Opcode::FPAdd64:
+        case Opcode::FPSub32:
+        case Opcode::FPSub64:
+        case Opcode::FPMul32:
+        case Opcode::FPMul64:
+        case Opcode::FPDiv32:
+        case Opcode::FPDiv64:
+        case Opcode::FPSqrt32:
+        case Opcode::FPSqrt64:
+        case Opcode::FPCompare32:
+        case Opcode::FPCompare64:
+            return round_to_nearest;
+        case Opcode::FPMulAdd32:
+        case Opcode::FPMulAdd64:
+        case Opcode::FPMulSub32:
+        case Opcode::FPMulSub64:
+            return round_to_nearest && target.unfuse_fma;
+        case Opcode::FPVectorAdd32:
+        case Opcode::FPVectorAdd64:
+        case Opcode::FPVectorSub32:
+        case Opcode::FPVectorSub64:
+        case Opcode::FPVectorMul32:
+        case Opcode::FPVectorMul64:
+        case Opcode::FPVectorDiv32:
+        case Opcode::FPVectorDiv64:
+            return vector_usable(2);
+        case Opcode::FPVectorMulAdd32:
+        case Opcode::FPVectorMulAdd64:
+            return target.unfuse_fma && vector_usable(3);
+        default:
+            return false;
+        }
+    }
+
+    /// Flush-to-zero for a guarded op: ASIMD ops that ignore the FPCR use the standard value.
+    bool GuardedFlushToZero(const Op& op) const {
+        switch (op.opcode) {
+        case Opcode::FPVectorAdd32:
+        case Opcode::FPVectorAdd64:
+        case Opcode::FPVectorSub32:
+        case Opcode::FPVectorSub64:
+        case Opcode::FPVectorMul32:
+        case Opcode::FPVectorMul64:
+        case Opcode::FPVectorDiv32:
+        case Opcode::FPVectorDiv64:
+            return !(ConstantValue(op.args[2]) & 1) || FlushToZero();
+        case Opcode::FPVectorMulAdd32:
+        case Opcode::FPVectorMulAdd64:
+            return !(ConstantValue(op.args[3]) & 1) || FlushToZero();
+        default:
+            return FlushToZero();
+        }
+    }
+
     bool VectorFPCRUsable(const Op& op, size_t fpcr_arg) const {
         // Without the IgnoreStandardFPCRValue optimization, uncontrolled ops use the ASIMD
         // standard value (flush-to-zero, default NaN).
@@ -1049,8 +1211,19 @@ private:
         case Opcode::VectorBroadcast32:
         case Opcode::VectorBroadcast64:
             return true;
+        case Opcode::VectorBroadcastElementLower8:
+        case Opcode::VectorBroadcastElementLower16:
+        case Opcode::VectorBroadcastElementLower32:
+        case Opcode::VectorBroadcastElement8:
+        case Opcode::VectorBroadcastElement16:
+        case Opcode::VectorBroadcastElement32:
+        case Opcode::VectorBroadcastElement64:
+            return IsConstant(op.args[1]);
         default:
             break;
+        }
+        if (GuardedFloat(op)) {
+            return true;
         }
         if (!NativeFloatAllowed()) {
             return false;
@@ -1309,8 +1482,236 @@ private:
         StoreV128(index);
     }
 
+    /// With guest float bits (i64) on the stack, pushes an i32 that is set when the value is a
+    /// NaN (if `nan`) or a denormal (if `denormal`).
+    void PushSpecialFloat(bool is64, bool nan, bool denormal) {
+        const u64 abs = is64 ? 0x7FFFFFFFFFFFFFFF : 0x7FFFFFFF;
+        const u64 inf = is64 ? 0x7FF0000000000000 : 0x7F800000;
+        const u64 max_denormal = is64 ? 0x000FFFFFFFFFFFFF : 0x007FFFFF;
+        And(abs);
+        code.Set(tmp2);
+        code.I32Const(0);
+        if (nan) {
+            code.Get(tmp2);
+            code.I64Const(inf);
+            code.Byte(Insn::I64GtU);
+            code.Byte(Insn::I32Or);
+        }
+        if (denormal) {
+            // abs - 1 < max_denormal, so zero is excluded.
+            code.Get(tmp2);
+            code.I64Const(1);
+            code.Byte(Insn::I64Sub);
+            code.I64Const(max_denormal);
+            code.Byte(Insn::I64LtU);
+            code.Byte(Insn::I32Or);
+        }
+    }
+
+    /// With a float vector on the stack, pushes an i32 that is set when any lane is a NaN (if
+    /// `nan`) or a denormal (if `denormal`).
+    void PushSpecialV128(bool is64, bool nan, bool denormal) {
+        code.Set(kV128B);
+        code.I32Const(0);
+        if (nan) {
+            code.Get(kV128B);
+            code.Get(kV128B);
+            SimdOp(is64 ? 72 : 66);  // f64x2.ne / f32x4.ne
+            SimdOp(83);              // v128.any_true
+            code.Byte(Insn::I32Or);
+        }
+        if (denormal) {
+            code.Get(kV128B);
+            if (is64) {
+                V128Splat64(0x7FFFFFFFFFFFFFFF);
+                SimdOp(78);  // v128.and
+                code.Set(kV128B);
+                // 0 < abs < smallest normal; i64x2 has no unsigned compare, but abs is positive.
+                code.Get(kV128B);
+                V128Splat64(0);
+                SimdOp(215);  // i64x2.ne
+                code.Get(kV128B);
+                V128Splat64(0x0010000000000000);
+                SimdOp(216);  // i64x2.lt_s
+                SimdOp(78);
+            } else {
+                V128Splat(0x7FFFFFFF);
+                SimdOp(78);   // v128.and
+                V128Splat(1);
+                SimdOp(177);  // i32x4.sub
+                V128Splat(0x007FFFFF);
+                SimdOp(58);   // i32x4.lt_u
+            }
+            SimdOp(83);  // v128.any_true
+            code.Byte(Insn::I32Or);
+        }
+    }
+
+    void PushGuestFloat(const Op& op, size_t index, bool is64) {
+        PushArg(op, index);
+        if (is64) {
+            code.Byte(0xBF);  // f64.reinterpret_i64
+        } else {
+            code.Byte(Insn::I32WrapI64);
+            code.Byte(0xBE);  // f32.reinterpret_i32
+        }
+    }
+
+    /// Emits a GuardedFloat op: the native result, or the interpreter's when it is special.
+    bool EmitGuardedFloat(size_t index) {
+        const Op& op = block.ops[index];
+        const bool fz = GuardedFlushToZero(op);
+        bool is64 = false;
+        bool vector = false;
+        size_t num_inputs = 2;
+        u8 scalar_op = 0;
+        u32 simd_op = 0;
+        bool muladd = false;
+        bool subtract = false;
+        switch (op.opcode) {
+        case Opcode::FPAdd32: scalar_op = 0x92; break;
+        case Opcode::FPAdd64: scalar_op = 0xA0; is64 = true; break;
+        case Opcode::FPSub32: scalar_op = 0x93; break;
+        case Opcode::FPSub64: scalar_op = 0xA1; is64 = true; break;
+        case Opcode::FPMul32: scalar_op = 0x94; break;
+        case Opcode::FPMul64: scalar_op = 0xA2; is64 = true; break;
+        case Opcode::FPDiv32: scalar_op = 0x95; break;
+        case Opcode::FPDiv64: scalar_op = 0xA3; is64 = true; break;
+        case Opcode::FPSqrt32: scalar_op = 0x91; num_inputs = 1; break;
+        case Opcode::FPSqrt64: scalar_op = 0x9F; num_inputs = 1; is64 = true; break;
+        case Opcode::FPCompare32:
+        case Opcode::FPCompare64:
+            return EmitGuardedCompare(index, op.opcode == Opcode::FPCompare64, fz);
+        case Opcode::FPMulSub32: subtract = true; [[fallthrough]];
+        case Opcode::FPMulAdd32: muladd = true; num_inputs = 3; break;
+        case Opcode::FPMulSub64: subtract = true; [[fallthrough]];
+        case Opcode::FPMulAdd64: muladd = true; num_inputs = 3; is64 = true; break;
+        case Opcode::FPVectorAdd32: simd_op = 228; vector = true; break;
+        case Opcode::FPVectorAdd64: simd_op = 240; vector = true; is64 = true; break;
+        case Opcode::FPVectorSub32: simd_op = 229; vector = true; break;
+        case Opcode::FPVectorSub64: simd_op = 241; vector = true; is64 = true; break;
+        case Opcode::FPVectorMul32: simd_op = 230; vector = true; break;
+        case Opcode::FPVectorMul64: simd_op = 242; vector = true; is64 = true; break;
+        case Opcode::FPVectorDiv32: simd_op = 231; vector = true; break;
+        case Opcode::FPVectorDiv64: simd_op = 243; vector = true; is64 = true; break;
+        case Opcode::FPVectorMulAdd32: muladd = true; vector = true; num_inputs = 3; break;
+        case Opcode::FPVectorMulAdd64: muladd = true; vector = true; num_inputs = 3; is64 = true; break;
+        default:
+            return false;
+        }
+
+        if (vector) {
+            for (size_t i = 0; i < num_inputs; ++i) {
+                PushV128(op, i);
+            }
+            if (muladd) {
+                SimdOp(is64 ? 242 : 230);  // mul
+                SimdOp(is64 ? 240 : 228);  // add
+            } else {
+                SimdOp(simd_op);
+            }
+            code.Set(kV128C);
+            code.Get(kV128C);
+            PushSpecialV128(is64, true, fz);
+            if (fz) {
+                // NaN inputs give NaN results, so inputs only need the denormal check.
+                for (size_t i = 0; i < num_inputs; ++i) {
+                    PushV128(op, i);
+                    PushSpecialV128(is64, false, true);
+                    code.Byte(Insn::I32Or);
+                }
+            }
+            code.If();
+            CallHelper(index);
+            code.Else();
+            code.Get(kV128C);
+            StoreV128(index);
+            code.End();
+            return true;
+        }
+
+        for (size_t i = 0; i < num_inputs; ++i) {
+            PushGuestFloat(op, i, is64);
+        }
+        if (muladd) {
+            code.Byte(is64 ? 0xA2 : 0x94);  // mul
+            code.Byte(is64 ? (subtract ? 0xA1 : 0xA0) : (subtract ? 0x93 : 0x92));
+        } else {
+            code.Byte(scalar_op);
+        }
+        if (is64) {
+            code.Byte(0xBD);  // i64.reinterpret_f64
+        } else {
+            code.Byte(0xBC);  // i32.reinterpret_f32
+            code.Byte(Insn::I64ExtendI32U);
+        }
+        code.Set(tmp3);
+        code.Get(tmp3);
+        PushSpecialFloat(is64, true, fz);
+        if (fz) {
+            for (size_t i = 0; i < num_inputs; ++i) {
+                PushArg(op, i);
+                PushSpecialFloat(is64, false, true);
+                code.Byte(Insn::I32Or);
+            }
+        }
+        code.IfI64();
+        for (size_t i = 0; i < num_inputs; ++i) {
+            SpillArg(op, i);
+        }
+        CallHelper(index);
+        code.Get(kFrame);
+        code.Mem(Insn::I64Load, u64(index) * kSlotSize + kLoOffset);
+        code.Else();
+        code.Get(tmp3);
+        code.End();
+        Define(index);
+        return true;
+    }
+
+    bool EmitGuardedCompare(size_t index, bool is64, bool fz) {
+        const Op& op = block.ops[index];
+        const u32 a = is64 ? kF64A : kF32A;
+        const u32 b = is64 ? kF64B : kF32B;
+        code.I32Const(0);
+        for (size_t i = 0; i < 2; ++i) {
+            PushArg(op, i);
+            PushSpecialFloat(is64, true, fz);
+            code.Byte(Insn::I32Or);
+        }
+        code.IfI64();
+        SpillArg(op, 0);
+        SpillArg(op, 1);
+        SpillArg(op, 2);
+        CallHelper(index);
+        code.Get(kFrame);
+        code.Mem(Insn::I64Load, u64(index) * kSlotSize + kLoOffset);
+        code.Else();
+        PushGuestFloat(op, 0, is64);
+        code.Set(a);
+        PushGuestFloat(op, 1, is64);
+        code.Set(b);
+        code.I64Const(0x60000000);
+        code.I64Const(0x80000000);
+        code.I64Const(0x20000000);
+        code.Get(a);
+        code.Get(b);
+        code.Byte(is64 ? 0x63 : 0x5D);  // lt
+        code.Byte(Insn::Select);
+        code.Get(a);
+        code.Get(b);
+        code.Byte(is64 ? 0x61 : 0x5B);  // eq
+        code.Byte(Insn::Select);
+        code.End();
+        Define(index);
+        return true;
+    }
+
     bool EmitFloat(size_t index) {
         const Op& op = block.ops[index];
+        if (GuardedFloat(op)) {
+            return EmitGuardedFloat(index);
+        }
         const auto unary_bits = [&](u64 mask, bool xor_mask) {
             PushArg(op, 0);
             code.I64Const(mask);
@@ -1742,6 +2143,39 @@ private:
             SimdOp(18);  // i64x2.splat
             StoreV128(index);
             return true;
+        case Opcode::VectorBroadcastElementLower8:
+        case Opcode::VectorBroadcastElementLower16:
+        case Opcode::VectorBroadcastElementLower32:
+        case Opcode::VectorBroadcastElement8:
+        case Opcode::VectorBroadcastElement16:
+        case Opcode::VectorBroadcastElement32:
+        case Opcode::VectorBroadcastElement64: {
+            // extract_lane and splat opcodes for 8, 16, 32 and 64-bit lanes.
+            static constexpr u32 extract[] = {22, 25, 27, 29};
+            static constexpr u32 splat[] = {15, 16, 17, 18};
+            size_t size;
+            bool lower = false;
+            switch (op.opcode) {
+            case Opcode::VectorBroadcastElementLower8: lower = true; [[fallthrough]];
+            case Opcode::VectorBroadcastElement8: size = 0; break;
+            case Opcode::VectorBroadcastElementLower16: lower = true; [[fallthrough]];
+            case Opcode::VectorBroadcastElement16: size = 1; break;
+            case Opcode::VectorBroadcastElementLower32: lower = true; [[fallthrough]];
+            case Opcode::VectorBroadcastElement32: size = 2; break;
+            default: size = 3; break;
+            }
+            PushV128(op, 0);
+            SimdOp(extract[size]);
+            code.Byte(u8(ConstantValue(op.args[1]) & ((16 >> size) - 1)));
+            SimdOp(splat[size]);
+            StoreV128(index);
+            if (lower) {
+                code.Get(kFrame);
+                code.I64Const(0);
+                code.Mem(Insn::I64Store, u64(index) * kSlotSize + kHiOffset);
+            }
+            return true;
+        }
         default:
             return false;
         }
@@ -2359,6 +2793,12 @@ private:
         case Opcode::A32WriteMemory64:
             EmitWrite(index, 8);
             break;
+        case Opcode::A64ReadMemory128:
+            EmitRead128(index);
+            break;
+        case Opcode::A64WriteMemory128:
+            EmitWrite128(index);
+            break;
 
         // A32 state
         case Opcode::A32GetRegister: {
@@ -2532,32 +2972,41 @@ private:
             And(0xF0000000);
             code.Mem(Insn::I64Store32, target.fpsr_nzcv_offset);
             break;
+        case Opcode::A64ClearExclusive:
         case Opcode::A32ClearExclusive:
             code.Get(kState);
             code.I64Const(0);
             code.Mem(Insn::I64Store32, target.exclusive_state_offset);
             break;
+        case Opcode::A64ExclusiveReadMemory8:
         case Opcode::A32ExclusiveReadMemory8:
             EmitExclusiveRead(index, 1);
             break;
+        case Opcode::A64ExclusiveReadMemory16:
         case Opcode::A32ExclusiveReadMemory16:
             EmitExclusiveRead(index, 2);
             break;
+        case Opcode::A64ExclusiveReadMemory32:
         case Opcode::A32ExclusiveReadMemory32:
             EmitExclusiveRead(index, 4);
             break;
+        case Opcode::A64ExclusiveReadMemory64:
         case Opcode::A32ExclusiveReadMemory64:
             EmitExclusiveRead(index, 8);
             break;
+        case Opcode::A64ExclusiveWriteMemory8:
         case Opcode::A32ExclusiveWriteMemory8:
             EmitExclusiveWrite(index, 1);
             break;
+        case Opcode::A64ExclusiveWriteMemory16:
         case Opcode::A32ExclusiveWriteMemory16:
             EmitExclusiveWrite(index, 2);
             break;
+        case Opcode::A64ExclusiveWriteMemory32:
         case Opcode::A32ExclusiveWriteMemory32:
             EmitExclusiveWrite(index, 4);
             break;
+        case Opcode::A64ExclusiveWriteMemory64:
         case Opcode::A32ExclusiveWriteMemory64:
             EmitExclusiveWrite(index, 8);
             break;
@@ -2973,7 +3422,8 @@ public:
         }
         const RegionLocals* cached_ptr = cached ? &*cached : nullptr;
 
-        code.I64Const(0);
+        // Regions may be entered at any of their blocks.
+        code.Get(kEntry);
         code.Set(kCurrent);
         code.BlockStart();
         exit_nest = code.nest;
@@ -3020,6 +3470,9 @@ public:
             BlockCompiler flusher{*blocks[0], target, code, kLocalBase, &*cached};
             flusher.FlushState();
         }
+        if (target.chain_regions && !cached) {
+            EmitChain();
+        }
 
         BuildModule(out, locals_end);
         return true;
@@ -3033,6 +3486,66 @@ private:
 
     void Exit() {
         code.BrTo(exit_nest);
+    }
+
+    /// Continues in the region of the next guest location, as the dispatcher would, when this
+    /// thread has it in its dispatch table and there is budget left.
+    void EmitChain() {
+        constexpr u32 kLocation = kCurrent;
+        constexpr u32 kEntryAddress = kCachedBase;
+        PushCycles();
+        code.I64Const(0);
+        code.Byte(Insn::I64GtS);
+        PushHalted();
+        code.Byte(Insn::I32Eqz);
+        code.Byte(Insn::I32And);
+        code.If();
+        // location = (pc & pc_mask) | ((fpcr & fpcr_mask) << fpcr_shift)
+        code.Get(kState);
+        code.Mem(Insn::I64Load, target.pc_offset);
+        code.I64Const(A64::LocationDescriptor::pc_mask);
+        code.Byte(Insn::I64And);
+        code.Get(kState);
+        code.Mem(Insn::I64Load32U, target.fpcr_offset);
+        code.I64Const(A64::LocationDescriptor::fpcr_mask);
+        code.Byte(Insn::I64And);
+        code.I64Const(A64::LocationDescriptor::fpcr_shift);
+        code.Byte(Insn::I64Shl);
+        code.Byte(Insn::I64Or);
+        code.Set(kLocation);
+        // entry = table + IndexOf(location) * sizeof(DispatchEntry)
+        code.Get(kState);
+        code.Mem(Insn::I64Load, target.dispatch_table_offset);
+        code.Get(kLocation);
+        code.Get(kLocation);
+        code.I64Const(32);
+        code.Byte(Insn::I64ShrU);
+        code.Byte(Insn::I64Xor);
+        code.I64Const(2);
+        code.Byte(Insn::I64ShrU);
+        code.I64Const(DispatchTables::kEntries - 1);
+        code.Byte(Insn::I64And);
+        code.I64Const(5);
+        code.Byte(Insn::I64Shl);
+        code.Byte(Insn::I64Add);
+        code.Set(kEntryAddress);
+        code.Get(kEntryAddress);
+        code.Mem(Insn::I64Load, offsetof(DispatchEntry, location));
+        code.Get(kLocation);
+        code.Byte(Insn::I64Eq);
+        code.If();
+        code.Get(kState);
+        code.Get(kFrame);
+        code.Get(kImpl);
+        code.Get(kEntryAddress);
+        code.Mem(Insn::I64Load, offsetof(DispatchEntry, index));
+        code.Get(kEntryAddress);
+        code.Mem(Insn::I64Load, offsetof(DispatchEntry, function));
+        code.Byte(0x13);  // return_call_indirect
+        code.U32(0);      // region type
+        code.U32(0);      // table
+        code.End();
+        code.End();
     }
 
     void PushCycles() {
@@ -3263,6 +3776,9 @@ std::atomic<u64> g_compile_count{0};
 std::atomic<u64> g_compile_us{0};
 std::atomic<u64> g_instantiate_count{0};
 std::atomic<u64> g_instantiate_us{0};
+std::atomic<u64> g_release_count{0};
+std::atomic<u64> g_compile_bytes{0};
+std::atomic<u64> g_compile_blocks{0};
 
 u64 NowUs() {
     return u64(emscripten_get_now() * 1000.0);
@@ -3270,8 +3786,9 @@ u64 NowUs() {
 }  // Anonymous namespace
 
 std::string JitStats() {
-    return fmt::format("compile {}/{}ms instantiate {}/{}ms", g_compile_count.exchange(0), g_compile_us.exchange(0) / 1000,
-                       g_instantiate_count.exchange(0), g_instantiate_us.exchange(0) / 1000);
+    return fmt::format("compile {}/{}ms {}KB {}blk instantiate {}/{}ms release {}", g_compile_count.exchange(0), g_compile_us.exchange(0) / 1000,
+                       g_compile_bytes.exchange(0) / 1024, g_compile_blocks.exchange(0),
+                       g_instantiate_count.exchange(0), g_instantiate_us.exchange(0) / 1000, g_release_count.exchange(0));
 }
 
 bool CompileRegion(const std::vector<CompiledBlock*>& blocks, const JitTarget& target, std::vector<u8>& out) {
@@ -3280,7 +3797,37 @@ bool CompileRegion(const std::vector<CompiledBlock*>& blocks, const JitTarget& t
     const bool ok = compiler.Compile(out);
     g_compile_count.fetch_add(1, std::memory_order_relaxed);
     g_compile_us.fetch_add(NowUs() - start, std::memory_order_relaxed);
+    g_compile_bytes.fetch_add(out.size(), std::memory_order_relaxed);
+    g_compile_blocks.fetch_add(blocks.size(), std::memory_order_relaxed);
     return ok;
+}
+
+namespace {
+// Ids of dropped regions, in the order they were dropped. Each thread releases its instances of
+// them when it next looks up a function.
+std::mutex g_dead_mutex;
+std::vector<u64> g_dead_regions;
+std::atomic<size_t> g_dead_count{0};
+}  // Anonymous namespace
+
+static std::atomic<u64> g_live_code_bytes{0};
+
+WasmRegion::~WasmRegion() {
+    if (tracked) {
+        g_live_code_bytes.fetch_sub(wasm.size(), std::memory_order_relaxed);
+    }
+    std::scoped_lock lock{g_dead_mutex};
+    g_dead_regions.push_back(id);
+    g_dead_count.store(g_dead_regions.size(), std::memory_order_release);
+}
+
+bool TrackRegionCode(WasmRegion& region) {
+    static const u64 budget = [] {
+        const char* value = std::getenv("EDEN_JIT_CODE_BUDGET_MB");
+        return u64(value ? std::max(16, std::atoi(value)) : 384) << 20;
+    }();
+    region.tracked = true;
+    return g_live_code_bytes.fetch_add(region.wasm.size(), std::memory_order_relaxed) + region.wasm.size() > budget;
 }
 
 CompiledBlockFn GetThreadFunction(WasmRegion& region) {
@@ -3293,6 +3840,22 @@ CompiledBlockFn GetThreadFunction(WasmRegion& region) {
     }
 
     thread_local std::unordered_map<u64, CompiledBlockFn> functions;
+    thread_local size_t dead_seen = 0;
+    if (g_dead_count.load(std::memory_order_acquire) != dead_seen) {
+        std::scoped_lock lock{g_dead_mutex};
+        for (; dead_seen < g_dead_regions.size(); ++dead_seen) {
+            const auto it = functions.find(g_dead_regions[dead_seen]);
+            if (it == functions.end()) {
+                continue;
+            }
+            if (it->second) {
+                dynarmic_wasm_release(reinterpret_cast<uintptr_t>(it->second));
+                g_release_count.fetch_add(1, std::memory_order_relaxed);
+            }
+            functions.erase(it);
+        }
+    }
+
     CompiledBlockFn fn;
     if (const auto it = functions.find(region.id); it != functions.end()) {
         fn = it->second;
@@ -3309,10 +3872,33 @@ CompiledBlockFn GetThreadFunction(WasmRegion& region) {
     return fn;
 }
 
+u64 DispatchTables::NextId() {
+    static std::atomic<u64> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+DispatchEntry* DispatchTables::ForThisThread() {
+    thread_local std::unordered_map<u64, DispatchEntry*> by_owner;
+    DispatchEntry*& table = by_owner[id];
+    if (!table) {
+        std::scoped_lock lock{mutex};
+        tables.push_back(std::make_unique<Table>());
+        table = tables.back()->data();
+    }
+    return table;
+}
+
+void DispatchTables::Clear() {
+    std::scoped_lock lock{mutex};
+    for (const auto& table : tables) {
+        table->fill({});
+    }
+}
+
 u32 RegionThreshold() {
     static const u32 threshold = [] {
         const char* value = std::getenv("EDEN_JIT_THRESHOLD");
-        return value ? std::max(1, std::atoi(value)) : 8;
+        return value ? std::max(1, std::atoi(value)) : 64;
     }();
     return u32(threshold);
 }

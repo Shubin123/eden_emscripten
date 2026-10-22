@@ -6,7 +6,10 @@
 
 #pragma once
 
+#include <array>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -16,7 +19,7 @@
 
 namespace Dynarmic::Backend::Interp {
 
-/// Signature of a compiled block: (state, frame, impl, block).
+/// Signature of a compiled region: (state, frame, impl, index of the block to enter at).
 using CompiledBlockFn = void (*)(void*, void*, void*, void*);
 /// Signature of the interpreter fallback: (impl, block, first op, exclusive end).
 using OpHelperFn = void (*)(void*, void*, u32, u32);
@@ -62,7 +65,13 @@ struct JitTarget {
     bool ignore_standard_fpcr = false;
     u32 fpsr_nzcv_offset = 0;
 
-    /// A32 exclusive accesses with a per-core reservation (Unsafe_IgnoreGlobalMonitor).
+    /// Whether regions continue into the next region through the dispatch table at
+    /// dispatch_table_offset in the guest state, instead of returning to the dispatcher.
+    bool chain_regions = false;
+    u32 fpcr_offset = 0;
+    u32 dispatch_table_offset = 0;
+
+    /// Exclusive accesses with a per-core reservation (Unsafe_IgnoreGlobalMonitor).
     bool local_exclusive_monitor = false;
     u32 exclusive_state_offset = 0;
     u32 exclusive_address_offset = 0;
@@ -72,6 +81,41 @@ struct JitTarget {
     std::function<u64(u64)> coproc_read_pointer;
 };
 
+/// A guest location and the function and block index of the region that runs it, valid on the
+/// thread that owns the table.
+struct DispatchEntry {
+    u64 location;
+    u64 function;
+    u64 index;
+    u64 padding;
+};
+static_assert(sizeof(DispatchEntry) == 32);
+
+/// Direct-mapped tables of compiled regions, one per thread that runs a Jit. Region code looks up
+/// the next location there and tail-calls its region while there is budget left.
+class DispatchTables {
+public:
+    static constexpr size_t kEntries = 2048;
+
+    static size_t IndexOf(u64 location) {
+        return ((location ^ (location >> 32)) >> 2) % kEntries;
+    }
+
+    /// The calling thread's table.
+    DispatchEntry* ForThisThread();
+
+    /// Clears every thread's table, for when regions are dropped.
+    void Clear();
+
+private:
+    using Table = std::array<DispatchEntry, kEntries>;
+    const u64 id = NextId();
+    std::mutex mutex;
+    std::vector<std::unique_ptr<Table>> tables;
+
+    static u64 NextId();
+};
+
 /// Builds a module for a region of linked blocks; blocks[0] is the entry point.
 bool CompileRegion(const std::vector<CompiledBlock*>& blocks, const JitTarget& target, std::vector<u8>& out);
 
@@ -79,13 +123,19 @@ bool CompileRegion(const std::vector<CompiledBlock*>& blocks, const JitTarget& t
 /// first use. Returns nullptr if instantiation failed.
 CompiledBlockFn GetThreadFunction(WasmRegion& region);
 
+/// Counts a built region towards the live code budget. Returns true when the live code exceeds
+/// it (EDEN_JIT_CODE_BUDGET_MB, default 384 MB of module bytes), and the caller should clear its
+/// cache: the engine cannot free compiled code that regions still reference, and running out
+/// of wasm code space aborts the process.
+bool TrackRegionCode(WasmRegion& region);
+
 /// Compile and instantiation counts and times since the last call, for the stats report.
 std::string JitStats();
 
 /// Whether compiled execution is enabled (EDEN_INTERP_JIT=0 disables it).
 bool WasmJitEnabled();
 
-/// Entries into a block before a region is compiled for it (EDEN_JIT_THRESHOLD, default 8).
+/// Entries into a block before a region is compiled for it (EDEN_JIT_THRESHOLD, default 64).
 u32 RegionThreshold();
 
 /// Whether a region may be compiled at this guest PC. EDEN_JIT_PC_RANGE=lo-hi (hex) limits

@@ -3,6 +3,7 @@
 
 // Portable A32 backend that interprets optimized IR blocks. See a64_interface.cpp.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -236,7 +237,14 @@ struct Jit::Impl final {
 
 private:
     CompiledBlock* GetBlock(IR::LocationDescriptor descriptor) {
-        if (const auto it = block_cache.find(descriptor.Value()); it != block_cache.end()) {
+        // Most lookups hit a small direct-mapped cache in front of the block map.
+        const u64 key = descriptor.Value();
+        FastDispatchEntry& entry = fast_dispatch[((key ^ (key >> 32)) >> 1) % fast_dispatch.size()];
+        if (entry.block && entry.location == key) {
+            return entry.block;
+        }
+        if (const auto it = block_cache.find(key); it != block_cache.end()) {
+            entry = {key, it->second.get()};
             return it->second.get();
         }
 
@@ -261,6 +269,7 @@ private:
 
         CompiledBlock* result = block.get();
         block_cache.emplace(descriptor.Value(), std::move(block));
+        entry = {key, result};
         return result;
     }
 
@@ -282,19 +291,35 @@ private:
         if (!invalidate_entire_cache && invalid_cache_ranges.empty()) {
             return;
         }
+        fast_dispatch.fill({});
         if (invalidate_entire_cache) {
             block_cache.clear();
             block_ranges.ClearCache();
         } else {
+            std::vector<u64> erased_keys;
+            std::unordered_set<const CompiledBlock*> erased;
             for (const auto& location : block_ranges.InvalidateRanges(invalid_cache_ranges)) {
-                block_cache.erase(location.Value());
+                if (const auto it = block_cache.find(location.Value()); it != block_cache.end()) {
+                    erased_keys.push_back(it->first);
+                    erased.insert(it->second.get());
+                }
             }
+            // Keep the links and regions that only reference surviving blocks, so an unrelated
+            // invalidation does not force the whole cache to be recompiled.
             for (auto& [_, block] : block_cache) {
-                block->link_then = nullptr;
-                block->link_else = nullptr;
-                // Regions may contain erased blocks.
-                block->region.reset();
-                block->entry_count = 0;
+                if (erased.contains(block->link_then)) {
+                    block->link_then = nullptr;
+                }
+                if (erased.contains(block->link_else)) {
+                    block->link_else = nullptr;
+                }
+                if (block->region && std::ranges::any_of(block->region->blocks, [&](const CompiledBlock* b) { return erased.contains(b); })) {
+                    block->region.reset();
+                    block->entry_count = 0;
+                }
+            }
+            for (const u64 key : erased_keys) {
+                block_cache.erase(key);
             }
         }
         invalid_cache_ranges.clear();
@@ -535,7 +560,7 @@ private:
         if (!fn) {
             return false;
         }
-        fn(&state, frame.data(), this, nullptr);
+        fn(&state, frame.data(), this, reinterpret_cast<void*>(uintptr_t{block.region_index}));
         if (SamplePC(state.reg[15])) {
             DumpBlock(state.Location());
         }
@@ -550,7 +575,10 @@ private:
             const auto add = [&](IR::LocationDescriptor next) {
                 const IR::LocationDescriptor location = A32::LocationDescriptor{next}.SetSingleStepping(false);
                 if (blocks.size() < kMaxRegionBlocks && seen.insert(location.Value()).second) {
-                    blocks.push_back(GetBlock(location));
+                    // Blocks already compiled elsewhere are reached through their own region.
+                    if (CompiledBlock* successor = GetBlock(location); !successor->region) {
+                        blocks.push_back(successor);
+                    }
                 }
             };
             std::visit([&](const auto& term) { AddSuccessors(term, add); }, block.terminal);
@@ -563,7 +591,18 @@ private:
         if (!CompileRegion(blocks, jit_target, region->wasm)) {
             return false;
         }
-        entry.region = std::move(region);
+        region->blocks.assign(blocks.begin(), blocks.end());
+        if (TrackRegionCode(*region)) {
+            ClearCache();
+        }
+        // Blocks without a region of their own enter this one rather than compiling another
+        // copy of the same code.
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (!blocks[i]->region) {
+                blocks[i]->region = region;
+                blocks[i]->region_index = u32(i);
+            }
+        }
         return true;
     }
 
@@ -738,6 +777,11 @@ private:
     IR::Block ir_block = {LocationDescriptor(0, PSR(0), FPSCR(0), false)};
     Optimization::PolyfillOptions polyfill_options{.sha256 = true, .vector_multiply_widen = true};
     std::unordered_map<u64, std::unique_ptr<CompiledBlock>> block_cache;
+    struct FastDispatchEntry {
+        u64 location = 0;
+        CompiledBlock* block = nullptr;
+    };
+    std::array<FastDispatchEntry, 4096> fast_dispatch{};
     Backend::BlockRangeInformation<u32> block_ranges;
     std::vector<Slot> frame;
     s64 cycles_to_run = 0;
