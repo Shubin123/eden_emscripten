@@ -66,3 +66,6 @@ vulkansdk*.exe
 
 # Build-time generated external sources
 externals/generated
+
+# Per-branch runtimes from tools/web/bench-branches.sh
+/bench/
