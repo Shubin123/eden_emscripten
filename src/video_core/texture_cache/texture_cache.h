@@ -597,6 +597,13 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
 
 template <class P>
 bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
+    // Backends that cannot read images back would write their empty staging data over guest
+    // memory; their images keep the last data the guest wrote instead.
+    if constexpr (requires { P::IMPLEMENTS_DOWNLOADS; }) {
+        if constexpr (!P::IMPLEMENTS_DOWNLOADS) {
+            return false;
+        }
+    }
     if (!image.IsSafeGpuCopy()) {
         return false;
     }
@@ -2642,7 +2649,8 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id) 
     }
     if (new_id) {
         const ImageViewBase& old_view = slot_image_views[new_id];
-        if (True(old_view.flags & ImageViewFlagBits::PreemtiveDownload)) {
+        if (True(old_view.flags & ImageViewFlagBits::PreemtiveDownload) &&
+            IsDownloadable(slot_images[old_view.image_id])) {
             const PendingDownload new_download{true, 0, old_view.image_id};
             uncommitted_downloads.emplace_back(new_download);
         }

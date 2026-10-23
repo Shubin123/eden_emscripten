@@ -287,6 +287,8 @@ struct TextureCacheParams {
     static constexpr bool HAS_EMULATED_COPIES = false;
     static constexpr bool HAS_DEVICE_MEMORY_INFO = true;
     static constexpr bool IMPLEMENTS_ASYNC_DOWNLOADS = false;
+    /// Images are not read back from the GPU yet.
+    static constexpr bool IMPLEMENTS_DOWNLOADS = false;
     static constexpr bool HAS_MSAA_DOWNLOADS = false;
 
     using Runtime = WebGPU::TextureCacheRuntime;
