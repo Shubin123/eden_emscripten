@@ -24,6 +24,7 @@
 #include "video_core/renderer_webgpu/wgpu_texture_cache.h"
 #include "video_core/renderer_webgpu/wgpu_uniform_ring.h"
 #include "video_core/shader_cache.h"
+#include "video_core/shader_environment.h"
 
 namespace Shader::IR {
 struct Program;
@@ -89,17 +90,27 @@ public:
 
     /// Resources resolved by the last Configure call.
     wgpu::RenderPipeline render_pipeline;
+    /// Layout of the pulled vertex buffer group, null when every buffer has a vertex slot.
+    wgpu::BindGroupLayout pulled_layout;
+    /// Guest vertex buffers the shader fetches itself, in pulled-buffer order.
+    std::vector<u32> pulled_buffers;
     wgpu::BindGroup bind_group;
     u32 draw_info_offset{};
     const RenderTargets* targets{};
     /// Host buffers the last Configure bound as writable and as read-only storage.
     std::vector<WGPUBuffer> written_buffers;
     std::vector<WGPUBuffer> read_buffers;
+    /// Entries of `bind_group`, and which of them are writable storage, so a draw can rebind
+    /// writable buffers to copies.
+    std::vector<wgpu::BindGroupEntry> bind_entries;
+    std::vector<size_t> written_entries;
+    wgpu::BindGroupLayout bind_layout;
 
     struct VertexBufferUse {
         u32 stride{};
         bool per_instance{};
         bool used{};
+        u32 slot{}; ///< WebGPU vertex buffer slot; used guest buffers are packed from zero
     };
     /// Vertex buffers the pipeline reads, to keep draws within the bound ranges.
     std::array<VertexBufferUse, Maxwell::NumVertexArrays> vertex_buffer_uses{};
@@ -113,6 +124,7 @@ private:
         /// Set once asynchronous creation succeeded.
         std::shared_ptr<wgpu::RenderPipeline> pipeline = std::make_shared<wgpu::RenderPipeline>();
         wgpu::BindGroupLayout layout;
+        wgpu::BindGroupLayout pulled_layout;
         std::vector<bool> storage_writable; ///< Per storage binding, in layout order
         bool failed{};
     };
@@ -138,8 +150,68 @@ private:
     VariantKey last_variant_key;
 };
 
+struct ComputePipelineKey {
+    u64 unique_hash{};
+    u32 shared_memory_size{};
+    std::array<u32, 3> workgroup_size{};
+
+    auto operator<=>(const ComputePipelineKey&) const = default;
+};
+
+class ComputePipeline {
+public:
+    explicit ComputePipeline(PipelineCache& cache, const ComputePipelineKey& key,
+                             VideoCommon::ComputeEnvironment&& env);
+
+    /// Binds this pipeline's resources for the next dispatch. Returns false if the dispatch has
+    /// to be skipped.
+    bool Configure();
+
+    /// Resources resolved by the last Configure call.
+    wgpu::ComputePipeline pipeline;
+    wgpu::BindGroup bind_group;
+    std::vector<WGPUBuffer> written_buffers;
+    std::vector<WGPUBuffer> read_buffers;
+
+    /// Storage buffers read through the packed binding: copied into `pack_buffer` before the
+    /// dispatch and, when written, back afterwards.
+    struct PackedCopy {
+        wgpu::Buffer buffer;
+        u64 offset{};
+        u64 size{};
+        u64 pack_offset{};
+        bool written{};
+    };
+    std::vector<PackedCopy> packed_copies;
+    wgpu::Buffer pack_buffer;
+
+private:
+    struct Variant {
+        /// Set once asynchronous creation succeeded.
+        std::shared_ptr<wgpu::ComputePipeline> pipeline =
+            std::make_shared<wgpu::ComputePipeline>();
+        wgpu::BindGroupLayout layout;
+        std::vector<bool> storage_writable; ///< Per storage binding, in layout order
+        bool failed{};
+    };
+
+    /// Translates the guest shader; builds `variant` unless only descriptor info is wanted.
+    bool Translate(const std::vector<TextureSampleKind>& texture_kinds, Variant* variant);
+
+    PipelineCache& cache;
+    ComputePipelineKey key;
+    VideoCommon::ComputeEnvironment env;
+
+    Shader::Info info;
+    VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
+    bool valid{};
+
+    std::map<std::vector<TextureSampleKind>, Variant> variants;
+};
+
 class PipelineCache : public VideoCommon::ShaderCache {
     friend GraphicsPipeline;
+    friend ComputePipeline;
 
 public:
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory, Scheduler& scheduler,
@@ -148,6 +220,7 @@ public:
     ~PipelineCache();
 
     GraphicsPipeline* CurrentGraphicsPipeline();
+    ComputePipeline* CurrentComputePipeline();
 
     const wgpu::TextureView& DummyTexture(Shader::TextureType type, TextureKind kind);
 
@@ -170,6 +243,11 @@ private:
                        GraphicsPipelineKeyHash>
         graphics_cache;
     GraphicsPipeline* current_pipeline{};
+    std::map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_cache;
+    /// Scratch storage for packed storage buffers, grown on demand.
+    wgpu::Buffer ssbo_pack;
+    u32 max_storage_buffers{};
+    u32 max_vertex_buffers{8};
 
     std::map<std::pair<Shader::TextureType, TextureKind>, wgpu::TextureView> dummy_views;
 

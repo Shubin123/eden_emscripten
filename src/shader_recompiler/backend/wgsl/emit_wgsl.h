@@ -27,6 +27,29 @@ enum class TextureSampleKind : u8 {
 };
 
 /// Pipeline state the WGSL backend needs beyond Shader::RuntimeInfo.
+/// How a vertex attribute is read when its buffer is fetched by the shader instead of the vertex
+/// stage (WebGPU has fewer vertex buffer slots than the guest).
+struct PulledAttribute {
+    enum class Kind : u8 { Unorm, Snorm, Uint, Sint, Float, Unorm1010102 };
+    bool enabled{};
+    u8 buffer{};     ///< Index of the pulled buffer
+    u8 bits{};       ///< Bits per component: 8, 16 or 32
+    u8 components{}; ///< Components read, 1 to 4
+    Kind kind{};
+    u32 offset{};    ///< Byte offset within each element
+};
+
+struct PulledBuffer {
+    u32 stride{};
+    bool per_instance{};
+};
+
+/// Bind group with the pulled vertex buffers: read-only storage at bindings 0 to
+/// MAX_PULLED_BUFFERS - 1, and at MAX_PULLED_BUFFERS a uniform array<vec4<u32>, 2> with each
+/// buffer's byte offset from its binding's start.
+constexpr u32 PULLED_VERTEX_GROUP = 2;
+constexpr u32 MAX_PULLED_BUFFERS = 8;
+
 struct Options {
     /// Kind of each texture descriptor element, in descriptor order.
     std::vector<TextureSampleKind> texture_kinds;
@@ -42,7 +65,27 @@ struct Options {
     bool has_depth_target = true;
     /// Bind group holding the per-draw info uniform.
     u32 draw_info_group = 1;
+    /// Storage buffer bindings the stage may use; zero for no limit. Past it, the storage buffers
+    /// from index max_storage_buffers - 1 on share one binding (see PackedSsboFirst).
+    u32 max_storage_buffers = 0;
+    /// Vertex attributes read from pulled buffers, and those buffers.
+    std::array<PulledAttribute, 32> pulled_attributes{};
+    std::vector<PulledBuffer> pulled_buffers;
 };
+
+/// Maximum number of storage buffers that can share the packed binding.
+constexpr u32 MAX_PACKED_SSBOS = 16;
+
+/// Index of the first storage buffer read through the packed binding, or `count` when all storage
+/// buffers get their own binding. The packed binding takes the first packed buffer's binding
+/// number and is followed by a uniform array<vec4<u32>, 4> holding each packed buffer's base, in
+/// 32-bit words; the bindings of the remaining packed buffers are left unused.
+[[nodiscard]] constexpr u32 PackedSsboFirst(u32 count, u32 max_storage_buffers) {
+    if (max_storage_buffers < 2 || count <= max_storage_buffers) {
+        return count;
+    }
+    return max_storage_buffers - 1;
+}
 
 /// Layout of the per-draw uniform (group `draw_info_group`, binding 0).
 struct DrawInfo {

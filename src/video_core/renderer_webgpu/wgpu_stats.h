@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <string>
 
 #include "common/common_types.h"
 
@@ -33,5 +34,8 @@ struct PipelineStats {
 };
 
 inline PipelineStats pipeline_stats;
+
+/// TEMP-DEBUG: counts events by description and logs the totals every few seconds.
+void DebugCount(const std::string& what);
 
 } // namespace WebGPU

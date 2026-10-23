@@ -8,6 +8,7 @@
 #include "common/logging.h"
 #include "video_core/renderer_webgpu/wgpu_blit.h"
 #include "video_core/renderer_webgpu/wgpu_texture_cache.h"
+#include "video_core/renderer_webgpu/wgpu_stats.h"
 #include "video_core/renderer_webgpu/wgpu_thread.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
@@ -221,6 +222,7 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     if (!compatible) {
         static bool logged = false;
         LogOnce(logged, "copies between different formats");
+        DebugCount(fmt::format("copy {} -> {}", src.info.format, dst.info.format));
         return;
     }
     const FormatInfo& format_info = GetFormatInfo(dst.info.format);
@@ -311,6 +313,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                                            std::span<const VideoCommon::ImageCopy> copies) {
     static bool logged = false;
     LogOnce(logged, "image reinterpretation");
+    DebugCount(fmt::format("reinterpret {} -> {}", src.info.format, dst.info.format));
 }
 
 void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view, ImageView& src_view) {

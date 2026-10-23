@@ -7,6 +7,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -158,6 +159,11 @@ public:
     bool uses_shared_atomics{};
     /// Vertex stages cannot write storage buffers in WebGPU.
     bool storage_read_only{};
+    /// Storage buffers from this index on are read through the packed binding.
+    u32 packed_ssbo_first{~0u};
+
+    /// Expression for word `word` of storage buffer `index`.
+    [[nodiscard]] std::string SsboElement(u32 index, std::string_view word) const;
 
 private:
     void DefineConstantBuffers(Bindings& bindings);

@@ -111,6 +111,78 @@ std::string AttributeConversion(AttributeType type, std::string_view value) {
     }
 }
 
+/// WGSL expression of type `input_type` reading attribute `index` from its pulled buffer.
+std::string PulledAttributeValue(const PulledAttribute& attr, const PulledBuffer& buffer,
+                                 size_t index, std::string_view input_type) {
+    using Kind = PulledAttribute::Kind;
+    const std::string address{fmt::format(
+        "(vpull_base[{}u][{}u] + {} * {}u + {}u)", attr.buffer / 4, attr.buffer % 4,
+        buffer.per_instance ? "input.instance_index" : "input.vertex_index", buffer.stride,
+        attr.offset)};
+    const auto word{[&](u32 byte_offset) {
+        return fmt::format("vpull_read{}({} + {}u)", attr.buffer, address, byte_offset);
+    }};
+    if (attr.kind == Kind::Unorm1010102) {
+        const std::string w{word(0)};
+        return fmt::format("{0}(vec4<f32>(f32(extractBits({1}, 0u, 10u)), "
+                           "f32(extractBits({1}, 10u, 10u)), f32(extractBits({1}, 20u, 10u)), "
+                           "f32(extractBits({1}, 30u, 2u))) / vec4<f32>(1023.0, 1023.0, 1023.0, 3.0))",
+                           input_type, w);
+    }
+    const bool is_float{attr.kind == Kind::Float || attr.kind == Kind::Unorm ||
+                        attr.kind == Kind::Snorm};
+    const bool is_signed{attr.kind == Kind::Sint};
+    std::array<std::string, 4> values;
+    for (u32 component = 0; component < 4; ++component) {
+        if (component >= attr.components) {
+            values[component] = component == 3 ? (is_float ? "1.0" : is_signed ? "1i" : "1u")
+                                               : (is_float ? "0.0" : is_signed ? "0i" : "0u");
+            continue;
+        }
+        std::string raw;
+        if (attr.bits == 32) {
+            raw = word(component * 4);
+        } else {
+            const u32 bit{component * attr.bits};
+            raw = fmt::format("extractBits({}, {}u, {}u)", word(bit / 32 * 4), bit % 32, attr.bits);
+        }
+        const auto sign_extend{[&] {
+            return fmt::format("(bitcast<i32>({} << {}u) >> {}u)", raw, 32 - attr.bits,
+                               32 - attr.bits);
+        }};
+        const f32 max_unsigned{static_cast<f32>((1ULL << attr.bits) - 1)};
+        const f32 max_signed{static_cast<f32>((1ULL << (attr.bits - 1)) - 1)};
+        switch (attr.kind) {
+        case Kind::Float:
+            values[component] = attr.bits == 32
+                                    ? fmt::format("bitcast<f32>({})", raw)
+                                    : fmt::format("unpack2x16float({}).x", raw);
+            break;
+        case Kind::Unorm:
+            values[component] = fmt::format("(f32({}) / {:.1f})", raw, max_unsigned);
+            break;
+        case Kind::Snorm:
+            values[component] = fmt::format("max(f32({}) / {:.1f}, -1.0)",
+                                            attr.bits == 32 ? fmt::format("bitcast<i32>({})", raw)
+                                                            : sign_extend(),
+                                            max_signed);
+            break;
+        case Kind::Uint:
+            values[component] = raw;
+            break;
+        case Kind::Sint:
+            values[component] =
+                attr.bits == 32 ? fmt::format("bitcast<i32>({})", raw) : sign_extend();
+            break;
+        default:
+            break;
+        }
+    }
+    const std::string_view vector{is_float ? "vec4<f32>" : is_signed ? "vec4<i32>" : "vec4<u32>"};
+    return fmt::format("{}({}({}, {}, {}, {}))", input_type, vector, values[0], values[1],
+                       values[2], values[3]);
+}
+
 std::string_view ColorOutputType(AttributeType type) {
     switch (type) {
     case AttributeType::SignedInt:
@@ -201,18 +273,49 @@ void EmitContext::DefineConstantBufferIndirect() {
 }
 
 void EmitContext::DefineStorageBuffers(Bindings& bindings) {
+    u32 count{};
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        count += desc.count;
+    }
+    packed_ssbo_first = PackedSsboFirst(count, options.max_storage_buffers);
+    const auto element{uses_storage_atomics ? "atomic<u32>" : "u32"};
+    bool pack_writable{};
+    u32 pack_binding{};
     u32 index{};
     for (const auto& desc : info.storage_buffers_descriptors) {
         // Buffers the shader never writes stay read-only, so the same host buffer can be read
         // elsewhere in the render pass.
         const bool writable{!storage_read_only && (desc.is_written || uses_storage_atomics)};
-        const auto access{writable ? "read_write" : "read"};
-        const auto element{uses_storage_atomics ? "atomic<u32>" : "u32"};
-        header += fmt::format("@group(0) @binding({}) var<storage, {}> {}_ssbo{}: array<{}>;\n",
-                              bindings.unified, access, stage_name, index, element);
+        if (index >= packed_ssbo_first) {
+            if (index == packed_ssbo_first) {
+                pack_binding = bindings.unified;
+            }
+            pack_writable |= writable;
+        } else {
+            header += fmt::format("@group(0) @binding({}) var<storage, {}> {}_ssbo{}: array<{}>;\n",
+                                  bindings.unified, writable ? "read_write" : "read", stage_name,
+                                  index, element);
+        }
         bindings.unified += desc.count;
         index += desc.count;
     }
+    if (packed_ssbo_first < count) {
+        header += fmt::format("@group(0) @binding({}) var<storage, {}> {}_ssbo_pack: array<{}>;\n",
+                              pack_binding, pack_writable ? "read_write" : "read", stage_name,
+                              element);
+        header += fmt::format("@group(0) @binding({}) var<uniform> {}_ssbo_base: "
+                              "array<vec4<u32>, {}>;\n",
+                              pack_binding + 1, stage_name, MAX_PACKED_SSBOS / 4);
+    }
+}
+
+std::string EmitContext::SsboElement(u32 index, std::string_view word) const {
+    if (index < packed_ssbo_first) {
+        return fmt::format("{}_ssbo{}[{}]", stage_name, index, word);
+    }
+    const u32 slot{index - packed_ssbo_first};
+    return fmt::format("{}_ssbo_pack[{}_ssbo_base[{}][{}]+({})]", stage_name, stage_name, slot / 4,
+                       slot % 4, word);
 }
 
 void EmitContext::DefineTextures(Bindings& bindings) {
@@ -327,7 +430,8 @@ std::string EmitContext::Finish(const IR::Program& program) {
         for (size_t index = 0; index < IR::NUM_GENERICS; ++index) {
             const AttributeType type{runtime_info.generic_input_types[index]};
             if (info.loads.Generic(index) && type != AttributeType::Disabled &&
-                options.attribute_components[index] != 0) {
+                options.attribute_components[index] != 0 &&
+                !options.pulled_attributes[index].enabled) {
                 entry += fmt::format("@location({}) attr{}: {},\n", index, index,
                                      options.attribute_snorm_1010102[index]
                                          ? "u32"
@@ -343,6 +447,19 @@ std::string EmitContext::Finish(const IR::Program& program) {
             }
         }
         entry += "}\n";
+        if (!options.pulled_buffers.empty()) {
+            for (size_t buffer = 0; buffer < options.pulled_buffers.size(); ++buffer) {
+                entry += fmt::format(
+                    "@group({}) @binding({}) var<storage, read> vpull{}: array<u32>;\n"
+                    "fn vpull_read{}(byte: u32) -> u32 {{\nlet word = byte >> 2u;\n"
+                    "let shift = (byte & 3u) * 8u;\nif (shift == 0u) {{ return vpull{}[word]; }}\n"
+                    "return (vpull{}[word] >> shift) | (vpull{}[word + 1u] << (32u - shift));\n}}\n",
+                    PULLED_VERTEX_GROUP, buffer, buffer, buffer, buffer, buffer, buffer);
+            }
+            entry += fmt::format("@group({}) @binding({}) var<uniform> vpull_base: "
+                                 "array<vec4<u32>, {}>;\n",
+                                 PULLED_VERTEX_GROUP, MAX_PULLED_BUFFERS, MAX_PULLED_BUFFERS / 4);
+        }
         if (std::ranges::any_of(options.attribute_snorm_1010102, [](bool flag) { return flag; })) {
             // Sign-extends each field; the most negative value clamps to -1 as with SNORM formats.
             entry += "fn UnpackSnorm1010102(v: u32) -> vec4<f32> {\n"
@@ -359,12 +476,25 @@ std::string EmitContext::Finish(const IR::Program& program) {
                 options.attribute_components[index] == 0) {
                 continue;
             }
+            const PulledAttribute& pulled{options.pulled_attributes[index]};
+            std::string value{fmt::format("input.attr{}", index)};
+            if (pulled.enabled) {
+                const PulledBuffer& buffer{options.pulled_buffers[pulled.buffer]};
+                if (options.attribute_snorm_1010102[index]) {
+                    value = fmt::format("vpull_read{}(vpull_base[{}u][{}u] + {} * {}u + {}u)",
+                                        pulled.buffer, pulled.buffer / 4, pulled.buffer % 4,
+                                        buffer.per_instance ? "input.instance_index"
+                                                            : "input.vertex_index",
+                                        buffer.stride, pulled.offset);
+                } else {
+                    value = PulledAttributeValue(pulled, buffer, index, AttributeInputType(type));
+                }
+            }
             if (options.attribute_snorm_1010102[index]) {
-                entry += fmt::format("in_attr{} = UnpackSnorm1010102(input.attr{});\n", index, index);
+                entry += fmt::format("in_attr{} = UnpackSnorm1010102({});\n", index, value);
                 continue;
             }
-            entry += fmt::format("in_attr{} = {};\n", index,
-                                 AttributeConversion(type, fmt::format("input.attr{}", index)));
+            entry += fmt::format("in_attr{} = {};\n", index, AttributeConversion(type, value));
             if (options.attribute_components[index] == 3) {
                 entry += fmt::format("in_attr{}.w = 1.0;\n", index);
             }

@@ -17,8 +17,8 @@ std::string SharedPtr(std::string_view offset) {
 }
 
 std::string SsboPtr(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset) {
-    return fmt::format("&{}_ssbo{}[({})>>2u]", ctx.stage_name, binding.U32(),
-                       ctx.var_alloc.Consume(offset));
+    return "&" + ctx.SsboElement(binding.U32(),
+                                 fmt::format("({})>>2u", ctx.var_alloc.Consume(offset)));
 }
 
 /// Atomic read-modify-write through a compare-exchange loop; `function` maps (old, value).

@@ -14,7 +14,7 @@
 namespace Shader::Backend::WGSL {
 namespace {
 std::string Ssbo(EmitContext& ctx, const IR::Value& binding, std::string_view word) {
-    return fmt::format("{}_ssbo{}[{}]", ctx.stage_name, binding.U32(), word);
+    return ctx.SsboElement(binding.U32(), word);
 }
 
 std::string SsboLoad(EmitContext& ctx, const IR::Value& binding, std::string_view word) {

@@ -9,6 +9,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_webgpu/wgpu_rasterizer.h"
 #include "video_core/renderer_webgpu/maxwell_to_wgpu.h"
+#include "video_core/renderer_webgpu/wgpu_stats.h"
 #include "video_core/renderer_webgpu/wgpu_thread.h"
 #include "video_core/surface.h"
 #include "video_core/gpu.h"
@@ -16,6 +17,7 @@
 
 #include "video_core/texture_cache/types.h"
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <span>
 #include <boost/container/small_vector.hpp>
@@ -87,17 +89,17 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     ++stats.draws;
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (!pipeline) {
-        return;
+        { DebugCount("draw skip line 90"); return; }
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     if (!pipeline->Configure(is_indexed)) {
-        return;
+        { DebugCount("draw skip line 94"); return; }
     }
     const auto& regs = maxwell3d->regs;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const RenderTargets& targets = *pipeline->targets;
     if (targets.width == 0 || targets.height == 0) {
-        return;
+        { DebugCount("draw skip line 100"); return; }
     }
 
     // Draw parameters, after topologies WebGPU lacks were rewritten into index lists.
@@ -120,7 +122,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         first = 0;
     }
     if (count == 0 || instance_count == 0) {
-        return;
+        { DebugCount("draw skip line 123"); return; }
     }
 
     // The guest viewport is applied in the vertex shader so it may extend past the target.
@@ -168,7 +170,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         const u32 y0 = static_cast<u32>(std::clamp<s32>(min_y, 0, static_cast<s32>(targets.height)));
         const u32 y1 = static_cast<u32>(std::clamp<s32>(max_y, 0, static_cast<s32>(targets.height)));
         if (x1 <= x0 || y1 <= y0) {
-            return;
+            { DebugCount("draw skip line 171"); return; }
         }
         sx = x0, sy = y0, sw = x1 - x0, sh = y1 - y0;
     }
@@ -186,17 +188,107 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     if (indexed && runtime.index.buffer) {
         read_buffers.push_back(runtime.index.buffer.Get());
     }
-    const std::span<const WGPUBuffer> written_buffers{pipeline->written_buffers};
-    if (!written_buffers.empty()) {
-        for (const WGPUBuffer buffer : written_buffers) {
-            if (std::ranges::find(read_buffers, buffer) != read_buffers.end()) {
-                static bool logged = false;
-                if (!logged) {
-                    logged = true;
-                    LOG_WARNING(Render, "WebGPU: skipping draws that read and write one buffer");
-                }
-                return;
+    // Vertex buffers past WebGPU's slots are read by the shader as storage buffers. Storage
+    // bindings start at 256-byte aligned offsets; the shader adds the remainder.
+    wgpu::BindGroup pulled_group;
+    if (!pipeline->pulled_buffers.empty()) {
+        std::array<wgpu::BindGroupEntry, Shader::Backend::WGSL::MAX_PULLED_BUFFERS + 1> entries{};
+        std::array<u32, Shader::Backend::WGSL::MAX_PULLED_BUFFERS> bases{};
+        const size_t count = pipeline->pulled_buffers.size();
+        for (size_t i = 0; i < count; ++i) {
+            const u32 index = pipeline->pulled_buffers[i];
+            const auto& binding = runtime.vertex_bindings[index];
+            if (index >= runtime.num_vertex_bindings || !binding.buffer) {
+                { DebugCount("draw skip pulled buffer missing"); return; }
             }
+            const u64 aligned = binding.offset & ~255ULL;
+            if (aligned + 4 > binding.buffer.GetSize()) {
+                { DebugCount("draw skip pulled buffer range"); return; }
+            }
+            entries[i].binding = static_cast<u32>(i);
+            entries[i].buffer = binding.buffer;
+            entries[i].offset = aligned;
+            entries[i].size = (binding.buffer.GetSize() - aligned) & ~3ULL;
+            bases[i] = static_cast<u32>(binding.offset - aligned);
+            read_buffers.push_back(binding.buffer.Get());
+        }
+        auto& base_entry = entries[count];
+        base_entry.binding = Shader::Backend::WGSL::MAX_PULLED_BUFFERS;
+        base_entry.buffer = uniform_ring.Buffer();
+        base_entry.offset = uniform_ring.Push(
+            std::span<const u8>(reinterpret_cast<const u8*>(bases.data()), sizeof(bases)));
+        base_entry.size = sizeof(bases);
+        wgpu::BindGroupDescriptor desc{};
+        desc.layout = pipeline->pulled_layout;
+        desc.entryCount = count + 1;
+        desc.entries = entries.data();
+        pulled_group = Thread::Get().device.CreateBindGroup(&desc);
+    }
+    // A storage buffer the draw writes may share its host buffer with one it reads, which WebGPU
+    // forbids in one pass: the draw writes a copy of the range, copied back after the draw.
+    boost::container::small_vector<WGPUBuffer, 8> written_buffers(pipeline->written_buffers.begin(),
+                                                                  pipeline->written_buffers.end());
+    wgpu::BindGroup bind_group = pipeline->bind_group;
+    struct ShadowCopy {
+        wgpu::Buffer buffer;
+        u64 offset;
+        u64 size;
+        u64 shadow_offset;
+    };
+    boost::container::small_vector<ShadowCopy, 4> shadow_copies;
+    for (const size_t entry_index : pipeline->written_entries) {
+        const wgpu::BindGroupEntry& entry = pipeline->bind_entries[entry_index];
+        if (std::ranges::find(read_buffers, entry.buffer.Get()) == read_buffers.end() ||
+            entry.offset % 4 != 0) {
+            continue;
+        }
+        const u64 size = Common::AlignUp(entry.size, 4);
+        if (entry.offset + size > entry.buffer.GetSize()) {
+            continue;
+        }
+        const u64 shadow_offset =
+            shadow_copies.empty() ? 0
+                                  : Common::AlignUp(shadow_copies.back().shadow_offset +
+                                                        shadow_copies.back().size,
+                                                    256);
+        shadow_copies.push_back({entry.buffer, entry.offset, size, shadow_offset});
+    }
+    if (!shadow_copies.empty()) {
+        const u64 total = shadow_copies.back().shadow_offset + shadow_copies.back().size;
+        if (!shadow_buffer || shadow_buffer.GetSize() < total) {
+            wgpu::BufferDescriptor desc{};
+            desc.size = std::bit_ceil(std::max<u64>(total, 1ULL << 20));
+            desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc |
+                         wgpu::BufferUsage::CopyDst;
+            shadow_buffer = Thread::Get().device.CreateBuffer(&desc);
+        }
+        std::vector<wgpu::BindGroupEntry> entries = pipeline->bind_entries;
+        size_t copy_index{};
+        for (const size_t entry_index : pipeline->written_entries) {
+            auto& entry = entries[entry_index];
+            if (copy_index < shadow_copies.size() &&
+                shadow_copies[copy_index].buffer.Get() == entry.buffer.Get() &&
+                shadow_copies[copy_index].offset == entry.offset) {
+                std::ranges::replace(written_buffers, entry.buffer.Get(), shadow_buffer.Get());
+                entry.buffer = shadow_buffer;
+                entry.offset = shadow_copies[copy_index].shadow_offset;
+                ++copy_index;
+            }
+        }
+        wgpu::CommandEncoder& encoder = scheduler.Encoder();
+        for (const auto& copy : shadow_copies) {
+            encoder.CopyBufferToBuffer(copy.buffer, copy.offset, shadow_buffer, copy.shadow_offset,
+                                       copy.size);
+        }
+        wgpu::BindGroupDescriptor desc{};
+        desc.layout = pipeline->bind_layout;
+        desc.entryCount = entries.size();
+        desc.entries = entries.data();
+        bind_group = Thread::Get().device.CreateBindGroup(&desc);
+    }
+    for (const WGPUBuffer buffer : written_buffers) {
+        if (std::ranges::find(read_buffers, buffer) != read_buffers.end()) {
+            { DebugCount("draw skip line 198"); return; }
         }
     }
     if (scheduler.InRenderPass() && scheduler.PassConflicts(written_buffers, read_buffers)) {
@@ -211,8 +303,11 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         ++debug_last_serial;
     }
     pass.SetPipeline(pipeline->render_pipeline);
-    pass.SetBindGroup(0, pipeline->bind_group);
+    pass.SetBindGroup(0, bind_group);
     pass.SetBindGroup(1, draw_info_group, 1, &draw_offset);
+    if (pulled_group) {
+        pass.SetBindGroup(Shader::Backend::WGSL::PULLED_VERTEX_GROUP, pulled_group);
+    }
     // WebGPU rejects draws reading past a vertex binding (and the whole command buffer with
     // them), while the guest just reads zeros; widen bindings to the buffer end or skip the draw.
     std::array<u64, Maxwell::NumVertexArrays> vertex_sizes{};
@@ -224,7 +319,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         const auto& binding = runtime.vertex_bindings[index];
         if (index >= runtime.num_vertex_bindings || !binding.buffer ||
             binding.offset >= binding.buffer.GetSize()) {
-            return;
+            { DebugCount("draw skip line 227"); return; }
         }
         const u64 available = binding.buffer.GetSize() - (binding.offset & ~3ULL);
         u64 needed = 0;
@@ -234,14 +329,15 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
             needed = static_cast<u64>(first + count) * use.stride;
         }
         if (needed > available) {
-            return;
+            { DebugCount("draw skip line 237"); return; }
         }
         vertex_sizes[index] = available;
     }
     for (u32 index = 0; index < Maxwell::NumVertexArrays; ++index) {
         if (vertex_sizes[index] != 0) {
             const auto& binding = runtime.vertex_bindings[index];
-            pass.SetVertexBuffer(index, binding.buffer, binding.offset & ~3ULL, vertex_sizes[index]);
+            pass.SetVertexBuffer(pipeline->vertex_buffer_uses[index].slot, binding.buffer,
+                                 binding.offset & ~3ULL, vertex_sizes[index]);
         }
     }
     pass.SetViewport(0.0f, 0.0f, width, height, min_depth, max_depth);
@@ -253,11 +349,11 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     if (indexed) {
         const auto& index = runtime.index;
         if (!index.buffer) {
-            return;
+            { DebugCount("draw skip line 256"); return; }
         }
         const u64 index_offset = index.offset & ~3ULL;
         if (index_offset >= index.buffer.GetSize()) {
-            return;
+            { DebugCount("draw skip line 260"); return; }
         }
         const u64 available = index.buffer.GetSize() - index_offset;
         const u64 needed = (static_cast<u64>(first) + count) *
@@ -269,7 +365,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
                             "converted {})", first, count, needed, available, index.buffer.GetSize(),
                             index.offset, index.converted);
             }
-            return;
+            { DebugCount("draw skip line 272"); return; }
         }
         const u64 index_size = std::min(available, std::max(needed, static_cast<u64>(index.size)));
         pass.SetIndexBuffer(index.buffer, index.format, index_offset, index_size);
@@ -279,6 +375,13 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     } else {
         pass.Draw(count, instance_count, first, draw_state.base_instance);
         ++stats.actual_draws;
+    }
+    if (!shadow_copies.empty()) {
+        wgpu::CommandEncoder& encoder = scheduler.Encoder();
+        for (const auto& copy : shadow_copies) {
+            encoder.CopyBufferToBuffer(shadow_buffer, copy.shadow_offset, copy.buffer, copy.offset,
+                                       copy.size);
+        }
     }
 }
 void RasterizerWebGPU::DrawTexture() {
@@ -293,11 +396,11 @@ void RasterizerWebGPU::DrawTexture() {
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
     const auto* framebuffer = texture_cache.GetFramebuffer();
     if (!framebuffer) {
-        return;
+        { DebugCount("draw skip line 296"); return; }
     }
     const auto& targets = framebuffer->Targets();
     if (!targets.colors[0]) {
-        return;
+        { DebugCount("draw skip line 300"); return; }
     }
     Region2D dst_region = {Offset2D{.x = static_cast<s32>(draw_texture_state.dst_x0),
                                     .y = static_cast<s32>(draw_texture_state.dst_y0)},
@@ -355,9 +458,41 @@ void RasterizerWebGPU::Clear(u32 layer_count) {
     scheduler.Clear(targets, request);
 }
 void RasterizerWebGPU::DispatchCompute() {
-    static u32 logs = 0; // TEMP-DEBUG
-    if (logs++ % 500 == 0) {
-        LOG_INFO(Render, "TEMP-DEBUG compute dispatches {}", logs);
+    ComputePipeline* const pipeline = pipeline_cache.CurrentComputePipeline();
+    if (!pipeline) {
+        return;
+    }
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    if (!pipeline->Configure()) {
+        return;
+    }
+    // One dispatch is one usage scope: a buffer cannot be both written and read in it.
+    for (const WGPUBuffer buffer : pipeline->written_buffers) {
+        if (std::ranges::find(pipeline->read_buffers, buffer) != pipeline->read_buffers.end()) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG_WARNING(Render, "WebGPU: skipping dispatches that read and write one buffer");
+            }
+            return;
+        }
+    }
+    const auto& qmd{kepler_compute->launch_description};
+    wgpu::CommandEncoder& encoder = scheduler.Encoder();
+    for (const auto& copy : pipeline->packed_copies) {
+        encoder.CopyBufferToBuffer(copy.buffer, copy.offset, pipeline->pack_buffer,
+                                   copy.pack_offset, copy.size);
+    }
+    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+    pass.SetPipeline(pipeline->pipeline);
+    pass.SetBindGroup(0, pipeline->bind_group);
+    pass.DispatchWorkgroups(qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z);
+    pass.End();
+    for (const auto& copy : pipeline->packed_copies) {
+        if (copy.written) {
+            encoder.CopyBufferToBuffer(pipeline->pack_buffer, copy.pack_offset, copy.buffer,
+                                       copy.offset, copy.size);
+        }
     }
 }
 void RasterizerWebGPU::ResetCounter(VideoCommon::QueryType type) {}

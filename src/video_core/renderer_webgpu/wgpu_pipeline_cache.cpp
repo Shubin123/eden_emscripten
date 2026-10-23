@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <mutex>
 #include <bit>
 #include <chrono>
 #include <cstring>
 
 #include <boost/container/small_vector.hpp>
 
+#include "common/alignment.h"
 #include "common/cityhash.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
@@ -218,6 +220,63 @@ u8 ProvidedComponents(const Vulkan::FixedPipelineState& state, size_t index) {
     return components;
 }
 
+/// How the shader reads `format` from a pulled vertex buffer.
+Shader::Backend::WGSL::PulledAttribute PulledFormat(wgpu::VertexFormat format) {
+    using VF = wgpu::VertexFormat;
+    using Kind = Shader::Backend::WGSL::PulledAttribute::Kind;
+    const auto make = [](u8 bits, u8 components, Kind kind) {
+        Shader::Backend::WGSL::PulledAttribute attr{};
+        attr.enabled = true;
+        attr.bits = bits;
+        attr.components = components;
+        attr.kind = kind;
+        return attr;
+    };
+    switch (format) {
+    case VF::Unorm8: return make(8, 1, Kind::Unorm);
+    case VF::Unorm8x2: return make(8, 2, Kind::Unorm);
+    case VF::Unorm8x4: return make(8, 4, Kind::Unorm);
+    case VF::Snorm8: return make(8, 1, Kind::Snorm);
+    case VF::Snorm8x2: return make(8, 2, Kind::Snorm);
+    case VF::Snorm8x4: return make(8, 4, Kind::Snorm);
+    case VF::Uint8: return make(8, 1, Kind::Uint);
+    case VF::Uint8x2: return make(8, 2, Kind::Uint);
+    case VF::Uint8x4: return make(8, 4, Kind::Uint);
+    case VF::Sint8: return make(8, 1, Kind::Sint);
+    case VF::Sint8x2: return make(8, 2, Kind::Sint);
+    case VF::Sint8x4: return make(8, 4, Kind::Sint);
+    case VF::Unorm16: return make(16, 1, Kind::Unorm);
+    case VF::Unorm16x2: return make(16, 2, Kind::Unorm);
+    case VF::Unorm16x4: return make(16, 4, Kind::Unorm);
+    case VF::Snorm16: return make(16, 1, Kind::Snorm);
+    case VF::Snorm16x2: return make(16, 2, Kind::Snorm);
+    case VF::Snorm16x4: return make(16, 4, Kind::Snorm);
+    case VF::Uint16: return make(16, 1, Kind::Uint);
+    case VF::Uint16x2: return make(16, 2, Kind::Uint);
+    case VF::Uint16x4: return make(16, 4, Kind::Uint);
+    case VF::Sint16: return make(16, 1, Kind::Sint);
+    case VF::Sint16x2: return make(16, 2, Kind::Sint);
+    case VF::Sint16x4: return make(16, 4, Kind::Sint);
+    case VF::Float16: return make(16, 1, Kind::Float);
+    case VF::Float16x2: return make(16, 2, Kind::Float);
+    case VF::Float16x4: return make(16, 4, Kind::Float);
+    case VF::Float32: return make(32, 1, Kind::Float);
+    case VF::Float32x2: return make(32, 2, Kind::Float);
+    case VF::Float32x3: return make(32, 3, Kind::Float);
+    case VF::Float32x4: return make(32, 4, Kind::Float);
+    case VF::Uint32: return make(32, 1, Kind::Uint);
+    case VF::Uint32x2: return make(32, 2, Kind::Uint);
+    case VF::Uint32x3: return make(32, 3, Kind::Uint);
+    case VF::Uint32x4: return make(32, 4, Kind::Uint);
+    case VF::Sint32: return make(32, 1, Kind::Sint);
+    case VF::Sint32x2: return make(32, 2, Kind::Sint);
+    case VF::Sint32x3: return make(32, 3, Kind::Sint);
+    case VF::Sint32x4: return make(32, 4, Kind::Sint);
+    case VF::Unorm10_10_10_2: return make(32, 4, Kind::Unorm1010102);
+    default: return {};
+    }
+}
+
 u32 UniformBindingSize(const Shader::Info& info, u32 index) {
     const u32 used_size{std::max(info.constant_buffer_used_sizes[index], 16U)};
     return std::min(Common::DivCeil(used_size, 16U), 4096U) * 16;
@@ -256,6 +315,25 @@ wgpu::ShaderModule MakeModule(const std::string& code, u64 hash) {
 }
 
 } // Anonymous namespace
+
+void DebugCount(const std::string& what) {
+    static std::mutex mutex;
+    static std::map<std::string, u64> counts;
+    static auto last = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    ++counts[what];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) {
+        return;
+    }
+    last = now;
+    std::string text;
+    for (const auto& [key, value] : counts) {
+        text += fmt::format("\n  {:8} {}", value, key);
+    }
+    LOG_INFO(Render, "TEMP-DEBUG counts (10 s):{}", text);
+    counts.clear();
+}
 
 size_t GraphicsPipelineKey::Hash() const noexcept {
     return static_cast<size_t>(Common::CityHash64(reinterpret_cast<const char*>(this), Size()));
@@ -298,6 +376,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .single_lane_geometry_subgroups = true,
     };
     host_info.ApplyDescriptorLimitPolicy();
+    wgpu::Limits limits{};
+    if (Thread::Get().device.GetLimits(&limits) == wgpu::Status::Success) {
+        max_storage_buffers = limits.maxStorageBuffersPerShaderStage;
+        max_vertex_buffers = limits.maxVertexBuffers;
+    }
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -466,6 +549,15 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
                 }
                 const size_t stage = index - 1;
                 stage_infos[stage] = programs[index].info;
+                if (!programs[index].info.image_descriptors.empty() ||
+                    !programs[index].info.texture_buffer_descriptors.empty() ||
+                    programs[index].info.storage_buffers_descriptors.size() > 8) {
+                    LOG_INFO(Render, "TEMP-DEBUG graphics {:016x} stage {}: ssbos {} images {} "
+                             "texbufs {}", key.Hash(), stage,
+                             programs[index].info.storage_buffers_descriptors.size(),
+                             programs[index].info.image_descriptors.size(),
+                             programs[index].info.texture_buffer_descriptors.size());
+                }
                 enabled_stages[stage] = true;
                 enabled_uniform_buffer_masks[stage] = stage_infos[stage].constant_buffer_mask;
                 std::ranges::copy(stage_infos[stage].constant_buffer_used_sizes,
@@ -480,6 +572,35 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
         if (variant_key.texture_kinds.size() != num_textures) {
             return false;
         }
+
+        // Guest vertex buffers the pipeline reads take WebGPU's vertex buffer slots in order; the
+        // shader fetches the ones past the last slot from storage buffers.
+        std::array<bool, Maxwell::NumVertexArrays> buffer_read{};
+        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+            const auto& attribute = key.state.attributes[index];
+            if (attribute.enabled && stage_infos[0].loads.Generic(index) &&
+                ProvidedComponents(key.state, index) != 0) {
+                buffer_read[attribute.buffer] = true;
+            }
+        }
+        pulled_buffers.clear();
+        u32 num_read{};
+        for (u32 buffer = 0; buffer < Maxwell::NumVertexArrays; ++buffer) {
+            if (buffer_read[buffer] && num_read++ >= cache.max_vertex_buffers) {
+                pulled_buffers.push_back(buffer);
+            }
+        }
+        if (pulled_buffers.size() > Shader::Backend::WGSL::MAX_PULLED_BUFFERS) {
+            LOG_WARNING(Render, "WebGPU: pipeline {:016x} reads too many vertex buffers", key.Hash());
+            return false;
+        }
+        const auto pulled_index = [&](u32 buffer) -> std::optional<u8> {
+            const auto it = std::ranges::find(pulled_buffers, buffer);
+            if (it == pulled_buffers.end()) {
+                return std::nullopt;
+            }
+            return static_cast<u8>(it - pulled_buffers.begin());
+        };
 
         std::array<std::string, NUM_STAGES> codes;
         Shader::Backend::Bindings binding;
@@ -511,6 +632,19 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
                         attribute.enabled &&
                         attribute.Size() == Maxwell::VertexAttribute::Size::Size_A2_B10_G10_R10 &&
                         attribute.Type() == Maxwell::VertexAttribute::Type::SNorm;
+                    const auto pulled = pulled_index(attribute.buffer);
+                    if (attribute.enabled && pulled && options.attribute_components[attr] != 0) {
+                        u8 components{};
+                        auto& pulled_attr = options.pulled_attributes[attr];
+                        pulled_attr = PulledFormat(MaxwellToWGPU::VertexFormat(
+                            attribute.Type(), attribute.Size(), components));
+                        pulled_attr.buffer = *pulled;
+                        pulled_attr.offset = attribute.offset;
+                    }
+                }
+                for (const u32 buffer : pulled_buffers) {
+                    options.pulled_buffers.push_back({key.state.vertex_strides[buffer],
+                                                      key.state.binding_divisors[buffer] != 0});
                 }
             }
             codes[stage] = EmitWGSL(cache.profile, runtime_info, program, binding, options);
@@ -596,9 +730,27 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
         draw_layout_desc.entryCount = 1;
         draw_layout_desc.entries = &draw_entry;
         const wgpu::BindGroupLayout draw_layout = device.CreateBindGroupLayout(&draw_layout_desc);
-        const std::array<wgpu::BindGroupLayout, 2> layouts{variant.layout, draw_layout};
+        if (!pulled_buffers.empty()) {
+            std::vector<wgpu::BindGroupLayoutEntry> pulled_entries(pulled_buffers.size() + 1);
+            for (u32 i = 0; i < pulled_buffers.size(); ++i) {
+                pulled_entries[i].binding = i;
+                pulled_entries[i].visibility = wgpu::ShaderStage::Vertex;
+                pulled_entries[i].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+            }
+            auto& bases = pulled_entries.back();
+            bases.binding = Shader::Backend::WGSL::MAX_PULLED_BUFFERS;
+            bases.visibility = wgpu::ShaderStage::Vertex;
+            bases.buffer.type = wgpu::BufferBindingType::Uniform;
+            bases.buffer.minBindingSize = Shader::Backend::WGSL::MAX_PULLED_BUFFERS * 4;
+            wgpu::BindGroupLayoutDescriptor pulled_desc{};
+            pulled_desc.entryCount = pulled_entries.size();
+            pulled_desc.entries = pulled_entries.data();
+            variant.pulled_layout = device.CreateBindGroupLayout(&pulled_desc);
+        }
+        const std::array<wgpu::BindGroupLayout, 3> layouts{variant.layout, draw_layout,
+                                                           variant.pulled_layout};
         wgpu::PipelineLayoutDescriptor pipeline_layout_desc{};
-        pipeline_layout_desc.bindGroupLayoutCount = layouts.size();
+        pipeline_layout_desc.bindGroupLayoutCount = variant.pulled_layout ? 3 : 2;
         pipeline_layout_desc.bindGroupLayouts = layouts.data();
         const wgpu::PipelineLayout pipeline_layout = device.CreatePipelineLayout(&pipeline_layout_desc);
 
@@ -617,7 +769,7 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
             if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
                 continue;
             }
-            if (ProvidedComponents(state, index) == 0) {
+            if (ProvidedComponents(state, index) == 0 || pulled_index(attribute.buffer)) {
                 continue;
             }
             u8 components{};
@@ -629,18 +781,19 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
                                           .shaderLocation = static_cast<u32>(index)});
             num_buffers = std::max(num_buffers, buffer + 1);
         }
+        // WebGPU has fewer vertex buffer slots than the guest has buffers, so the buffers the
+        // pipeline reads take consecutive slots.
         std::array<wgpu::VertexBufferLayout, Maxwell::NumVertexArrays> buffer_layouts{};
         vertex_buffer_uses = {};
+        u32 num_slots{};
         for (u32 index = 0; index < num_buffers; ++index) {
-            auto& layout = buffer_layouts[index];
-            vertex_buffer_uses[index] = {state.vertex_strides[index] & ~3u,
-                                         state.binding_divisors[index] != 0,
-                                         !attributes[index].empty()};
             if (attributes[index].empty()) {
-                // Undefined with no attributes leaves the slot unused, so no buffer is required.
-                layout.stepMode = wgpu::VertexStepMode::Undefined;
                 continue;
             }
+            const u32 slot = num_slots++;
+            auto& layout = buffer_layouts[slot];
+            vertex_buffer_uses[index] = {state.vertex_strides[index] & ~3u,
+                                         state.binding_divisors[index] != 0, true, slot};
             layout.arrayStride = state.vertex_strides[index] & ~3u;
             layout.stepMode = state.binding_divisors[index] != 0 ? wgpu::VertexStepMode::Instance
                                                                  : wgpu::VertexStepMode::Vertex;
@@ -652,7 +805,7 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
         desc.layout = pipeline_layout;
         desc.vertex.module = vs_module;
         desc.vertex.entryPoint = "main";
-        desc.vertex.bufferCount = num_buffers;
+        desc.vertex.bufferCount = num_slots;
         desc.vertex.buffers = buffer_layouts.data();
 
         const auto& dynamic = state.dynamic_state;
@@ -826,7 +979,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
         Translate(VariantKey{}, scratch, true);
         if (!infos_ready) {
             valid = false;
-            return false;
+            { DebugCount("configure false line 863"); return false; }
         }
     }
     auto* const maxwell3d = cache.maxwell3d;
@@ -886,7 +1039,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
     texture_cache.UpdateRenderTargets(false);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (!framebuffer) {
-        return false;
+        { DebugCount("configure false line 923"); return false; }
     }
     targets = &framebuffer->Targets();
 
@@ -936,15 +1089,17 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
     Variant* const variant = FindVariant(variant_key);
     if (!variant || variant->failed || !*variant->pipeline) {
         // Still compiling, or failed.
-        return false;
+        { DebugCount("configure false line 973"); return false; }
     }
     render_pipeline = *variant->pipeline;
+    pulled_layout = variant->pulled_layout;
 
     // Resource bindings, in layout order.
     auto& descriptors = runtime.Descriptors();
     std::vector<wgpu::BindGroupEntry> entries;
     written_buffers.clear();
     read_buffers.clear();
+    written_entries.clear();
     size_t storage_index{};
     size_t descriptor_index{};
     size_t texture_index{};
@@ -958,7 +1113,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
         for (const auto& desc : info.constant_buffer_descriptors) {
             for (u32 i = 0; i < desc.count; ++i) {
                 if (descriptor_index >= descriptors.size()) {
-                    return false;
+                    { DebugCount("configure false line 995"); return false; }
                 }
                 BufferDescriptor& bound = descriptors[descriptor_index++];
                 const u32 size = UniformBindingSize(info, desc.index);
@@ -980,7 +1135,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
         for (const auto& desc : info.storage_buffers_descriptors) {
             for (u32 i = 0; i < desc.count; ++i) {
                 if (descriptor_index >= descriptors.size()) {
-                    return false;
+                    { DebugCount("configure false line 1017"); return false; }
                 }
                 const BufferDescriptor& bound = descriptors[descriptor_index++];
                 auto& entry = entries.emplace_back();
@@ -991,6 +1146,9 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
                 const bool writable = storage_index < variant->storage_writable.size() &&
                                       variant->storage_writable[storage_index];
                 ++storage_index;
+                if (writable) {
+                    written_entries.push_back(entries.size() - 1);
+                }
                 (writable ? written_buffers : read_buffers).push_back(bound.buffer.Get());
             }
         }
@@ -1002,6 +1160,11 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
                 wgpu::TextureView handle = view.Handle(desc.type);
                 const bool is_dummy = (!handle || view.Kind() != kind);
                 if (is_dummy) {
+                    DebugCount(fmt::format("dummy texture: view {} fmt {} viewtype {} desctype {} "
+                                           "kind {}/{}", views[slot].id.index != 0 ? "real" : "null",
+                                           view.format, static_cast<u32>(view.type),
+                                           static_cast<u32>(desc.type),
+                                           static_cast<u32>(view.Kind()), static_cast<u32>(kind)));
                     handle = cache.DummyTexture(desc.type, kind);
                 } else if (std::ranges::find(targets->textures, view.BaseTexture().Get()) !=
                            targets->textures.end()) {
@@ -1029,6 +1192,358 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
     bind_desc.entryCount = entries.size();
     bind_desc.entries = entries.data();
     bind_group = device.CreateBindGroup(&bind_desc);
+    bind_layout = variant->layout;
+    bind_entries = std::move(entries);
+    return true;
+}
+
+ComputePipeline* PipelineCache::CurrentComputePipeline() {
+    const VideoCommon::ShaderInfo* const shader{ComputeShader()};
+    if (!shader) {
+        return nullptr;
+    }
+    const auto& qmd{kepler_compute->launch_description};
+    const ComputePipelineKey key{
+        .unique_hash = shader->unique_hash,
+        .shared_memory_size = qmd.shared_alloc,
+        .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
+    };
+    auto [it, is_new] = compute_cache.try_emplace(key);
+    if (is_new) {
+        const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
+        VideoCommon::ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base,
+                                            qmd.program_start};
+        env.SetCachedSize(shader->size_bytes);
+        it->second = std::make_unique<ComputePipeline>(*this, key, std::move(env));
+    }
+    return it->second.get();
+}
+
+ComputePipeline::ComputePipeline(PipelineCache& cache_, const ComputePipelineKey& key_,
+                                 VideoCommon::ComputeEnvironment&& env_)
+    : cache{cache_}, key{key_}, env{std::move(env_)} {
+    valid = Translate({}, nullptr);
+}
+
+bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_kinds,
+                                Variant* variant) {
+    auto& pools = cache.pools;
+    pools.ReleaseContents();
+    try {
+        Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
+        Shader::IR::Program program{
+            TranslateProgram(pools.inst, pools.block, env, cfg, cache.host_info)};
+        if (!variant) {
+            info = program.info;
+            LOG_INFO(Render, "TEMP-DEBUG compute {:016x}: cbufs {} ssbos {} textures {} images {} "
+                     "texbufs {} imgbufs {} smem {} wg {}x{}x{}", key.unique_hash,
+                     info.constant_buffer_descriptors.size(), info.storage_buffers_descriptors.size(),
+                     info.texture_descriptors.size(), info.image_descriptors.size(),
+                     info.texture_buffer_descriptors.size(), info.image_buffer_descriptors.size(),
+                     program.shared_memory_size, program.workgroup_size[0],
+                     program.workgroup_size[1], program.workgroup_size[2]);
+            std::copy_n(info.constant_buffer_used_sizes.begin(), uniform_buffer_sizes.size(),
+                        uniform_buffer_sizes.begin());
+            return true;
+        }
+        Options options;
+        options.texture_kinds = texture_kinds;
+        options.max_storage_buffers = cache.max_storage_buffers;
+        Shader::Backend::Bindings binding;
+        const std::string code{
+            EmitWGSL(cache.profile, Shader::RuntimeInfo{}, program, binding, options)};
+
+        auto& device = Thread::Get().device;
+        const auto visibility = wgpu::ShaderStage::Compute;
+        std::vector<wgpu::BindGroupLayoutEntry> entries;
+        u32 binding_index{};
+        for (const auto& desc : info.constant_buffer_descriptors) {
+            for (u32 i = 0; i < desc.count; ++i) {
+                auto& entry = entries.emplace_back();
+                entry.binding = binding_index++;
+                entry.visibility = visibility;
+                entry.buffer.type = wgpu::BufferBindingType::Uniform;
+                entry.buffer.minBindingSize = UniformBindingSize(info, desc.index);
+            }
+        }
+        const u32 num_ssbos{Shader::NumDescriptors(info.storage_buffers_descriptors)};
+        const u32 packed_first{
+            Shader::Backend::WGSL::PackedSsboFirst(num_ssbos, cache.max_storage_buffers)};
+        if (num_ssbos - packed_first > Shader::Backend::WGSL::MAX_PACKED_SSBOS) {
+            LOG_WARNING(Render, "WebGPU: compute shader {:016x} uses too many storage buffers",
+                        key.unique_hash);
+            return false;
+        }
+        u32 ssbo_index{};
+        for (const auto& desc : info.storage_buffers_descriptors) {
+            const bool writable =
+                code.find(fmt::format("@binding({}) var<storage, read_write>", binding_index)) !=
+                std::string::npos;
+            for (u32 i = 0; i < desc.count; ++i, ++ssbo_index) {
+                const u32 binding_number = binding_index++;
+                variant->storage_writable.push_back(writable);
+                if (ssbo_index > packed_first) {
+                    continue;
+                }
+                auto& entry = entries.emplace_back();
+                entry.binding = binding_number;
+                entry.visibility = visibility;
+                entry.buffer.type = writable ? wgpu::BufferBindingType::Storage
+                                             : wgpu::BufferBindingType::ReadOnlyStorage;
+                if (ssbo_index == packed_first) {
+                    auto& bases = entries.emplace_back();
+                    bases.binding = binding_number + 1;
+                    bases.visibility = visibility;
+                    bases.buffer.type = wgpu::BufferBindingType::Uniform;
+                    bases.buffer.minBindingSize = Shader::Backend::WGSL::MAX_PACKED_SSBOS * 4;
+                }
+            }
+        }
+        size_t kind_index{};
+        for (const auto& desc : info.texture_descriptors) {
+            for (u32 i = 0; i < desc.count; ++i) {
+                const TextureSampleKind kind{texture_kinds[kind_index++]};
+                auto& texture = entries.emplace_back();
+                texture.binding = binding_index++;
+                texture.visibility = visibility;
+                texture.texture.viewDimension = ViewDimension(desc.type);
+                if (desc.is_depth || kind == TextureSampleKind::Depth) {
+                    texture.texture.sampleType = wgpu::TextureSampleType::Depth;
+                } else if (kind == TextureSampleKind::Sint) {
+                    texture.texture.sampleType = wgpu::TextureSampleType::Sint;
+                } else if (kind == TextureSampleKind::Uint) {
+                    texture.texture.sampleType = wgpu::TextureSampleType::Uint;
+                } else if (kind == TextureSampleKind::UnfilterableFloat) {
+                    texture.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
+                } else {
+                    texture.texture.sampleType = wgpu::TextureSampleType::Float;
+                }
+                auto& sampler = entries.emplace_back();
+                sampler.binding = binding_index++;
+                sampler.visibility = visibility;
+                if (desc.is_depth) {
+                    sampler.sampler.type = wgpu::SamplerBindingType::Comparison;
+                } else if (kind == TextureSampleKind::Float) {
+                    sampler.sampler.type = wgpu::SamplerBindingType::Filtering;
+                } else {
+                    sampler.sampler.type = wgpu::SamplerBindingType::NonFiltering;
+                }
+            }
+        }
+        wgpu::BindGroupLayoutDescriptor layout_desc{};
+        layout_desc.entryCount = entries.size();
+        layout_desc.entries = entries.data();
+        variant->layout = device.CreateBindGroupLayout(&layout_desc);
+        wgpu::PipelineLayoutDescriptor pipeline_layout_desc{};
+        pipeline_layout_desc.bindGroupLayoutCount = 1;
+        pipeline_layout_desc.bindGroupLayouts = &variant->layout;
+
+        wgpu::ComputePipelineDescriptor desc{};
+        desc.layout = device.CreatePipelineLayout(&pipeline_layout_desc);
+        desc.compute.module = MakeModule(code, key.unique_hash);
+        desc.compute.entryPoint = "main";
+        device.CreateComputePipelineAsync(
+            &desc, wgpu::CallbackMode::AllowSpontaneous,
+            [slot = variant->pipeline, hash = key.unique_hash](
+                wgpu::CreatePipelineAsyncStatus status, wgpu::ComputePipeline pipeline,
+                wgpu::StringView message) {
+                if (status == wgpu::CreatePipelineAsyncStatus::Success) {
+                    *slot = std::move(pipeline);
+                    return;
+                }
+                LOG_ERROR(Render, "WebGPU compute pipeline {:016x}: {}", hash,
+                          std::string_view{message.data, message.length});
+            });
+        return true;
+    } catch (const std::exception& exception) {
+        LOG_ERROR(Render, "WebGPU compute shader translation failed: {}", exception.what());
+        return false;
+    }
+}
+
+bool ComputePipeline::Configure() {
+    if (!valid) {
+        return false;
+    }
+    auto& texture_cache = cache.texture_cache;
+    auto& buffer_cache = cache.buffer_cache;
+    auto& gpu_memory = *cache.gpu_memory;
+    const auto& qmd{cache.kepler_compute->launch_description};
+
+    buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
+    buffer_cache.UnbindComputeStorageBuffers();
+    size_t ssbo_index{};
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
+                                              desc.is_written);
+        ++ssbo_index;
+    }
+
+    texture_cache.SynchronizeDescriptors(true);
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 32> views;
+    boost::container::small_vector<VideoCommon::SamplerId, 32> samplers;
+    const auto& cbufs{qmd.const_buffer_config};
+    const bool via_header_index{qmd.linked_tsc != 0};
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            const u32 index_offset{index << desc.size_shift};
+            const GPUVAddr addr{cbufs[desc.cbuf_index].Address() + desc.cbuf_offset + index_offset};
+            u32 raw{gpu_memory.Read<u32>(addr) << desc.shift_left};
+            if (desc.has_secondary) {
+                const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].Address() +
+                                             desc.secondary_cbuf_offset + index_offset};
+                raw |= gpu_memory.Read<u32>(separate_addr) << desc.secondary_shift_left;
+            }
+            const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
+            views.push_back({handle.first});
+            samplers.push_back(texture_cache.GetSamplerId(handle.second, true));
+        }
+    }
+    texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+
+    buffer_cache.UnbindComputeTextureBuffers();
+    buffer_cache.UpdateComputeBuffers();
+    auto& runtime = buffer_cache.runtime;
+    runtime.ClearDescriptors();
+    buffer_cache.BindHostComputeBuffers();
+    buffer_cache.any_buffer_uploaded = false;
+
+    std::vector<TextureSampleKind> texture_kinds;
+    texture_kinds.reserve(views.size());
+    {
+        size_t texture_index{};
+        for (const auto& desc : info.texture_descriptors) {
+            for (u32 i = 0; i < desc.count; ++i) {
+                const ImageView& view{texture_cache.GetImageView(views[texture_index++].id)};
+                TextureKind kind = view.Handle(desc.type) ? view.Kind() : TextureKind::Float;
+                if (desc.is_depth) {
+                    kind = TextureKind::Depth;
+                }
+                texture_kinds.push_back(ToSampleKind(kind));
+            }
+        }
+    }
+    auto [it, is_new] = variants.try_emplace(texture_kinds);
+    Variant& variant = it->second;
+    if (is_new && !Translate(texture_kinds, &variant)) {
+        variant.failed = true;
+    }
+    if (variant.failed || !*variant.pipeline) {
+        return false;
+    }
+    pipeline = *variant.pipeline;
+
+    auto& descriptors = runtime.Descriptors();
+    std::vector<wgpu::BindGroupEntry> entries;
+    written_buffers.clear();
+    read_buffers.clear();
+    size_t descriptor_index{};
+    u32 binding_index{};
+    for (const auto& desc : info.constant_buffer_descriptors) {
+        for (u32 i = 0; i < desc.count; ++i) {
+            if (descriptor_index >= descriptors.size()) {
+                return false;
+            }
+            BufferDescriptor& bound = descriptors[descriptor_index++];
+            const u32 size = UniformBindingSize(info, desc.index);
+            bound.data.resize(size, 0);
+            auto& entry = entries.emplace_back();
+            entry.binding = binding_index++;
+            entry.buffer = cache.uniform_ring.Buffer();
+            entry.offset = cache.uniform_ring.Push(bound.data);
+            entry.size = size;
+        }
+    }
+    const u32 num_ssbos{Shader::NumDescriptors(info.storage_buffers_descriptors)};
+    const u32 packed_first{
+        Shader::Backend::WGSL::PackedSsboFirst(num_ssbos, cache.max_storage_buffers)};
+    packed_copies.clear();
+    std::array<u32, Shader::Backend::WGSL::MAX_PACKED_SSBOS> pack_bases{};
+    u64 pack_size{};
+    u32 pack_binding{};
+    size_t storage_index{};
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        for (u32 i = 0; i < desc.count; ++i) {
+            if (descriptor_index >= descriptors.size()) {
+                return false;
+            }
+            const BufferDescriptor& bound = descriptors[descriptor_index++];
+            if (!bound.buffer || bound.offset + 4 > bound.buffer.GetSize() || bound.size < 4) {
+                return false;
+            }
+            if (storage_index >= packed_first) {
+                // Copies need 4-byte aligned ranges.
+                if (bound.offset % 4 != 0) {
+                    return false;
+                }
+                if (storage_index == packed_first) {
+                    pack_binding = binding_index;
+                }
+                const u64 size = std::min<u64>(Common::AlignUp(bound.size, 4),
+                                               bound.buffer.GetSize() - bound.offset) & ~3ULL;
+                pack_bases[storage_index - packed_first] = static_cast<u32>(pack_size / 4);
+                packed_copies.push_back({bound.buffer, bound.offset, size, pack_size,
+                                         desc.is_written});
+                pack_size = Common::AlignUp(pack_size + size, 256);
+                ++binding_index;
+                ++storage_index;
+                continue;
+            }
+            auto& entry = entries.emplace_back();
+            entry.binding = binding_index++;
+            entry.buffer = bound.buffer;
+            entry.offset = bound.offset;
+            entry.size = std::min<u64>(bound.size, bound.buffer.GetSize() - bound.offset);
+            const bool writable = storage_index < variant.storage_writable.size() &&
+                                  variant.storage_writable[storage_index];
+            ++storage_index;
+            (writable ? written_buffers : read_buffers).push_back(bound.buffer.Get());
+        }
+    }
+    if (!packed_copies.empty()) {
+        if (!cache.ssbo_pack || cache.ssbo_pack.GetSize() < pack_size) {
+            wgpu::BufferDescriptor pack_desc{};
+            pack_desc.size = std::bit_ceil(std::max<u64>(pack_size, 1ULL << 20));
+            pack_desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc |
+                              wgpu::BufferUsage::CopyDst;
+            cache.ssbo_pack = Thread::Get().device.CreateBuffer(&pack_desc);
+        }
+        pack_buffer = cache.ssbo_pack;
+        auto& pack_entry = entries.emplace_back();
+        pack_entry.binding = pack_binding;
+        pack_entry.buffer = pack_buffer;
+        pack_entry.size = pack_size;
+        auto& bases_entry = entries.emplace_back();
+        bases_entry.binding = pack_binding + 1;
+        bases_entry.buffer = cache.uniform_ring.Buffer();
+        bases_entry.offset = cache.uniform_ring.Push(std::span<const u8>(
+            reinterpret_cast<const u8*>(pack_bases.data()), sizeof(pack_bases)));
+        bases_entry.size = sizeof(pack_bases);
+    }
+    size_t texture_index{};
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 i = 0; i < desc.count; ++i) {
+            const size_t slot = texture_index++;
+            ImageView& view{texture_cache.GetImageView(views[slot].id)};
+            const TextureKind kind{FromSampleKind(texture_kinds[slot])};
+            wgpu::TextureView handle = view.Handle(desc.type);
+            if (!handle || view.Kind() != kind) {
+                handle = cache.DummyTexture(desc.type, kind);
+            }
+            auto& texture_entry = entries.emplace_back();
+            texture_entry.binding = binding_index++;
+            texture_entry.textureView = handle;
+            Sampler& sampler{texture_cache.GetSampler(samplers[slot])};
+            auto& sampler_entry = entries.emplace_back();
+            sampler_entry.binding = binding_index++;
+            sampler_entry.sampler = sampler.Handle(kind, desc.is_depth);
+        }
+    }
+    wgpu::BindGroupDescriptor bind_desc{};
+    bind_desc.layout = variant.layout;
+    bind_desc.entryCount = entries.size();
+    bind_desc.entries = entries.data();
+    bind_group = Thread::Get().device.CreateBindGroup(&bind_desc);
     return true;
 }
 

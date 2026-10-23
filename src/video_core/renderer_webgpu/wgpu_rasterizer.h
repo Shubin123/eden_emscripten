@@ -129,6 +129,8 @@ private:
     BufferCache buffer_cache;
     PipelineCache pipeline_cache;
     wgpu::BindGroup draw_info_group;
+    /// Copies of storage ranges a draw writes while reading the same host buffer.
+    wgpu::Buffer shadow_buffer;
     AccelerateDMA m_accelerate_dma;
 
     void BindDrawInfoGroup();
