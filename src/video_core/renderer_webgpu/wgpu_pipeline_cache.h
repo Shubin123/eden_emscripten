@@ -254,6 +254,7 @@ private:
     wgpu::Buffer ssbo_shadow;
     u32 max_storage_buffers{};
     u32 max_vertex_buffers{8};
+    u32 max_samplers{16};
 
     std::map<std::pair<Shader::TextureType, TextureKind>, wgpu::TextureView> dummy_views;
 

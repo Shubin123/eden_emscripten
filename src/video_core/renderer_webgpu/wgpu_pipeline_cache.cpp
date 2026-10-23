@@ -382,6 +382,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (Thread::Get().device.GetLimits(&limits) == wgpu::Status::Success) {
         max_storage_buffers = limits.maxStorageBuffersPerShaderStage;
         max_vertex_buffers = limits.maxVertexBuffers;
+        max_samplers = limits.maxSamplersPerShaderStage;
     }
 }
 
@@ -623,6 +624,7 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
                                          variant_key.texture_kinds.begin() + kind_index + stage_textures);
             kind_index += stage_textures;
             options.has_depth_target = variant_key.depth_format != wgpu::TextureFormat::Undefined;
+            options.max_samplers = cache.max_samplers;
             if (program.stage == Shader::Stage::VertexB && key.unique_hashes[5] != 0) {
                 options.output_interpolation = programs[5].info.interpolation;
             }
@@ -686,6 +688,9 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
                     variant.storage_writable.push_back(writable);
                 }
             }
+            u32 ordinal{};
+            const u32 shared_first{Shader::Backend::WGSL::SharedSamplerFirst(
+                Shader::NumDescriptors(info.texture_descriptors), cache.max_samplers)};
             for (const auto& desc : info.texture_descriptors) {
                 for (u32 i = 0; i < desc.count; ++i) {
                     const TextureSampleKind kind{variant_key.texture_kinds[kind_index++]};
@@ -704,12 +709,17 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
                     } else {
                         texture.texture.sampleType = wgpu::TextureSampleType::Float;
                     }
+                    const u32 element = ordinal++;
+                    if (element > shared_first) {
+                        ++binding_index;
+                        continue;
+                    }
                     auto& sampler = entries.emplace_back();
                     sampler.binding = binding_index++;
                     sampler.visibility = visibility;
                     if (desc.is_depth) {
                         sampler.sampler.type = wgpu::SamplerBindingType::Comparison;
-                    } else if (kind == TextureSampleKind::Float) {
+                    } else if (kind == TextureSampleKind::Float && element != shared_first) {
                         sampler.sampler.type = wgpu::SamplerBindingType::Filtering;
                     } else {
                         sampler.sampler.type = wgpu::SamplerBindingType::NonFiltering;
@@ -1154,6 +1164,9 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
                 (writable ? written_buffers : read_buffers).push_back(bound.buffer.Get());
             }
         }
+        u32 ordinal{};
+        const u32 shared_first{Shader::Backend::WGSL::SharedSamplerFirst(
+            Shader::NumDescriptors(info.texture_descriptors), cache.max_samplers)};
         for (const auto& desc : info.texture_descriptors) {
             for (u32 i = 0; i < desc.count; ++i) {
                 const size_t slot = texture_index++;
@@ -1182,10 +1195,18 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
                 auto& texture_entry = entries.emplace_back();
                 texture_entry.binding = binding_index++;
                 texture_entry.textureView = handle;
+                const u32 element = ordinal++;
+                if (element > shared_first) {
+                    ++binding_index;
+                    continue;
+                }
                 Sampler& sampler{texture_cache.GetSampler(samplers[slot])};
                 auto& sampler_entry = entries.emplace_back();
                 sampler_entry.binding = binding_index++;
-                sampler_entry.sampler = sampler.Handle(kind, desc.is_depth);
+                sampler_entry.sampler = sampler.Handle(
+                    element == shared_first && kind == TextureKind::Float ? TextureKind::UnfilterableFloat
+                                                                         : kind,
+                    desc.is_depth);
             }
         }
     }
@@ -1251,6 +1272,7 @@ bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_ki
         Options options;
         options.texture_kinds = texture_kinds;
         options.max_storage_buffers = cache.max_storage_buffers;
+        options.max_samplers = cache.max_samplers;
         Shader::Backend::Bindings binding;
         const std::string code{
             EmitWGSL(cache.profile, Shader::RuntimeInfo{}, program, binding, options)};
@@ -1301,6 +1323,9 @@ bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_ki
                 }
             }
         }
+        u32 ordinal{};
+        const u32 shared_first{Shader::Backend::WGSL::SharedSamplerFirst(
+            Shader::NumDescriptors(info.texture_descriptors), cache.max_samplers)};
         size_t kind_index{};
         for (const auto& desc : info.texture_descriptors) {
             for (u32 i = 0; i < desc.count; ++i) {
@@ -1320,12 +1345,17 @@ bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_ki
                 } else {
                     texture.texture.sampleType = wgpu::TextureSampleType::Float;
                 }
+                const u32 element = ordinal++;
+                if (element > shared_first) {
+                    ++binding_index;
+                    continue;
+                }
                 auto& sampler = entries.emplace_back();
                 sampler.binding = binding_index++;
                 sampler.visibility = visibility;
                 if (desc.is_depth) {
                     sampler.sampler.type = wgpu::SamplerBindingType::Comparison;
-                } else if (kind == TextureSampleKind::Float) {
+                } else if (kind == TextureSampleKind::Float && element != shared_first) {
                     sampler.sampler.type = wgpu::SamplerBindingType::Filtering;
                 } else {
                     sampler.sampler.type = wgpu::SamplerBindingType::NonFiltering;
@@ -1527,6 +1557,9 @@ bool ComputePipeline::Configure() {
             reinterpret_cast<const u8*>(pack_bases.data()), sizeof(pack_bases)));
         bases_entry.size = sizeof(pack_bases);
     }
+    u32 ordinal{};
+    const u32 shared_first{Shader::Backend::WGSL::SharedSamplerFirst(
+        Shader::NumDescriptors(info.texture_descriptors), cache.max_samplers)};
     size_t texture_index{};
     for (const auto& desc : info.texture_descriptors) {
         for (u32 i = 0; i < desc.count; ++i) {
@@ -1549,10 +1582,18 @@ bool ComputePipeline::Configure() {
             auto& texture_entry = entries.emplace_back();
             texture_entry.binding = binding_index++;
             texture_entry.textureView = handle;
+            const u32 element = ordinal++;
+            if (element > shared_first) {
+                ++binding_index;
+                continue;
+            }
             Sampler& sampler{texture_cache.GetSampler(samplers[slot])};
             auto& sampler_entry = entries.emplace_back();
             sampler_entry.binding = binding_index++;
-            sampler_entry.sampler = sampler.Handle(kind, desc.is_depth);
+            sampler_entry.sampler = sampler.Handle(
+                element == shared_first && kind == TextureKind::Float ? TextureKind::UnfilterableFloat
+                                                                     : kind,
+                desc.is_depth);
         }
     }
     // Written ranges of host buffers the dispatch also reads go through a scratch copy: one

@@ -37,6 +37,7 @@ namespace Shader::Backend::WGSL {
 struct TextureDefinition {
     u32 binding;   ///< Binding of element 0's texture; its sampler follows it
     u32 count;
+    u32 ordinal;   ///< Element 0's position among the stage's texture elements
     TextureType type;
     bool is_depth; ///< Depth compare reads
     TextureSampleKind kind;
@@ -151,6 +152,9 @@ public:
     std::string_view stage_name = "invalid";
 
     std::vector<TextureDefinition> textures;
+    /// Texture elements from this ordinal on use the sampler at `shared_sampler_binding`.
+    u32 shared_sampler_first{~0u};
+    u32 shared_sampler_binding{};
 
     u32 num_safety_loop_vars{};
 

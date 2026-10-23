@@ -33,7 +33,9 @@ TextureNames Texture(EmitContext& ctx, const IR::TextureInstInfo& info, const IR
         }
     }
     const u32 binding{def.binding + element * 2};
-    return {fmt::format("tex{}", binding), fmt::format("samp{}", binding), &def};
+    const u32 sampler{def.ordinal + element >= ctx.shared_sampler_first ? ctx.shared_sampler_binding
+                                                                        : binding};
+    return {fmt::format("tex{}", binding), fmt::format("samp{}", sampler), &def};
 }
 
 bool IsDepthTexture(const TextureNames& names) {

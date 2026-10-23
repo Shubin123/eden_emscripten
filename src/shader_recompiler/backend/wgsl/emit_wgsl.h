@@ -68,10 +68,23 @@ struct Options {
     /// Storage buffer bindings the stage may use; zero for no limit. Past it, the storage buffers
     /// from index max_storage_buffers - 1 on share one binding (see PackedSsboFirst).
     u32 max_storage_buffers = 0;
+    /// Samplers the stage may use; zero for no limit. Past it, the textures from element
+    /// max_samplers - 1 on share that element's sampler (see SharedSamplerFirst).
+    u32 max_samplers = 0;
     /// Vertex attributes read from pulled buffers, and those buffers.
     std::array<PulledAttribute, 32> pulled_attributes{};
     std::vector<PulledBuffer> pulled_buffers;
 };
+
+/// Index of the first texture element whose sampler is shared, or `count` when every texture
+/// element has its own. The shared sampler is the first shared element's (non-filtering, or
+/// comparison for depth compare reads); the other shared elements' sampler bindings are unused.
+[[nodiscard]] constexpr u32 SharedSamplerFirst(u32 count, u32 max_samplers) {
+    if (max_samplers < 2 || count <= max_samplers) {
+        return count;
+    }
+    return max_samplers - 1;
+}
 
 /// Maximum number of storage buffers that can share the packed binding.
 constexpr u32 MAX_PACKED_SSBOS = 16;

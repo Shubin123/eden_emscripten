@@ -320,15 +320,23 @@ std::string EmitContext::SsboElement(u32 index, std::string_view word) const {
 
 void EmitContext::DefineTextures(Bindings& bindings) {
     // Texture buffers and images are not bound yet; their reads return zero.
+    u32 num_elements{};
+    for (const auto& desc : info.texture_descriptors) {
+        num_elements += desc.count;
+    }
+    shared_sampler_first = SharedSamplerFirst(num_elements, options.max_samplers);
     size_t kind_index{};
     for (const auto& desc : info.texture_descriptors) {
         const TextureSampleKind kind{kind_index < options.texture_kinds.size()
                                          ? options.texture_kinds[kind_index]
                                          : TextureSampleKind::Float};
+        const u32 first_ordinal{static_cast<u32>(kind_index)};
         kind_index += desc.count;
-        textures.push_back({bindings.unified, desc.count, desc.type, desc.is_depth, kind});
+        textures.push_back({bindings.unified, desc.count, first_ordinal, desc.type, desc.is_depth,
+                            kind});
         for (u32 element = 0; element < desc.count; ++element) {
             const u32 binding{bindings.unified + element * 2};
+            const u32 ordinal{first_ordinal + element};
             const auto dimension{TextureDimension(desc.type)};
             std::string type;
             if (desc.is_depth || kind == TextureSampleKind::Depth) {
@@ -342,6 +350,12 @@ void EmitContext::DefineTextures(Bindings& bindings) {
             }
             const auto sampler{desc.is_depth ? "sampler_comparison" : "sampler"};
             header += fmt::format("@group(0) @binding({}) var tex{}: {};\n", binding, binding, type);
+            if (ordinal > shared_sampler_first) {
+                continue;
+            }
+            if (ordinal == shared_sampler_first) {
+                shared_sampler_binding = binding;
+            }
             header += fmt::format("@group(0) @binding({}) var samp{}: {};\n", binding + 1, binding,
                                   sampler);
         }
