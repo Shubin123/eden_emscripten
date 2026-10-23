@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+
 #include "input_common/input_engine.h"
 
 namespace InputCommon {
@@ -75,7 +78,22 @@ public:
     /// Restores all inputs into the neutral position
     void ResetControllers();
 
+    /// Rumble the game last requested for a player, for frontends that forward it to a device.
+    struct Rumble {
+        float low_amplitude{};
+        float high_amplitude{};
+    };
+    Rumble GetRumble(std::size_t player_index) const;
+
+    Common::Input::DriverResult SetVibration(
+        const PadIdentifier& identifier,
+        const Common::Input::VibrationStatus& vibration) override;
+    bool IsVibrationEnabled(const PadIdentifier& identifier) override;
+
 private:
+    /// Rumble per player and side (left and right Joy-Con halves send their own).
+    std::array<std::array<std::atomic<u64>, 2>, 10> rumble{};
+
     /// Returns the correct identifier corresponding to the player index
     PadIdentifier GetIdentifier(std::size_t player_index) const;
 };

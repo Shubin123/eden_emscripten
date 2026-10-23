@@ -189,6 +189,18 @@ void EmulatedController::LoadDevices() {
 
     output_params[LeftIndex] = left_joycon;
     output_params[RightIndex] = right_joycon;
+#ifdef __EMSCRIPTEN__
+    // The browser frontend drives every player through the virtual gamepad, which also takes the
+    // player's rumble and hands it to the browser's controller.
+    for (const std::size_t index : {LeftIndex, RightIndex}) {
+        if (!output_params[index].Has("engine")) {
+            output_params[index] = Common::ParamPackage{"engine:virtual_gamepad"};
+            output_params[index].Set("port",
+                                     static_cast<int>(Service::HID::NpadIdTypeToIndex(npad_id_type)));
+            output_params[index].Set("pad", static_cast<int>(index));
+        }
+    }
+#endif
     output_params[2] = camera_params[1];
     output_params[3] = nfc_params[0];
     output_params[4] = android_params;

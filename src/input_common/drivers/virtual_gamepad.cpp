@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "input_common/drivers/virtual_gamepad.h"
 
 namespace InputCommon {
@@ -89,6 +91,43 @@ PadIdentifier VirtualGamepad::GetIdentifier(std::size_t player_index) const {
         .port = player_index,
         .pad = 0,
     };
+}
+
+namespace {
+u64 PackRumble(const Common::Input::VibrationStatus& vibration) {
+    const auto unit = [](float value) { return u64(std::clamp(value, 0.0f, 1.0f) * 65535.0f); };
+    return unit(vibration.low_amplitude) | (unit(vibration.high_amplitude) << 16);
+}
+} // Anonymous namespace
+
+Common::Input::DriverResult VirtualGamepad::SetVibration(
+    const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) {
+    if (identifier.port >= rumble.size()) {
+        return Common::Input::DriverResult::InvalidParameters;
+    }
+    // The left half of a controller vibrates first; the right half overwrites the other slot.
+    auto& sides = rumble[identifier.port];
+    const std::size_t side = identifier.pad == 1 ? 1 : 0;
+    sides[side].store(PackRumble(vibration), std::memory_order_relaxed);
+    return Common::Input::DriverResult::Success;
+}
+
+bool VirtualGamepad::IsVibrationEnabled(const PadIdentifier&) {
+    return true;
+}
+
+VirtualGamepad::Rumble VirtualGamepad::GetRumble(std::size_t player_index) const {
+    if (player_index >= rumble.size()) {
+        return {};
+    }
+    Rumble result{};
+    for (const auto& side : rumble[player_index]) {
+        const u64 packed = side.load(std::memory_order_relaxed);
+        result.low_amplitude = std::max(result.low_amplitude, float(packed & 0xFFFF) / 65535.0f);
+        result.high_amplitude =
+            std::max(result.high_amplitude, float((packed >> 16) & 0xFFFF) / 65535.0f);
+    }
+    return result;
 }
 
 } // namespace InputCommon

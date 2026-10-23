@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -54,6 +55,7 @@
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
 #include "dynarmic/interface/exec_stats.h"
+#include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/camera.h"
 #include "input_common/drivers/virtual_gamepad.h"
@@ -95,15 +97,19 @@ enum class EmuState : int {
 };
 
 struct Request {
-    enum class Kind { Boot, Pause, Resume, Shutdown, Button, Stick } kind;
+    enum class Kind { Boot, Pause, Resume, Shutdown, Button, Stick, Connect } kind;
     std::string path;
-    /// Input: player index, VirtualGamepad button or stick id, and its state.
+    /// Input: player index, VirtualGamepad button or stick id, and its state (pressed is also
+    /// whether a Connect request connects or disconnects the player).
     int player = 0;
     int id = 0;
     bool pressed = false;
     float x = 0.0f;
     float y = 0.0f;
 };
+
+/// The virtual gamepad the page drives, for reading rumble from any thread.
+std::atomic<InputCommon::VirtualGamepad*> g_virtual_gamepad{nullptr};
 
 std::mutex g_request_mutex;
 std::condition_variable g_request_cv;
@@ -363,6 +369,26 @@ public:
                                                               x, y);
     }
 
+    /// Plugs a Pro Controller into players 2 to 8 (player 1 is always connected).
+    void SetPlayerConnected(int player, bool connected) {
+        if (player < 1 || player >= 8) {
+            return;
+        }
+        auto& settings = Settings::values.players.GetValue()[player];
+        settings.connected = connected;
+        settings.controller_type = Settings::ControllerType::ProController;
+        auto* const controller = system.HIDCore().GetEmulatedControllerByIndex(player);
+        if (!controller) {
+            return;
+        }
+        if (connected) {
+            controller->SetNpadStyleIndex(Core::HID::NpadStyleIndex::Fullkey);
+            controller->Connect(true);
+        } else {
+            controller->Disconnect();
+        }
+    }
+
     void UpdateCamera() {
         std::vector<u32> frame;
         size_t width = 0;
@@ -462,6 +488,23 @@ EMSCRIPTEN_KEEPALIVE void eden_set_button(int player, int button, int pressed) {
 /// Moves a stick (0 left, 1 right) to x, y in [-1, 1], with +y up.
 EMSCRIPTEN_KEEPALIVE void eden_set_stick(int player, int stick, float x, float y) {
     PushRequest({.kind = Request::Kind::Stick, .player = player, .id = stick, .x = x, .y = y});
+}
+
+/// Connects (1) or disconnects (0) a Pro Controller for player 2 to 8 (index 1 to 7).
+EMSCRIPTEN_KEEPALIVE void eden_set_player_connected(int player, int connected) {
+    PushRequest({.kind = Request::Kind::Connect, .player = player, .pressed = connected != 0});
+}
+
+/// Rumble the game wants on a player's controller: low and high frequency amplitudes in 0..1,
+/// packed as low * 65535 + high * 65535 * 65536.
+EMSCRIPTEN_KEEPALIVE double eden_get_rumble(int player) {
+    const auto* gamepad = g_virtual_gamepad.load(std::memory_order_acquire);
+    if (!gamepad || player < 0) {
+        return 0.0;
+    }
+    const auto rumble = gamepad->GetRumble(static_cast<size_t>(player));
+    return std::round(rumble.low_amplitude * 65535.0) +
+           std::round(rumble.high_amplitude * 65535.0) * 65536.0;
 }
 
 /// 0 idle, 1 booting, 2 running, 3 paused, 4 failed, 5 stopped.
@@ -697,7 +740,7 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_capabilities() {
                   R"({"apiVersion":%d,"cpuBackends":["jit","interpreter"],)"
                   R"("cpuBackend":"%s","renderer":"%s","audio":"%s",)"
                   R"("operations":["boot","pause","resume","shutdown","input","frameTimes",)"
-                  R"("gameInfo","buildInfo","runtimeStats"%s]})",
+                  R"("gameInfo","buildInfo","runtimeStats","players","rumble"%s]})",
                   ApiVersion, CpuJitEnabled() ? "jit" : "interpreter", renderer, audio,
 #ifdef EDEN_WEB_HEADLESS
                   ""
@@ -739,6 +782,7 @@ int main(int argc, char** argv) {
     emulator->system.ApplySettings();
     // Registers the input engines, including the virtual gamepad the page drives.
     emulator->input_subsystem.Initialize();
+    g_virtual_gamepad.store(emulator->input_subsystem.GetVirtualGamepad(), std::memory_order_release);
 
 #ifdef EDEN_WEB_HEADLESS
     if (argc < 2) {
@@ -806,6 +850,9 @@ int main(int argc, char** argv) {
                 break;
             case Request::Kind::Stick:
                 emulator->SetStick(request->player, request->id, request->x, request->y);
+                break;
+            case Request::Kind::Connect:
+                emulator->SetPlayerConnected(request->player, request->pressed);
                 break;
             }
         }
