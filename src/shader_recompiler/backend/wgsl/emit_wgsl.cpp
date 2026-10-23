@@ -167,8 +167,7 @@ void EmitCode(EmitContext& ctx, const IR::Program& program) {
             bool guarded{};
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 if (IsBarrier(inst)) {
-                    // Barriers inside control flow would not be uniform; they are dropped.
-                    if (depth > 0) {
+                    if (depth > 0 && !ctx.options.nested_barriers) {
                         continue;
                     }
                     if (guarded) {

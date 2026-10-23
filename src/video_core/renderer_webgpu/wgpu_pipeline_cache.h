@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -194,13 +195,18 @@ private:
         /// Set once asynchronous creation succeeded.
         std::shared_ptr<wgpu::ComputePipeline> pipeline =
             std::make_shared<wgpu::ComputePipeline>();
+        /// Set when asynchronous creation failed.
+        std::shared_ptr<std::atomic<bool>> creation_failed =
+            std::make_shared<std::atomic<bool>>(false);
         wgpu::BindGroupLayout layout;
         std::vector<bool> storage_writable; ///< Per storage binding, in layout order
+        bool nested_barriers{};
         bool failed{};
     };
 
     /// Translates the guest shader; builds `variant` unless only descriptor info is wanted.
-    bool Translate(const std::vector<TextureSampleKind>& texture_kinds, Variant* variant);
+    bool Translate(const std::vector<TextureSampleKind>& texture_kinds, Variant* variant,
+                   bool nested_barriers = false);
 
     PipelineCache& cache;
     ComputePipelineKey key;

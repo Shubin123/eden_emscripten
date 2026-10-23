@@ -372,9 +372,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_viewport_index_layer = false,
         .support_viewport_mask = false,
         .support_geometry_shader_passthrough = false,
-        // TODO: the WGSL backend can keep barriers after conditional returns uniform, but TotK's
-        // tiled lighting renders darker with them until its tile depth input is correct.
-        .support_conditional_barrier = false,
+        // The WGSL backend keeps barriers after returns inside control flow uniform itself, and
+        // keeps barriers inside uniform control flow where WGSL accepts them.
+        .support_conditional_barrier = true,
         .single_lane_geometry_subgroups = true,
     };
     host_info.ApplyDescriptorLimitPolicy();
@@ -1249,7 +1249,7 @@ ComputePipeline::ComputePipeline(PipelineCache& cache_, const ComputePipelineKey
 }
 
 bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_kinds,
-                                Variant* variant) {
+                                Variant* variant, bool nested_barriers) {
     auto& pools = cache.pools;
     pools.ReleaseContents();
     try {
@@ -1273,6 +1273,9 @@ bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_ki
         options.texture_kinds = texture_kinds;
         options.max_storage_buffers = cache.max_storage_buffers;
         options.max_samplers = cache.max_samplers;
+        options.nested_barriers = nested_barriers;
+        variant->nested_barriers = nested_barriers;
+        variant->storage_writable.clear();
         Shader::Backend::Bindings binding;
         const std::string code{
             EmitWGSL(cache.profile, Shader::RuntimeInfo{}, program, binding, options)};
@@ -1376,11 +1379,17 @@ bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_ki
         desc.compute.entryPoint = "main";
         device.CreateComputePipelineAsync(
             &desc, wgpu::CallbackMode::AllowSpontaneous,
-            [slot = variant->pipeline, hash = key.unique_hash](
-                wgpu::CreatePipelineAsyncStatus status, wgpu::ComputePipeline pipeline,
-                wgpu::StringView message) {
+            [slot = variant->pipeline, failed = variant->creation_failed, hash = key.unique_hash,
+             nested_barriers](wgpu::CreatePipelineAsyncStatus status,
+                              wgpu::ComputePipeline pipeline, wgpu::StringView message) {
                 if (status == wgpu::CreatePipelineAsyncStatus::Success) {
                     *slot = std::move(pipeline);
+                    return;
+                }
+                failed->store(true);
+                if (nested_barriers) {
+                    LOG_INFO(Render, "WebGPU compute pipeline {:016x}: barriers in control flow are "
+                             "not uniform, retrying without them", hash);
                     return;
                 }
                 LOG_ERROR(Render, "WebGPU compute pipeline {:016x}: {}", hash,
@@ -1457,8 +1466,16 @@ bool ComputePipeline::Configure() {
     }
     auto [it, is_new] = variants.try_emplace(texture_kinds);
     Variant& variant = it->second;
-    if (is_new && !Translate(texture_kinds, &variant)) {
+    if (is_new && !Translate(texture_kinds, &variant, true)) {
         variant.failed = true;
+    }
+    if (!variant.failed && variant.nested_barriers && variant.creation_failed->load()) {
+        // Rebuild with barriers inside control flow dropped, as the IR pass would.
+        variant.creation_failed = std::make_shared<std::atomic<bool>>(false);
+        variant.pipeline = std::make_shared<wgpu::ComputePipeline>();
+        if (!Translate(texture_kinds, &variant, false)) {
+            variant.failed = true;
+        }
     }
     if (variant.failed || !*variant.pipeline) {
         return false;

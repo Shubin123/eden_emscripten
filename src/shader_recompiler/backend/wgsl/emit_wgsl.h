@@ -71,6 +71,9 @@ struct Options {
     /// Samplers the stage may use; zero for no limit. Past it, the textures from element
     /// max_samplers - 1 on share that element's sampler (see SharedSamplerFirst).
     u32 max_samplers = 0;
+    /// Emit barriers inside control flow. WGSL accepts them only where control flow is provably
+    /// uniform, so callers retry without them when the shader fails to compile.
+    bool nested_barriers = false;
     /// Vertex attributes read from pulled buffers, and those buffers.
     std::array<PulledAttribute, 32> pulled_attributes{};
     std::vector<PulledBuffer> pulled_buffers;
