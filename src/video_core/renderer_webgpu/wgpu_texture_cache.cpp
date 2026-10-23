@@ -356,14 +356,16 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         desc.size.width = std::max(info.size.width, 1u);
         desc.size.height = std::max(info.size.height, 1u);
     }
-    desc.dimension = info.type == ImageType::e3D ? wgpu::TextureDimension::e3D
-                                                 : wgpu::TextureDimension::e2D;
+    // Single-slice 3D images are kept 2D: guests view them as 2D, which WebGPU forbids on 3D textures.
+    desc.dimension = info.type == ImageType::e3D && info.size.depth > 1
+                         ? wgpu::TextureDimension::e3D
+                         : wgpu::TextureDimension::e2D;
     desc.format = host_format;
     desc.mipLevelCount = static_cast<u32>(std::max(info.resources.levels, 1));
     desc.sampleCount = 1;
     desc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc |
                  wgpu::TextureUsage::CopyDst;
-    if (format_info.renderable && info.type != ImageType::e3D) {
+    if (format_info.renderable && desc.dimension != wgpu::TextureDimension::e3D) {
         desc.usage |= wgpu::TextureUsage::RenderAttachment;
     }
     const wgpu::TextureFormat twin = SrgbTwin(host_format);
@@ -493,7 +495,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
     const u32 num_layers = static_cast<u32>(std::max(info.range.extent.layers, 1));
     const u32 base_level = static_cast<u32>(info.range.base.level);
     const u32 num_levels = static_cast<u32>(std::max(info.range.extent.levels, 1));
-    const bool image_is_3d = image.info.type == ImageType::e3D;
+    const bool image_is_3d = image.Texture().GetDimension() == wgpu::TextureDimension::e3D;
 
     const auto make = [&](wgpu::TextureViewDimension dimension, u32 layers, u32 levels,
                           bool sampled) -> wgpu::TextureView {
@@ -522,6 +524,10 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
 
     const auto set = [&](Shader::TextureType type, u32 layers) {
         const auto dimension = ViewDimension(type);
+        // View dimensions must match the texture's: 3D textures only get 3D views and vice versa.
+        if (image_is_3d != (dimension == wgpu::TextureViewDimension::e3D)) {
+            return;
+        }
         if (dimension == wgpu::TextureViewDimension::Cube && layers < 6) {
             return;
         }
@@ -635,23 +641,51 @@ const wgpu::Sampler& Sampler::Handle(TextureKind kind, bool compare) {
 
 Framebuffer::Framebuffer(TextureCacheRuntime&, std::span<ImageView*, NUM_RT> color_buffers,
                          ImageView* depth_buffer, const VideoCommon::RenderTargets& key) {
+    // WebGPU needs every attachment of a pass to be the same size, where the guest renders to the
+    // common area. Prefer the size matching the render area, then the depth buffer's; attachments
+    // of another size are left out.
+    u32 width = 0;
+    u32 height = 0;
+    std::array<const ImageView*, NUM_RT + 1> candidates{};
+    candidates[0] = depth_buffer && depth_buffer->RenderTarget() ? depth_buffer : nullptr;
     for (size_t index = 0; index < NUM_RT; ++index) {
         const ImageView* const view = color_buffers[index];
-        if (!view || !view->RenderTarget()) {
+        candidates[index + 1] = view && view->RenderTarget() ? view : nullptr;
+    }
+    for (const ImageView* view : candidates) {
+        if (view && view->Width() == key.size.width && view->Height() == key.size.height) {
+            width = view->Width();
+            height = view->Height();
+            break;
+        }
+    }
+    const auto fits = [&](const ImageView* view) {
+        if (width == 0) {
+            width = view->Width();
+            height = view->Height();
+        }
+        return view->Width() == width && view->Height() == height;
+    };
+    if (width == 0 && candidates[0]) {
+        fits(candidates[0]);
+    }
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        const ImageView* const view = color_buffers[index];
+        if (!view || !view->RenderTarget() || !fits(view)) {
             continue;
         }
         targets.colors[index] = view->RenderTarget();
         targets.color_formats[index] = view->HostFormat();
         targets.textures[index] = view->BaseTexture().Get();
     }
-    if (depth_buffer && depth_buffer->RenderTarget()) {
+    if (depth_buffer && depth_buffer->RenderTarget() && fits(depth_buffer)) {
         targets.textures[8] = depth_buffer->BaseTexture().Get();
         targets.depth_stencil = depth_buffer->RenderTarget();
         targets.depth_format = depth_buffer->HostFormat();
         targets.has_stencil = depth_buffer->HasStencil();
     }
-    targets.width = key.size.width;
-    targets.height = key.size.height;
+    targets.width = width ? std::min(key.size.width, width) : key.size.width;
+    targets.height = height ? std::min(key.size.height, height) : key.size.height;
     static u32 logs = 0; // TEMP-DEBUG
     if (logs++ < 40 && color_buffers[0]) {
         LOG_INFO(Render, "TEMP-DEBUG framebuffer rt0 {:#x} fmt {} {}x{} depth {}", color_buffers[0]->gpu_addr,
