@@ -112,10 +112,13 @@ public:
     static bool CoversLevel(const Image& image, s32 level, const VideoCommon::Offset3D& offset,
                             const VideoCommon::Extent3D& extent);
     void BlitDepthCopy(Image& dst, Image& src, const VideoCommon::ImageCopy& copy);
+    void CopyImageThroughBuffer(Image& dst, Image& src,
+                                std::span<const VideoCommon::ImageCopy> copies);
 
     Scheduler& scheduler;
     Blitter& blitter;
     u64 memory_usage = 0;
+    wgpu::Buffer copy_buffer;
     wgpu::TextureView last_blit_target;
     u32 last_blit_width = 0;
     u32 last_blit_height = 0;

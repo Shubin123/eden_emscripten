@@ -464,16 +464,13 @@ void RasterizerWebGPU::DispatchCompute() {
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     if (!pipeline->Configure()) {
+        DebugCount("dispatch skip configure");
         return;
     }
     // One dispatch is one usage scope: a buffer cannot be both written and read in it.
     for (const WGPUBuffer buffer : pipeline->written_buffers) {
         if (std::ranges::find(pipeline->read_buffers, buffer) != pipeline->read_buffers.end()) {
-            static bool logged = false;
-            if (!logged) {
-                logged = true;
-                LOG_WARNING(Render, "WebGPU: skipping dispatches that read and write one buffer");
-            }
+            DebugCount("dispatch skip read+write");
             return;
         }
     }
@@ -483,11 +480,19 @@ void RasterizerWebGPU::DispatchCompute() {
         encoder.CopyBufferToBuffer(copy.buffer, copy.offset, pipeline->pack_buffer,
                                    copy.pack_offset, copy.size);
     }
+    for (const auto& copy : pipeline->shadow_copies) {
+        encoder.CopyBufferToBuffer(copy.buffer, copy.offset, pipeline->shadow_buffer,
+                                   copy.pack_offset, copy.size);
+    }
     wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
     pass.SetPipeline(pipeline->pipeline);
     pass.SetBindGroup(0, pipeline->bind_group);
     pass.DispatchWorkgroups(qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z);
     pass.End();
+    for (const auto& copy : pipeline->shadow_copies) {
+        encoder.CopyBufferToBuffer(pipeline->shadow_buffer, copy.pack_offset, copy.buffer,
+                                   copy.offset, copy.size);
+    }
     for (const auto& copy : pipeline->packed_copies) {
         if (copy.written) {
             encoder.CopyBufferToBuffer(pipeline->pack_buffer, copy.pack_offset, copy.buffer,

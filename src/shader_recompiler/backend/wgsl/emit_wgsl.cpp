@@ -117,18 +117,84 @@ void Precolor(const IR::Program& program) {
     }
 }
 
-void EmitCode(EmitContext& ctx, const IR::Program& program) {
+bool IsBarrier(const IR::Inst& inst) {
+    return inst.GetOpcode() == IR::Opcode::Barrier ||
+           inst.GetOpcode() == IR::Opcode::WorkgroupMemoryBarrier;
+}
+
+/// Whether a barrier outside control flow follows a return inside it. WGSL only allows barriers
+/// in uniform control flow, so such returns become a flag that skips the remaining code.
+bool NeedsReturnFlag(const IR::Program& program) {
+    s32 depth{};
+    bool conditional_return{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
+        case IR::AbstractSyntaxNode::Type::If:
+        case IR::AbstractSyntaxNode::Type::Loop:
+            ++depth;
+            break;
+        case IR::AbstractSyntaxNode::Type::EndIf:
+        case IR::AbstractSyntaxNode::Type::Repeat:
+            --depth;
+            break;
+        case IR::AbstractSyntaxNode::Type::Return:
+        case IR::AbstractSyntaxNode::Type::Unreachable:
+            conditional_return |= depth > 0;
+            break;
         case IR::AbstractSyntaxNode::Type::Block:
-            for (IR::Inst& inst : node.data.block->Instructions()) {
-                EmitInst(ctx, &inst);
+            if (depth == 0 && conditional_return &&
+                std::ranges::any_of(node.data.block->Instructions(), IsBarrier)) {
+                return true;
             }
             break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+void EmitCode(EmitContext& ctx, const IR::Program& program) {
+    const bool return_flag{NeedsReturnFlag(program)};
+    if (return_flag) {
+        ctx.Add("var v_ret = false;");
+    }
+    s32 depth{};
+    bool may_have_returned{};
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        switch (node.type) {
+        case IR::AbstractSyntaxNode::Type::Block: {
+            bool guarded{};
+            for (IR::Inst& inst : node.data.block->Instructions()) {
+                if (IsBarrier(inst)) {
+                    // Barriers inside control flow would not be uniform; they are dropped.
+                    if (depth > 0) {
+                        continue;
+                    }
+                    if (guarded) {
+                        ctx.Add("}}");
+                        guarded = false;
+                    }
+                    EmitInst(ctx, &inst);
+                    continue;
+                }
+                if (return_flag && may_have_returned && !guarded) {
+                    ctx.Add("if (!v_ret) {{");
+                    guarded = true;
+                }
+                EmitInst(ctx, &inst);
+            }
+            if (guarded) {
+                ctx.Add("}}");
+            }
+            break;
+        }
         case IR::AbstractSyntaxNode::Type::If:
+            ++depth;
             ctx.Add("if ({}) {{", ctx.var_alloc.Consume(node.data.if_node.cond));
             break;
         case IR::AbstractSyntaxNode::Type::EndIf:
+            --depth;
             ctx.Add("}}");
             break;
         case IR::AbstractSyntaxNode::Type::Break:
@@ -142,12 +208,22 @@ void EmitCode(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Return:
         case IR::AbstractSyntaxNode::Type::Unreachable:
-            ctx.Add("return;");
+            if (return_flag && depth > 0) {
+                ctx.Add("v_ret = true;");
+                may_have_returned = true;
+            } else {
+                ctx.Add("return;");
+            }
             break;
         case IR::AbstractSyntaxNode::Type::Loop:
+            ++depth;
             ctx.Add("loop {{");
+            if (return_flag && may_have_returned) {
+                ctx.Add("if (v_ret) {{ break; }}");
+            }
             break;
         case IR::AbstractSyntaxNode::Type::Repeat:
+            --depth;
             if (Settings::values.disable_shader_loop_safety_checks) {
                 ctx.Add("if (!({})) {{ break; }}\n}}", ctx.var_alloc.Consume(node.data.repeat.cond));
             } else {

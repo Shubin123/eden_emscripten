@@ -184,6 +184,10 @@ public:
     };
     std::vector<PackedCopy> packed_copies;
     wgpu::Buffer pack_buffer;
+    /// Written storage ranges of host buffers the dispatch also reads, swapped for copies in
+    /// `shadow_buffer` (pack_offset is the offset there).
+    std::vector<PackedCopy> shadow_copies;
+    wgpu::Buffer shadow_buffer;
 
 private:
     struct Variant {
@@ -204,6 +208,7 @@ private:
 
     Shader::Info info;
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
+    std::vector<size_t> written_entries;
     bool valid{};
 
     std::map<std::vector<TextureSampleKind>, Variant> variants;
@@ -246,6 +251,7 @@ private:
     std::map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_cache;
     /// Scratch storage for packed storage buffers, grown on demand.
     wgpu::Buffer ssbo_pack;
+    wgpu::Buffer ssbo_shadow;
     u32 max_storage_buffers{};
     u32 max_vertex_buffers{8};
 

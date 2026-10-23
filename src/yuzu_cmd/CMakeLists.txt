@@ -114,12 +114,19 @@ if (EMSCRIPTEN)
         list(APPEND EDEN_WEB_DEFINITIONS EDEN_WEB_ALLOC_DIAGNOSTICS)
     endif()
 
+    option(EDEN_WEB_PROFILING_FUNCS "Keep function names in the browser build for readable stack traces" OFF)
+    set(EDEN_WEB_BROWSER_LINK_OPTIONS "")
+    if (EDEN_WEB_PROFILING_FUNCS)
+        list(APPEND EDEN_WEB_BROWSER_LINK_OPTIONS --profiling-funcs)
+    endif()
+
     add_executable(eden_web emscripten_main.cpp emscripten_rom.cpp)
     target_compile_definitions(eden_web PRIVATE ${EDEN_WEB_DEFINITIONS})
     target_link_libraries(eden_web PRIVATE common core input_common frontend_common video_core dynarmic::dynarmic Threads::Threads)
     set_target_properties(eden_web PROPERTIES OUTPUT_NAME "eden")
     target_link_options(eden_web PRIVATE
         ${EDEN_WEB_LINK_OPTIONS}
+        ${EDEN_WEB_BROWSER_LINK_OPTIONS}
         -sENVIRONMENT=web,worker
         -sMODULARIZE=1
         -sEXPORT_NAME=createEdenModule

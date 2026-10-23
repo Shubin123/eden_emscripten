@@ -372,6 +372,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_viewport_index_layer = false,
         .support_viewport_mask = false,
         .support_geometry_shader_passthrough = false,
+        // TODO: the WGSL backend can keep barriers after conditional returns uniform, but TotK's
+        // tiled lighting renders darker with them until its tile depth input is correct.
         .support_conditional_barrier = false,
         .single_lane_geometry_subgroups = true,
     };
@@ -1458,6 +1460,8 @@ bool ComputePipeline::Configure() {
     const u32 packed_first{
         Shader::Backend::WGSL::PackedSsboFirst(num_ssbos, cache.max_storage_buffers)};
     packed_copies.clear();
+    shadow_copies.clear();
+    written_entries.clear();
     std::array<u32, Shader::Backend::WGSL::MAX_PACKED_SSBOS> pack_bases{};
     u64 pack_size{};
     u32 pack_binding{};
@@ -1497,6 +1501,9 @@ bool ComputePipeline::Configure() {
             const bool writable = storage_index < variant.storage_writable.size() &&
                                   variant.storage_writable[storage_index];
             ++storage_index;
+            if (writable) {
+                written_entries.push_back(entries.size() - 1);
+            }
             (writable ? written_buffers : read_buffers).push_back(bound.buffer.Get());
         }
     }
@@ -1528,7 +1535,16 @@ bool ComputePipeline::Configure() {
             const TextureKind kind{FromSampleKind(texture_kinds[slot])};
             wgpu::TextureView handle = view.Handle(desc.type);
             if (!handle || view.Kind() != kind) {
+                DebugCount(fmt::format("compute {:016x} dummy texture: view {} fmt {} size {}x{} "
+                                       "viewtype {} desctype {} kind {}/{}", key.unique_hash,
+                                       views[slot].id.index != 0 ? "real" : "null", view.format,
+                                       view.size.width, view.size.height,
+                                       static_cast<u32>(view.type), static_cast<u32>(desc.type),
+                                       static_cast<u32>(view.Kind()), static_cast<u32>(kind)));
                 handle = cache.DummyTexture(desc.type, kind);
+            } else {
+                DebugCount(fmt::format("compute {:016x} texture: fmt {} size {}x{}", key.unique_hash,
+                                       view.format, view.size.width, view.size.height));
             }
             auto& texture_entry = entries.emplace_back();
             texture_entry.binding = binding_index++;
@@ -1537,6 +1553,43 @@ bool ComputePipeline::Configure() {
             auto& sampler_entry = entries.emplace_back();
             sampler_entry.binding = binding_index++;
             sampler_entry.sampler = sampler.Handle(kind, desc.is_depth);
+        }
+    }
+    // Written ranges of host buffers the dispatch also reads go through a scratch copy: one
+    // dispatch cannot use a buffer both ways.
+    u64 shadow_size{};
+    for (const size_t entry_index : written_entries) {
+        auto& entry = entries[entry_index];
+        if (std::ranges::find(read_buffers, entry.buffer.Get()) == read_buffers.end()) {
+            continue;
+        }
+        const u64 size = Common::AlignUp(entry.size, 4);
+        if (entry.offset % 4 != 0 || entry.offset + size > entry.buffer.GetSize()) {
+            return false;
+        }
+        shadow_copies.push_back({entry.buffer, entry.offset, size, shadow_size, true});
+        shadow_size = Common::AlignUp(shadow_size + size, 256);
+    }
+    if (!shadow_copies.empty()) {
+        if (!cache.ssbo_shadow || cache.ssbo_shadow.GetSize() < shadow_size) {
+            wgpu::BufferDescriptor shadow_desc{};
+            shadow_desc.size = std::bit_ceil(std::max<u64>(shadow_size, 1ULL << 20));
+            shadow_desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc |
+                                wgpu::BufferUsage::CopyDst;
+            cache.ssbo_shadow = Thread::Get().device.CreateBuffer(&shadow_desc);
+        }
+        shadow_buffer = cache.ssbo_shadow;
+        size_t copy_index{};
+        for (const size_t entry_index : written_entries) {
+            auto& entry = entries[entry_index];
+            if (copy_index < shadow_copies.size() &&
+                shadow_copies[copy_index].buffer.Get() == entry.buffer.Get() &&
+                shadow_copies[copy_index].offset == entry.offset) {
+                std::ranges::replace(written_buffers, entry.buffer.Get(), shadow_buffer.Get());
+                entry.buffer = shadow_buffer;
+                entry.offset = shadow_copies[copy_index].pack_offset;
+                ++copy_index;
+            }
         }
     }
     wgpu::BindGroupDescriptor bind_desc{};

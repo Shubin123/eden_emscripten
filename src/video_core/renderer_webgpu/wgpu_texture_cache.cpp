@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 
 #include "common/alignment.h"
@@ -220,9 +221,7 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     }
     const bool compatible = dst.Format() == src.Format() || SrgbTwin(dst.Format()) == src.Format();
     if (!compatible) {
-        static bool logged = false;
-        LogOnce(logged, "copies between different formats");
-        DebugCount(fmt::format("copy {} -> {}", src.info.format, dst.info.format));
+        CopyImageThroughBuffer(dst, src, copies);
         return;
     }
     const FormatInfo& format_info = GetFormatInfo(dst.info.format);
@@ -255,6 +254,66 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                                   : static_cast<u32>(copy.src_subresource.num_layers);
         const wgpu::Extent3D extent{copy.extent.width, copy.extent.height, std::max(layers, 1u)};
         encoder.CopyTextureToTexture(&src_info, &dst_info, &extent);
+    }
+}
+
+void TextureCacheRuntime::CopyImageThroughBuffer(Image& dst, Image& src,
+                                                 std::span<const VideoCommon::ImageCopy> copies) {
+    // Formats with the same texel size are copied bit for bit through a buffer, as the guest
+    // reinterprets them; WebGPU only copies textures of the same format directly.
+    const FormatInfo& src_info = GetFormatInfo(src.info.format);
+    const FormatInfo& dst_info = GetFormatInfo(dst.info.format);
+    const u32 bytes = HostBytesPerBlock(src.info.format);
+    const bool plain = [](const Image& image) {
+        return !True(image.flags & VideoCommon::ImageFlagBits::Converted) &&
+               DefaultBlockWidth(image.info.format) == 1 && DefaultBlockHeight(image.info.format) == 1;
+    }(src) && [](const Image& image) {
+        return !True(image.flags & VideoCommon::ImageFlagBits::Converted) &&
+               DefaultBlockWidth(image.info.format) == 1 && DefaultBlockHeight(image.info.format) == 1;
+    }(dst);
+    if (!plain || bytes == 0 || bytes != HostBytesPerBlock(dst.info.format) || src_info.depth ||
+        src_info.stencil || dst_info.depth || dst_info.stencil ||
+        src_info.conversion != Conversion::None || dst_info.conversion != Conversion::None) {
+        DebugCount(fmt::format("copy {} -> {} unsupported", src.info.format, dst.info.format));
+        return;
+    }
+    auto& encoder = scheduler.Encoder();
+    for (const VideoCommon::ImageCopy& copy : copies) {
+        const u32 layers = std::max(src.info.type == ImageType::e3D
+                                        ? copy.extent.depth
+                                        : static_cast<u32>(copy.src_subresource.num_layers),
+                                    1u);
+        const u32 row_bytes = Common::AlignUp(copy.extent.width * bytes, 256u);
+        const u64 size = static_cast<u64>(row_bytes) * copy.extent.height * layers;
+        if (!copy_buffer || copy_buffer.GetSize() < size) {
+            wgpu::BufferDescriptor desc{};
+            desc.size = std::bit_ceil(std::max<u64>(size, 1ULL << 20));
+            desc.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst;
+            copy_buffer = Device().CreateBuffer(&desc);
+        }
+        wgpu::TexelCopyTextureInfo src_texture{};
+        src_texture.texture = src.Texture();
+        src_texture.mipLevel = static_cast<u32>(copy.src_subresource.base_level);
+        src_texture.origin = {static_cast<u32>(copy.src_offset.x),
+                              static_cast<u32>(copy.src_offset.y),
+                              src.info.type == ImageType::e3D
+                                  ? static_cast<u32>(copy.src_offset.z)
+                                  : static_cast<u32>(copy.src_subresource.base_layer)};
+        wgpu::TexelCopyTextureInfo dst_texture{};
+        dst_texture.texture = dst.Texture();
+        dst_texture.mipLevel = static_cast<u32>(copy.dst_subresource.base_level);
+        dst_texture.origin = {static_cast<u32>(copy.dst_offset.x),
+                              static_cast<u32>(copy.dst_offset.y),
+                              dst.info.type == ImageType::e3D
+                                  ? static_cast<u32>(copy.dst_offset.z)
+                                  : static_cast<u32>(copy.dst_subresource.base_layer)};
+        wgpu::TexelCopyBufferInfo buffer{};
+        buffer.buffer = copy_buffer;
+        buffer.layout.bytesPerRow = row_bytes;
+        buffer.layout.rowsPerImage = copy.extent.height;
+        const wgpu::Extent3D extent{copy.extent.width, copy.extent.height, layers};
+        encoder.CopyTextureToBuffer(&src_texture, &buffer, &extent);
+        encoder.CopyBufferToTexture(&buffer, &dst_texture, &extent);
     }
 }
 
