@@ -203,7 +203,10 @@ void EmitContext::DefineConstantBufferIndirect() {
 void EmitContext::DefineStorageBuffers(Bindings& bindings) {
     u32 index{};
     for (const auto& desc : info.storage_buffers_descriptors) {
-        const auto access{storage_read_only ? "read" : "read_write"};
+        // Buffers the shader never writes stay read-only, so the same host buffer can be read
+        // elsewhere in the render pass.
+        const bool writable{!storage_read_only && (desc.is_written || uses_storage_atomics)};
+        const auto access{writable ? "read_write" : "read"};
         const auto element{uses_storage_atomics ? "atomic<u32>" : "u32"};
         header += fmt::format("@group(0) @binding({}) var<storage, {}> {}_ssbo{}: array<{}>;\n",
                               bindings.unified, access, stage_name, index, element);

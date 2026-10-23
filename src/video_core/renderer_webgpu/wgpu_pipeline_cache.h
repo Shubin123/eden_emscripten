@@ -92,6 +92,9 @@ public:
     wgpu::BindGroup bind_group;
     u32 draw_info_offset{};
     const RenderTargets* targets{};
+    /// Host buffers the last Configure bound as writable and as read-only storage.
+    std::vector<WGPUBuffer> written_buffers;
+    std::vector<WGPUBuffer> read_buffers;
 
     struct VertexBufferUse {
         u32 stride{};
@@ -110,6 +113,7 @@ private:
         /// Set once asynchronous creation succeeded.
         std::shared_ptr<wgpu::RenderPipeline> pipeline = std::make_shared<wgpu::RenderPipeline>();
         wgpu::BindGroupLayout layout;
+        std::vector<bool> storage_writable; ///< Per storage binding, in layout order
         bool failed{};
     };
 

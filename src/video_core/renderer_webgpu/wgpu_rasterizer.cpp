@@ -17,6 +17,8 @@
 #include "video_core/texture_cache/types.h"
 #include <algorithm>
 #include <array>
+#include <span>
+#include <boost/container/small_vector.hpp>
 #include <cmath>
 
 namespace WebGPU {
@@ -171,7 +173,37 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         sx = x0, sy = y0, sw = x1 - x0, sh = y1 - y0;
     }
 
+    // A buffer written as storage cannot be used any other way within one render pass: split the
+    // pass when an earlier draw used it, and skip draws that need both uses at once.
+    boost::container::small_vector<WGPUBuffer, 16> read_buffers(pipeline->read_buffers.begin(),
+                                                                pipeline->read_buffers.end());
+    for (u32 index = 0; index < Maxwell::NumVertexArrays; ++index) {
+        if (pipeline->vertex_buffer_uses[index].used && index < runtime.num_vertex_bindings &&
+            runtime.vertex_bindings[index].buffer) {
+            read_buffers.push_back(runtime.vertex_bindings[index].buffer.Get());
+        }
+    }
+    if (indexed && runtime.index.buffer) {
+        read_buffers.push_back(runtime.index.buffer.Get());
+    }
+    const std::span<const WGPUBuffer> written_buffers{pipeline->written_buffers};
+    if (!written_buffers.empty()) {
+        for (const WGPUBuffer buffer : written_buffers) {
+            if (std::ranges::find(read_buffers, buffer) != read_buffers.end()) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    LOG_WARNING(Render, "WebGPU: skipping draws that read and write one buffer");
+                }
+                return;
+            }
+        }
+    }
+    if (scheduler.InRenderPass() && scheduler.PassConflicts(written_buffers, read_buffers)) {
+        scheduler.EndRenderPass();
+    }
     wgpu::RenderPassEncoder& pass = scheduler.RenderPass(targets);
+    scheduler.TrackPassUsage(written_buffers, read_buffers);
     if (targets.colors[0] && targets.width >= 640) {
         debug_last_target = targets.colors[0];
         debug_last_width = targets.width;

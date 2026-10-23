@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include "video_core/renderer_webgpu/wgpu_scheduler.h"
 #include "video_core/renderer_webgpu/wgpu_thread.h"
 
@@ -77,6 +79,41 @@ void Scheduler::EndRenderPass() {
     if (pass) {
         pass.End();
         pass = nullptr;
+    }
+    pass_written.clear();
+    pass_read.clear();
+}
+
+bool Scheduler::PassConflicts(std::span<const WGPUBuffer> written,
+                              std::span<const WGPUBuffer> read) const {
+    const auto contains = [](std::span<const WGPUBuffer> set, WGPUBuffer buffer) {
+        return std::ranges::find(set, buffer) != set.end();
+    };
+    for (const WGPUBuffer buffer : written) {
+        if (contains(pass_read, buffer)) {
+            return true;
+        }
+    }
+    for (const WGPUBuffer buffer : read) {
+        if (contains(pass_written, buffer)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Scheduler::TrackPassUsage(std::span<const WGPUBuffer> written,
+                               std::span<const WGPUBuffer> read) {
+    const auto add = [](std::vector<WGPUBuffer>& set, WGPUBuffer buffer) {
+        if (std::ranges::find(set, buffer) == set.end()) {
+            set.push_back(buffer);
+        }
+    };
+    for (const WGPUBuffer buffer : written) {
+        add(pass_written, buffer);
+    }
+    for (const WGPUBuffer buffer : read) {
+        add(pass_read, buffer);
     }
 }
 

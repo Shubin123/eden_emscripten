@@ -538,12 +538,16 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
                 }
             }
             for (const auto& desc : info.storage_buffers_descriptors) {
+                const bool writable =
+                    codes[stage].find(fmt::format("@binding({}) var<storage, read_write>",
+                                                  binding_index)) != std::string::npos;
                 for (u32 i = 0; i < desc.count; ++i) {
                     auto& entry = entries.emplace_back();
                     entry.binding = binding_index++;
                     entry.visibility = visibility;
-                    entry.buffer.type = stage == 4 ? wgpu::BufferBindingType::Storage
-                                                   : wgpu::BufferBindingType::ReadOnlyStorage;
+                    entry.buffer.type = writable ? wgpu::BufferBindingType::Storage
+                                                 : wgpu::BufferBindingType::ReadOnlyStorage;
+                    variant.storage_writable.push_back(writable);
                 }
             }
             for (const auto& desc : info.texture_descriptors) {
@@ -939,6 +943,9 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
     // Resource bindings, in layout order.
     auto& descriptors = runtime.Descriptors();
     std::vector<wgpu::BindGroupEntry> entries;
+    written_buffers.clear();
+    read_buffers.clear();
+    size_t storage_index{};
     size_t descriptor_index{};
     size_t texture_index{};
     u32 binding_index{};
@@ -981,6 +988,10 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
                 entry.buffer = bound.buffer;
                 entry.offset = bound.offset;
                 entry.size = std::min<u64>(bound.size, bound.buffer.GetSize() - bound.offset);
+                const bool writable = storage_index < variant->storage_writable.size() &&
+                                      variant->storage_writable[storage_index];
+                ++storage_index;
+                (writable ? written_buffers : read_buffers).push_back(bound.buffer.Get());
             }
         }
         for (const auto& desc : info.texture_descriptors) {

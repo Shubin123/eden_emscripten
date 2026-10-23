@@ -5,6 +5,8 @@
 
 #include <array>
 #include <optional>
+#include <span>
+#include <vector>
 
 #include <webgpu/webgpu_cpp.h>
 
@@ -74,6 +76,11 @@ public:
 
     void EndRenderPass();
 
+    /// WebGPU rejects a render pass that writes a buffer as storage and uses it any other way.
+    /// Returns whether a draw with these buffer usages would break that in the open pass.
+    bool PassConflicts(std::span<const WGPUBuffer> written, std::span<const WGPUBuffer> read) const;
+    void TrackPassUsage(std::span<const WGPUBuffer> written, std::span<const WGPUBuffer> read);
+
     /// Submits recorded commands.
     void Flush();
 
@@ -93,6 +100,8 @@ private:
 
     wgpu::CommandEncoder encoder;
     wgpu::RenderPassEncoder pass;
+    std::vector<WGPUBuffer> pass_written;
+    std::vector<WGPUBuffer> pass_read;
     RenderTargets current_targets;
     bool has_commands = false;
     u64 pass_serial = 0;
