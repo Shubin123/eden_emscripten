@@ -263,14 +263,15 @@ void TextureCacheRuntime::CopyImageThroughBuffer(Image& dst, Image& src,
     // reinterprets them; WebGPU only copies textures of the same format directly.
     const FormatInfo& src_info = GetFormatInfo(src.info.format);
     const FormatInfo& dst_info = GetFormatInfo(dst.info.format);
+    // An uncompressed source texel may also become one block of a compressed destination (the
+    // guest compressing on the GPU); copy regions are in source texels.
     const u32 bytes = HostBytesPerBlock(src.info.format);
-    const bool plain = [](const Image& image) {
-        return !True(image.flags & VideoCommon::ImageFlagBits::Converted) &&
-               DefaultBlockWidth(image.info.format) == 1 && DefaultBlockHeight(image.info.format) == 1;
-    }(src) && [](const Image& image) {
-        return !True(image.flags & VideoCommon::ImageFlagBits::Converted) &&
-               DefaultBlockWidth(image.info.format) == 1 && DefaultBlockHeight(image.info.format) == 1;
-    }(dst);
+    const u32 dst_block_w = DefaultBlockWidth(dst.info.format);
+    const u32 dst_block_h = DefaultBlockHeight(dst.info.format);
+    const bool plain = !True(src.flags & VideoCommon::ImageFlagBits::Converted) &&
+                       !True(dst.flags & VideoCommon::ImageFlagBits::Converted) &&
+                       DefaultBlockWidth(src.info.format) == 1 &&
+                       DefaultBlockHeight(src.info.format) == 1;
     if (!plain || bytes == 0 || bytes != HostBytesPerBlock(dst.info.format) || src_info.depth ||
         src_info.stencil || dst_info.depth || dst_info.stencil ||
         src_info.conversion != Conversion::None || dst_info.conversion != Conversion::None) {
@@ -314,7 +315,16 @@ void TextureCacheRuntime::CopyImageThroughBuffer(Image& dst, Image& src,
         buffer.layout.rowsPerImage = copy.extent.height;
         const wgpu::Extent3D extent{copy.extent.width, copy.extent.height, layers};
         encoder.CopyTextureToBuffer(&src_texture, &buffer, &extent);
-        encoder.CopyBufferToTexture(&buffer, &dst_texture, &extent);
+        // Compressed copies must end at block edges or at the edge of the mip level.
+        const u32 dst_level_w = Common::AlignUp(
+            std::max(dst.info.size.width >> dst_texture.mipLevel, 1u), dst_block_w);
+        const u32 dst_level_h = Common::AlignUp(
+            std::max(dst.info.size.height >> dst_texture.mipLevel, 1u), dst_block_h);
+        const wgpu::Extent3D dst_extent{
+            std::min(copy.extent.width * dst_block_w, dst_level_w - dst_texture.origin.x),
+            std::min(copy.extent.height * dst_block_h, dst_level_h - dst_texture.origin.y),
+            layers};
+        encoder.CopyBufferToTexture(&buffer, &dst_texture, &dst_extent);
     }
 }
 
