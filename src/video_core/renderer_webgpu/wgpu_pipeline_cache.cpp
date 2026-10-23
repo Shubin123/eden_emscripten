@@ -632,7 +632,12 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
             vertex_buffer_uses[index] = {state.vertex_strides[index] & ~3u,
                                          state.binding_divisors[index] != 0,
                                          !attributes[index].empty()};
-            layout.arrayStride = attributes[index].empty() ? 0 : state.vertex_strides[index] & ~3u;
+            if (attributes[index].empty()) {
+                // Undefined with no attributes leaves the slot unused, so no buffer is required.
+                layout.stepMode = wgpu::VertexStepMode::Undefined;
+                continue;
+            }
+            layout.arrayStride = state.vertex_strides[index] & ~3u;
             layout.stepMode = state.binding_divisors[index] != 0 ? wgpu::VertexStepMode::Instance
                                                                  : wgpu::VertexStepMode::Vertex;
             layout.attributeCount = attributes[index].size();

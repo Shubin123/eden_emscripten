@@ -100,6 +100,9 @@ public:
     }
 
     void Close(KPhysicalAddress address, size_t num_pages) {
+        // Pages coming back to the heap may hold data.
+        MarkDirty(address, num_pages);
+
         // Repeatedly close references until we've done so for all pages.
         while (num_pages) {
             auto& manager = this->GetManager(address);
@@ -333,6 +336,8 @@ private:
     };
 
 private:
+    void MarkDirty(KPhysicalAddress address, size_t num_pages);
+
     Impl& GetManager(KPhysicalAddress address) {
         return m_managers[m_memory_layout.GetPhysicalLinearRegion(address).GetAttributes()];
     }

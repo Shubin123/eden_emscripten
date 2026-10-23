@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include "common/common_funcs.h"
@@ -54,6 +55,9 @@ public:
 
     void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value);
 
+    /// Records that a backing range may hold data, so clearing it to zero cannot be skipped.
+    void MarkBackingDirty(size_t physical_offset, size_t length);
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }
@@ -86,6 +90,11 @@ private:
     size_t virtual_base_offset{};
     // Windows requires it for kernels whom lack proper support for some functions!
     bool fallback_buffer{false};
+#ifdef __EMSCRIPTEN__
+    // One bit per page of backing memory that may be non-zero. Fresh Wasm memory is zero and only
+    // committed by the browser once written, so zero-filling a clean page is skipped.
+    std::unique_ptr<std::atomic<u64>[]> dirty_pages;
+#endif
 };
 
 } // namespace Common

@@ -56,9 +56,14 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/div_ceil.h"
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/heap.h>
+#endif
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -740,9 +745,21 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     } else {
         LOG_WARNING(HW_Memory, "Platform can support fastmem, but can't create it");
         fallback_buffer = true;
+#ifdef __EMSCRIPTEN__
+        // Memory below the current heap size may have been used and returned by malloc.
+        const uintptr_t heap_end = emscripten_get_heap_size();
+#endif
         backing_base = static_cast<u8*>(impl->Allocate(backing_size));
         virtual_base = nullptr;
         impl.reset();
+#ifdef __EMSCRIPTEN__
+        const size_t num_words = DivCeil(DivCeil(backing_size, PageAlignment), size_t{64});
+        dirty_pages = std::make_unique<std::atomic<u64>[]>(num_words);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(backing_base);
+        if (backing_base && heap_end > base) {
+            MarkBackingDirty(0, std::min<size_t>(heap_end - base, backing_size));
+        }
+#endif
     }
 #endif
 }
@@ -807,7 +824,50 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+#ifdef __EMSCRIPTEN__
+    if (dirty_pages && fill_value == 0 && physical_offset % PageAlignment == 0 &&
+        length % PageAlignment == 0) {
+        // Clear only pages that were written before; the rest stay uncommitted.
+        const size_t first = physical_offset / PageAlignment;
+        const size_t last = first + length / PageAlignment;
+        size_t page = first;
+        while (page < last) {
+            const u64 bit = u64{1} << (page % 64);
+            const bool dirty = dirty_pages[page / 64].fetch_or(bit, std::memory_order_relaxed) & bit;
+            size_t run_end = page + 1;
+            while (run_end < last) {
+                const u64 run_bit = u64{1} << (run_end % 64);
+                const bool run_dirty =
+                    dirty_pages[run_end / 64].load(std::memory_order_relaxed) & run_bit;
+                if (run_dirty != dirty) {
+                    break;
+                }
+                dirty_pages[run_end / 64].fetch_or(run_bit, std::memory_order_relaxed);
+                ++run_end;
+            }
+            if (dirty) {
+                std::memset(backing_base + page * PageAlignment, 0, (run_end - page) * PageAlignment);
+            }
+            page = run_end;
+        }
+        return;
+    }
+    MarkBackingDirty(physical_offset, length);
+#endif
     std::memset(backing_base + physical_offset, fill_value, length);
+}
+
+void HostMemory::MarkBackingDirty(size_t physical_offset, size_t length) {
+#ifdef __EMSCRIPTEN__
+    if (!dirty_pages || length == 0) {
+        return;
+    }
+    const size_t first = physical_offset / PageAlignment;
+    const size_t last = DivCeil(physical_offset + length, PageAlignment);
+    for (size_t page = first; page < last; ++page) {
+        dirty_pages[page / 64].fetch_or(u64{1} << (page % 64), std::memory_order_relaxed);
+    }
+#endif
 }
 
 void HostMemory::EnableDirectMappedAddress() {

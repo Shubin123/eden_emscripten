@@ -47,6 +47,11 @@ KMemoryManager::KMemoryManager(Core::System& system)
           KLightLock{system.Kernel()},
       } {}
 
+void KMemoryManager::MarkDirty(KPhysicalAddress address, size_t num_pages) {
+    m_system.DeviceMemory().buffer.MarkBackingDirty(
+        GetInteger(address) - Core::DramMemoryMap::Base, num_pages * PageSize);
+}
+
 void KMemoryManager::Initialize(KVirtualAddress management_region, size_t management_region_size) {
 
     // Clear the management region to zero.
@@ -526,8 +531,9 @@ bool KMemoryManager::Impl::ProcessOptimizedAllocation(KernelCore& kernel, KPhysi
             any_new = true;
 
             // Fill the page.
-            auto* ptr = device_memory.GetPointer<u8>(m_heap.GetAddress());
-            std::memset(ptr + offset * PageSize, fill_pattern, PageSize);
+            device_memory.buffer.ClearBackingRegion(
+                GetInteger(m_heap.GetAddress()) + offset * PageSize - Core::DramMemoryMap::Base,
+                PageSize, fill_pattern);
         }
 
         offset++;

@@ -47,6 +47,26 @@ TextureKind KindOf(PixelFormat format) {
     return TextureKind::Float;
 }
 
+/// Formats that sample as float but cannot be filtered on this device, so they must be bound as
+/// unfilterable-float with a non-filtering sampler.
+bool IsUnfilterable(wgpu::TextureFormat format) {
+    switch (format) {
+    case wgpu::TextureFormat::R16Unorm:
+    case wgpu::TextureFormat::RG16Unorm:
+    case wgpu::TextureFormat::RGBA16Unorm:
+    case wgpu::TextureFormat::R16Snorm:
+    case wgpu::TextureFormat::RG16Snorm:
+    case wgpu::TextureFormat::RGBA16Snorm:
+        return true;
+    case wgpu::TextureFormat::R32Float:
+    case wgpu::TextureFormat::RG32Float:
+    case wgpu::TextureFormat::RGBA32Float:
+        return !Device().HasFeature(wgpu::FeatureName::Float32Filterable);
+    default:
+        return false;
+    }
+}
+
 wgpu::ComponentSwizzle ToComponent(SwizzleSource source) {
     switch (source) {
     case SwizzleSource::Zero:
@@ -203,10 +223,20 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
         LogOnce(logged, "copies between different formats");
         return;
     }
-    auto& encoder = scheduler.Encoder();
+    const FormatInfo& format_info = GetFormatInfo(dst.info.format);
+    const bool depth_stencil = format_info.depth || format_info.stencil;
     const bool is_3d_src = src.info.type == ImageType::e3D;
     const bool is_3d_dst = dst.info.type == ImageType::e3D;
     for (const VideoCommon::ImageCopy& copy : copies) {
+        // WebGPU only copies whole depth/stencil subresources; draw partial copies instead.
+        if (depth_stencil && (!CoversLevel(src, copy.src_subresource.base_level, copy.src_offset,
+                                           copy.extent) ||
+                              !CoversLevel(dst, copy.dst_subresource.base_level, copy.dst_offset,
+                                           copy.extent))) {
+            BlitDepthCopy(dst, src, copy);
+            continue;
+        }
+        auto& encoder = scheduler.Encoder();
         wgpu::TexelCopyTextureInfo src_info{};
         src_info.texture = src.Texture();
         src_info.mipLevel = static_cast<u32>(copy.src_subresource.base_level);
@@ -223,6 +253,53 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                                   : static_cast<u32>(copy.src_subresource.num_layers);
         const wgpu::Extent3D extent{copy.extent.width, copy.extent.height, std::max(layers, 1u)};
         encoder.CopyTextureToTexture(&src_info, &dst_info, &extent);
+    }
+}
+
+bool TextureCacheRuntime::CoversLevel(const Image& image, s32 level,
+                                      const VideoCommon::Offset3D& offset,
+                                      const VideoCommon::Extent3D& extent) {
+    const u32 width = std::max(image.info.size.width >> level, 1u);
+    const u32 height = std::max(image.info.size.height >> level, 1u);
+    return offset.x == 0 && offset.y == 0 && extent.width == width && extent.height == height;
+}
+
+void TextureCacheRuntime::BlitDepthCopy(Image& dst, Image& src, const VideoCommon::ImageCopy& copy) {
+    const FormatInfo& format_info = GetFormatInfo(dst.info.format);
+    if (!format_info.depth || !format_info.renderable) {
+        static bool logged = false;
+        LogOnce(logged, "partial stencil copies");
+        return;
+    }
+    const u32 src_level = static_cast<u32>(copy.src_subresource.base_level);
+    const u32 dst_level = static_cast<u32>(copy.dst_subresource.base_level);
+    const u32 layers = static_cast<u32>(std::max(copy.src_subresource.num_layers, 1));
+    for (u32 layer = 0; layer < layers; ++layer) {
+        wgpu::TextureViewDescriptor src_desc{};
+        src_desc.dimension = wgpu::TextureViewDimension::e2D;
+        src_desc.baseMipLevel = src_level;
+        src_desc.mipLevelCount = 1;
+        src_desc.baseArrayLayer = static_cast<u32>(copy.src_subresource.base_layer) + layer;
+        src_desc.arrayLayerCount = 1;
+        src_desc.aspect = wgpu::TextureAspect::DepthOnly;
+        wgpu::TextureViewDescriptor dst_desc{};
+        dst_desc.dimension = wgpu::TextureViewDimension::e2D;
+        dst_desc.baseMipLevel = dst_level;
+        dst_desc.mipLevelCount = 1;
+        dst_desc.baseArrayLayer = static_cast<u32>(copy.dst_subresource.base_layer) + layer;
+        dst_desc.arrayLayerCount = 1;
+        const wgpu::TextureView src_view = src.Texture().CreateView(&src_desc);
+        const wgpu::TextureView dst_view = dst.Texture().CreateView(&dst_desc);
+        const s32 width = static_cast<s32>(copy.extent.width);
+        const s32 height = static_cast<s32>(copy.extent.height);
+        const Region2D src_region{{copy.src_offset.x, copy.src_offset.y},
+                                  {copy.src_offset.x + width, copy.src_offset.y + height}};
+        const Region2D dst_region{{copy.dst_offset.x, copy.dst_offset.y},
+                                  {copy.dst_offset.x + width, copy.dst_offset.y + height}};
+        blitter.Blit(dst_view, dst.Format(), std::max(dst.info.size.width >> dst_level, 1u),
+                     std::max(dst.info.size.height >> dst_level, 1u), dst_region, src_view,
+                     TextureKind::Depth, std::max(src.info.size.width >> src_level, 1u),
+                     std::max(src.info.size.height >> src_level, 1u), src_region, false);
     }
 }
 
@@ -389,6 +466,9 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         host_format = image.Format();
     }
     kind = KindOf(format);
+    if (kind == TextureKind::Float && IsUnfilterable(host_format)) {
+        kind = TextureKind::UnfilterableFloat;
+    }
     has_stencil = format_info.stencil;
     view_width = std::max(1u, image.info.size.width >> info.range.base.level);
     view_height = std::max(1u, image.info.size.height >> info.range.base.level);

@@ -16,19 +16,17 @@ if [ "$dev" = 1 ]; then
   dev_option=ON
 fi
 
-# Activate emsdk if emcc is not in PATH
-if ! command -v emcc >/dev/null 2>&1; then
-  if [ -f "$HOME/emsdk/emsdk_env.sh" ]; then
-    echo "Activating EMSDK from $HOME/emsdk..."
-    source "$HOME/emsdk/emsdk_env.sh"
-  elif [ -n "${EMSDK:-}" ] && [ -f "$EMSDK/emsdk_env.sh" ]; then
-    echo "Activating EMSDK from $EMSDK..."
-    source "$EMSDK/emsdk_env.sh"
-  else
-    echo "Error: emcc not found and emsdk_env.sh not located." >&2
-    exit 1
-  fi
+# Prefer emsdk over whatever emcc is in PATH: build dirs are configured against one toolchain, and a
+# different emcc (e.g. Homebrew's) breaks architecture detection on reconfigure.
+if [ -n "${EMSDK:-}" ] && [ -f "$EMSDK/emsdk_env.sh" ]; then
+  source "$EMSDK/emsdk_env.sh" >/dev/null 2>&1
+elif [ -f "$HOME/emsdk/emsdk_env.sh" ]; then
+  source "$HOME/emsdk/emsdk_env.sh" >/dev/null 2>&1
+elif ! command -v emcc >/dev/null 2>&1; then
+  echo "Error: emcc not found and emsdk_env.sh not located." >&2
+  exit 1
 fi
+echo "Using $(command -v emcc)"
 
 # Memory64 + shared-memory threads must apply to every object. The Emscripten toolchain file reads
 # CMAKE_C_FLAGS to pick wasm64, so they have to be passed on the command line.

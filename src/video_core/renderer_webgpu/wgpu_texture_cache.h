@@ -109,6 +109,10 @@ public:
     }
     void BarrierFeedbackLoop() {}
 
+    static bool CoversLevel(const Image& image, s32 level, const VideoCommon::Offset3D& offset,
+                            const VideoCommon::Extent3D& extent);
+    void BlitDepthCopy(Image& dst, Image& src, const VideoCommon::ImageCopy& copy);
+
     Scheduler& scheduler;
     Blitter& blitter;
     u64 memory_usage = 0;
