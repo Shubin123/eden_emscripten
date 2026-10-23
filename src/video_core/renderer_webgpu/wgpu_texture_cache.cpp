@@ -339,7 +339,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     const bool decode_astc =
         VideoCore::Surface::IsPixelFormatASTC(info.format) &&
         (host_format == wgpu::TextureFormat::Undefined ||
-         !Device().HasFeature(wgpu::FeatureName::TextureCompressionASTC));
+         !Device().HasFeature(wgpu::FeatureName::TextureCompressionASTC) ||
+         (info.type == ImageType::e3D && info.size.depth > 1 &&
+          !Device().HasFeature(wgpu::FeatureName::TextureCompressionASTCSliced3D)));
     if (decode_astc) {
         flags |= VideoCommon::ImageFlagBits::Converted | VideoCommon::ImageFlagBits::CostlyLoad;
         host_format = VideoCore::Surface::IsPixelFormatSRGB(info.format)
@@ -348,6 +350,13 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     }
     if (host_format == wgpu::TextureFormat::Undefined || info.type == ImageType::Buffer) {
         LOG_WARNING(Render, "WebGPU: unsupported image format {}", info.format);
+        return;
+    }
+    if (info.type == ImageType::e3D && info.size.depth > 1 &&
+        VideoCore::Surface::IsPixelFormatBCn(info.format) &&
+        !Device().HasFeature(wgpu::FeatureName::TextureCompressionBCSliced3D)) {
+        LOG_WARNING(Render, "WebGPU: 3D {} images need texture-compression-bc-sliced-3d",
+                    info.format);
         return;
     }
     wgpu::TextureDescriptor desc{};

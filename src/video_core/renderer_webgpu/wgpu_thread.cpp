@@ -126,6 +126,8 @@ void Thread::InitDevice() {
             for (const auto feature : {
                      wgpu::FeatureName::TextureCompressionBC,
                      wgpu::FeatureName::TextureCompressionASTC,
+                     wgpu::FeatureName::TextureCompressionBCSliced3D,
+                     wgpu::FeatureName::TextureCompressionASTCSliced3D,
                      wgpu::FeatureName::TextureCompressionETC2,
                      wgpu::FeatureName::Depth32FloatStencil8,
                      wgpu::FeatureName::DepthClipControl,
