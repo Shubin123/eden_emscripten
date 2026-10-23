@@ -123,6 +123,9 @@ bool CompileRegion(const std::vector<CompiledBlock*>& blocks, const JitTarget& t
 /// first use. Returns nullptr if instantiation failed.
 CompiledBlockFn GetThreadFunction(WasmRegion& region);
 
+/// Id for a new region, unique across every Jit (A32 and A64): threads key their instances by it.
+u64 NextRegionId();
+
 /// Counts a built region towards the live code budget. Returns true when the live code exceeds
 /// it (EDEN_JIT_CODE_BUDGET_MB, default 384 MB of module bytes), and the caller should clear its
 /// cache: the engine cannot free compiled code that regions still reference, and running out

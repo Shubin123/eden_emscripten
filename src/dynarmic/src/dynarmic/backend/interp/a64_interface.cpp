@@ -41,7 +41,6 @@ namespace Dynarmic::A64 {
 using namespace Backend::Interp;
 using IR::Opcode;
 
-static std::atomic<u64> next_region_id{1};
 
 namespace {
 
@@ -556,7 +555,7 @@ private:
             std::visit([&](const auto& term) { AddSuccessors(term, add); }, block.terminal);
         }
         auto region = std::make_shared<WasmRegion>();
-        region->id = next_region_id.fetch_add(1, std::memory_order_relaxed);
+        region->id = NextRegionId();
         if (!CompileRegion(blocks, jit_target, region->wasm)) {
             return false;
         }

@@ -79,8 +79,9 @@ struct WasmRegion {
     std::vector<const CompiledBlock*> blocks;
     /// Whether `wasm` counts towards the live code budget (see TrackRegionCode).
     bool tracked = false;
-    std::atomic<u32> last_thread{0};
-    std::atomic<void (*)(void*, void*, void*, void*)> last_function{nullptr};
+    /// Last thread to look up its instance, and that instance's table index, packed as
+    /// (thread << 32) | index so both are read together: indices are only valid on their thread.
+    std::atomic<u64> last_use{0};
 };
 
 /// Accounts executed guest cycles; prints a throughput summary every few seconds when the

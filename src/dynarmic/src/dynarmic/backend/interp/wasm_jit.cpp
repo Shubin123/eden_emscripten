@@ -3821,6 +3821,11 @@ WasmRegion::~WasmRegion() {
     g_dead_count.store(g_dead_regions.size(), std::memory_order_release);
 }
 
+u64 NextRegionId() {
+    static std::atomic<u64> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 bool TrackRegionCode(WasmRegion& region) {
     static const u64 budget = [] {
         const char* value = std::getenv("EDEN_JIT_CODE_BUDGET_MB");
@@ -3835,8 +3840,9 @@ CompiledBlockFn GetThreadFunction(WasmRegion& region) {
         static std::atomic<u32> next_tag{1};
         return next_tag.fetch_add(1);
     }();
-    if (region.last_thread.load(std::memory_order_relaxed) == thread_tag) {
-        return region.last_function.load(std::memory_order_relaxed);
+    const u64 last_use = region.last_use.load(std::memory_order_relaxed);
+    if (u32(last_use >> 32) == thread_tag) {
+        return reinterpret_cast<CompiledBlockFn>(uintptr_t(u32(last_use)));
     }
 
     thread_local std::unordered_map<u64, CompiledBlockFn> functions;
@@ -3867,8 +3873,8 @@ CompiledBlockFn GetThreadFunction(WasmRegion& region) {
         fn = index == 0 ? nullptr : reinterpret_cast<CompiledBlockFn>(index);
         functions.emplace(region.id, fn);
     }
-    region.last_function.store(fn, std::memory_order_relaxed);
-    region.last_thread.store(thread_tag, std::memory_order_relaxed);
+    region.last_use.store((u64(thread_tag) << 32) | u64(reinterpret_cast<uintptr_t>(fn)),
+                          std::memory_order_relaxed);
     return fn;
 }
 
