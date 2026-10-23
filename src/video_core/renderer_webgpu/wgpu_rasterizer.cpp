@@ -89,17 +89,17 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     ++stats.draws;
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (!pipeline) {
-        { DebugCount("draw skip line 90"); return; }
+        return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     if (!pipeline->Configure(is_indexed)) {
-        { DebugCount("draw skip line 94"); return; }
+        return;
     }
     const auto& regs = maxwell3d->regs;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const RenderTargets& targets = *pipeline->targets;
     if (targets.width == 0 || targets.height == 0) {
-        { DebugCount("draw skip line 100"); return; }
+        return;
     }
 
     // Draw parameters, after topologies WebGPU lacks were rewritten into index lists.
@@ -122,7 +122,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         first = 0;
     }
     if (count == 0 || instance_count == 0) {
-        { DebugCount("draw skip line 123"); return; }
+        return;
     }
 
     // The guest viewport is applied in the vertex shader so it may extend past the target.
@@ -170,7 +170,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         const u32 y0 = static_cast<u32>(std::clamp<s32>(min_y, 0, static_cast<s32>(targets.height)));
         const u32 y1 = static_cast<u32>(std::clamp<s32>(max_y, 0, static_cast<s32>(targets.height)));
         if (x1 <= x0 || y1 <= y0) {
-            { DebugCount("draw skip line 171"); return; }
+            return;
         }
         sx = x0, sy = y0, sw = x1 - x0, sh = y1 - y0;
     }
@@ -199,11 +199,11 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
             const u32 index = pipeline->pulled_buffers[i];
             const auto& binding = runtime.vertex_bindings[index];
             if (index >= runtime.num_vertex_bindings || !binding.buffer) {
-                { DebugCount("draw skip pulled buffer missing"); return; }
+                return;
             }
             const u64 aligned = binding.offset & ~255ULL;
             if (aligned + 4 > binding.buffer.GetSize()) {
-                { DebugCount("draw skip pulled buffer range"); return; }
+                return;
             }
             entries[i].binding = static_cast<u32>(i);
             entries[i].buffer = binding.buffer;
@@ -288,7 +288,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     }
     for (const WGPUBuffer buffer : written_buffers) {
         if (std::ranges::find(read_buffers, buffer) != read_buffers.end()) {
-            { DebugCount("draw skip line 198"); return; }
+            return;
         }
     }
     if (scheduler.InRenderPass() && scheduler.PassConflicts(written_buffers, read_buffers)) {
@@ -319,7 +319,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         const auto& binding = runtime.vertex_bindings[index];
         if (index >= runtime.num_vertex_bindings || !binding.buffer ||
             binding.offset >= binding.buffer.GetSize()) {
-            { DebugCount("draw skip line 227"); return; }
+            return;
         }
         const u64 available = binding.buffer.GetSize() - (binding.offset & ~3ULL);
         u64 needed = 0;
@@ -329,7 +329,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
             needed = static_cast<u64>(first + count) * use.stride;
         }
         if (needed > available) {
-            { DebugCount("draw skip line 237"); return; }
+            return;
         }
         vertex_sizes[index] = available;
     }
@@ -349,11 +349,11 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     if (indexed) {
         const auto& index = runtime.index;
         if (!index.buffer) {
-            { DebugCount("draw skip line 256"); return; }
+            return;
         }
         const u64 index_offset = index.offset & ~3ULL;
         if (index_offset >= index.buffer.GetSize()) {
-            { DebugCount("draw skip line 260"); return; }
+            return;
         }
         const u64 available = index.buffer.GetSize() - index_offset;
         const u64 needed = (static_cast<u64>(first) + count) *
@@ -365,7 +365,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
                             "converted {})", first, count, needed, available, index.buffer.GetSize(),
                             index.offset, index.converted);
             }
-            { DebugCount("draw skip line 272"); return; }
+            return;
         }
         const u64 index_size = std::min(available, std::max(needed, static_cast<u64>(index.size)));
         pass.SetIndexBuffer(index.buffer, index.format, index_offset, index_size);
@@ -396,11 +396,11 @@ void RasterizerWebGPU::DrawTexture() {
     const auto& texture = texture_cache.GetImageView(draw_texture_state.src_texture);
     const auto* framebuffer = texture_cache.GetFramebuffer();
     if (!framebuffer) {
-        { DebugCount("draw skip line 296"); return; }
+        return;
     }
     const auto& targets = framebuffer->Targets();
     if (!targets.colors[0]) {
-        { DebugCount("draw skip line 300"); return; }
+        return;
     }
     Region2D dst_region = {Offset2D{.x = static_cast<s32>(draw_texture_state.dst_x0),
                                     .y = static_cast<s32>(draw_texture_state.dst_y0)},
@@ -464,13 +464,11 @@ void RasterizerWebGPU::DispatchCompute() {
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     if (!pipeline->Configure()) {
-        DebugCount("dispatch skip configure");
         return;
     }
     // One dispatch is one usage scope: a buffer cannot be both written and read in it.
     for (const WGPUBuffer buffer : pipeline->written_buffers) {
         if (std::ranges::find(pipeline->read_buffers, buffer) != pipeline->read_buffers.end()) {
-            DebugCount("dispatch skip read+write");
             return;
         }
     }

@@ -275,7 +275,8 @@ void TextureCacheRuntime::CopyImageThroughBuffer(Image& dst, Image& src,
     if (!plain || bytes == 0 || bytes != HostBytesPerBlock(dst.info.format) || src_info.depth ||
         src_info.stencil || dst_info.depth || dst_info.stencil ||
         src_info.conversion != Conversion::None || dst_info.conversion != Conversion::None) {
-        DebugCount(fmt::format("copy {} -> {} unsupported", src.info.format, dst.info.format));
+        static bool logged = false;
+        LogOnce(logged, "copies between these formats");
         return;
     }
     auto& encoder = scheduler.Encoder();
@@ -382,7 +383,6 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                                            std::span<const VideoCommon::ImageCopy> copies) {
     static bool logged = false;
     LogOnce(logged, "image reinterpretation");
-    DebugCount(fmt::format("reinterpret {} -> {}", src.info.format, dst.info.format));
 }
 
 void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view, ImageView& src_view) {

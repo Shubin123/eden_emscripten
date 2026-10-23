@@ -316,25 +316,6 @@ wgpu::ShaderModule MakeModule(const std::string& code, u64 hash) {
 
 } // Anonymous namespace
 
-void DebugCount(const std::string& what) {
-    static std::mutex mutex;
-    static std::map<std::string, u64> counts;
-    static auto last = std::chrono::steady_clock::now();
-    std::scoped_lock lock{mutex};
-    ++counts[what];
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::seconds(10)) {
-        return;
-    }
-    last = now;
-    std::string text;
-    for (const auto& [key, value] : counts) {
-        text += fmt::format("\n  {:8} {}", value, key);
-    }
-    LOG_INFO(Render, "TEMP-DEBUG counts (10 s):{}", text);
-    counts.clear();
-}
-
 size_t GraphicsPipelineKey::Hash() const noexcept {
     return static_cast<size_t>(Common::CityHash64(reinterpret_cast<const char*>(this), Size()));
 }
@@ -991,7 +972,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
         Translate(VariantKey{}, scratch, true);
         if (!infos_ready) {
             valid = false;
-            { DebugCount("configure false line 863"); return false; }
+            return false;
         }
     }
     auto* const maxwell3d = cache.maxwell3d;
@@ -1051,7 +1032,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
     texture_cache.UpdateRenderTargets(false);
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (!framebuffer) {
-        { DebugCount("configure false line 923"); return false; }
+        return false;
     }
     targets = &framebuffer->Targets();
 
@@ -1101,7 +1082,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
     Variant* const variant = FindVariant(variant_key);
     if (!variant || variant->failed || !*variant->pipeline) {
         // Still compiling, or failed.
-        { DebugCount("configure false line 973"); return false; }
+        return false;
     }
     render_pipeline = *variant->pipeline;
     pulled_layout = variant->pulled_layout;
@@ -1125,7 +1106,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
         for (const auto& desc : info.constant_buffer_descriptors) {
             for (u32 i = 0; i < desc.count; ++i) {
                 if (descriptor_index >= descriptors.size()) {
-                    { DebugCount("configure false line 995"); return false; }
+                    return false;
                 }
                 BufferDescriptor& bound = descriptors[descriptor_index++];
                 const u32 size = UniformBindingSize(info, desc.index);
@@ -1147,7 +1128,7 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
         for (const auto& desc : info.storage_buffers_descriptors) {
             for (u32 i = 0; i < desc.count; ++i) {
                 if (descriptor_index >= descriptors.size()) {
-                    { DebugCount("configure false line 1017"); return false; }
+                    return false;
                 }
                 const BufferDescriptor& bound = descriptors[descriptor_index++];
                 auto& entry = entries.emplace_back();
@@ -1175,11 +1156,6 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
                 wgpu::TextureView handle = view.Handle(desc.type);
                 const bool is_dummy = (!handle || view.Kind() != kind);
                 if (is_dummy) {
-                    DebugCount(fmt::format("dummy texture: view {} fmt {} viewtype {} desctype {} "
-                                           "kind {}/{}", views[slot].id.index != 0 ? "real" : "null",
-                                           view.format, static_cast<u32>(view.type),
-                                           static_cast<u32>(desc.type),
-                                           static_cast<u32>(view.Kind()), static_cast<u32>(kind)));
                     handle = cache.DummyTexture(desc.type, kind);
                 } else if (std::ranges::find(targets->textures, view.BaseTexture().Get()) !=
                            targets->textures.end()) {
@@ -1585,16 +1561,7 @@ bool ComputePipeline::Configure() {
             const TextureKind kind{FromSampleKind(texture_kinds[slot])};
             wgpu::TextureView handle = view.Handle(desc.type);
             if (!handle || view.Kind() != kind) {
-                DebugCount(fmt::format("compute {:016x} dummy texture: view {} fmt {} size {}x{} "
-                                       "viewtype {} desctype {} kind {}/{}", key.unique_hash,
-                                       views[slot].id.index != 0 ? "real" : "null", view.format,
-                                       view.size.width, view.size.height,
-                                       static_cast<u32>(view.type), static_cast<u32>(desc.type),
-                                       static_cast<u32>(view.Kind()), static_cast<u32>(kind)));
                 handle = cache.DummyTexture(desc.type, kind);
-            } else {
-                DebugCount(fmt::format("compute {:016x} texture: fmt {} size {}x{}", key.unique_hash,
-                                       view.format, view.size.width, view.size.height));
             }
             auto& texture_entry = entries.emplace_back();
             texture_entry.binding = binding_index++;

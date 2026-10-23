@@ -35,7 +35,4 @@ struct PipelineStats {
 
 inline PipelineStats pipeline_stats;
 
-/// TEMP-DEBUG: counts events by description and logs the totals every few seconds.
-void DebugCount(const std::string& what);
-
 } // namespace WebGPU
