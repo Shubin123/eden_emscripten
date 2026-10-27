@@ -109,7 +109,14 @@ s64 Conductor::GetNextTicks() const {
             speed_scale = 100.f / Settings::SpeedLimit();
         } else {
             // Run at unlocked framerate.
+#ifdef __EMSCRIPTEN__
+            // Every vsync wakes guest threads, which costs far more in the browser than natively;
+            // a hundred per frame starve the game's own threads. Four still lift the frame cap
+            // well past what the host can render.
+            speed_scale = 1.f / UNLOCKED_TARGET_DIVISOR;
+#else
             speed_scale = 0.01f;
+#endif
         }
     }
 

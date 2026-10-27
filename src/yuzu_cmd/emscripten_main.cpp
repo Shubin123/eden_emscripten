@@ -537,6 +537,19 @@ EMSCRIPTEN_KEEPALIVE double eden_get_frametime() {
     return g_frametime_ms;
 }
 
+/// Emulation speed limit in percent of the Switch; 0 runs uncapped, as fast as the host allows
+/// (vsync events come as fast as the game consumes them, so frame-capped games exceed their cap).
+EMSCRIPTEN_KEEPALIVE void eden_set_speed_limit(int percent) {
+    if (percent > 0) {
+        Settings::values.speed_limit.SetValue(static_cast<u16>(std::min(percent, 9999)));
+    }
+    Settings::values.use_speed_limit.SetValue(percent > 0);
+}
+
+EMSCRIPTEN_KEEPALIVE int eden_get_speed_limit() {
+    return Settings::values.use_speed_limit.GetValue() ? Settings::SpeedLimit() : 0;
+}
+
 /// Browser audio controls run on the calling UI thread; no emulation locks are needed.
 EMSCRIPTEN_KEEPALIVE int eden_get_audio_state() {
 #ifdef EDEN_WEB_HEADLESS
@@ -740,7 +753,7 @@ EMSCRIPTEN_KEEPALIVE const char* eden_get_capabilities() {
                   R"({"apiVersion":%d,"cpuBackends":["jit","interpreter"],)"
                   R"("cpuBackend":"%s","renderer":"%s","audio":"%s",)"
                   R"("operations":["boot","pause","resume","shutdown","input","frameTimes",)"
-                  R"("gameInfo","buildInfo","runtimeStats","players","rumble"%s]})",
+                  R"("gameInfo","buildInfo","runtimeStats","players","rumble","speedLimit"%s]})",
                   ApiVersion, CpuJitEnabled() ? "jit" : "interpreter", renderer, audio,
 #ifdef EDEN_WEB_HEADLESS
                   ""
@@ -786,7 +799,7 @@ int main(int argc, char** argv) {
 
 #ifdef EDEN_WEB_HEADLESS
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <rom> [seconds] [--stats]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <rom> [seconds] [--stats] [--uncapped]\n", argv[0]);
         return 1;
     }
     const int seconds = argc > 2 ? std::atoi(argv[2]) : 60;
@@ -824,6 +837,8 @@ int main(int argc, char** argv) {
             parse_pair(arg.substr(15), tap_first, tap_every);
         } else if (arg.starts_with("--measure-frames=")) {
             parse_pair(arg.substr(17), measure_from, measure_to);
+        } else if (arg == "--uncapped") {
+            eden_set_speed_limit(0);
         }
     }
     PushRequest({Request::Kind::Boot, argv[1]});
