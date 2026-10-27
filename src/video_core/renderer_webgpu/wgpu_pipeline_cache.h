@@ -132,6 +132,10 @@ private:
 
     /// Translates the guest shaders; builds `variant` unless only descriptor info is wanted.
     bool Translate(const VariantKey& variant_key, Variant& variant, bool infos_only);
+    /// Whether the guest program at `index` is translated (a skipped geometry shader is not).
+    bool UsesStage(size_t index) const {
+        return key.unique_hashes[index] != 0 && !(index == 4 && skip_geometry);
+    }
     Variant* FindVariant(const VariantKey& variant_key);
 
     PipelineCache& cache;
@@ -145,6 +149,7 @@ private:
     size_t num_textures{};
     bool valid{};
     bool infos_ready{};
+    bool skip_geometry{};
 
     std::map<VariantKey, Variant> variants;
     Variant* last_variant{};

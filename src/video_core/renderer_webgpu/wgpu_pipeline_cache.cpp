@@ -494,9 +494,15 @@ GraphicsPipeline::GraphicsPipeline(PipelineCache& cache_, const GraphicsPipeline
             environments.env_ptrs[env_index++] = &environments.envs[index];
         }
     }
-    // WebGPU has no tessellation or geometry stages.
+    // WebGPU has no tessellation or geometry stages. A passthrough geometry shader cannot add or
+    // change vertices, only cull primitives or pick their viewport and layer (games use it for
+    // culling), so the pipeline runs without it.
+    if (key.unique_hashes[4] != 0 && key.unique_hashes[2] == 0 && key.unique_hashes[3] == 0) {
+        const auto& geometry = environments.envs[4];
+        skip_geometry = geometry.SPH().common0.geometry_passthrough != 0;
+    }
     const bool unsupported = key.unique_hashes[2] != 0 || key.unique_hashes[3] != 0 ||
-                             key.unique_hashes[4] != 0;
+                             (key.unique_hashes[4] != 0 && !skip_geometry);
     if (unsupported) {
         LOG_WARNING(Render, "WebGPU: skipping pipeline {:016x} with tessellation/geometry stages",
                     key.Hash());
@@ -517,6 +523,9 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
                 continue;
             }
             Shader::Environment& env{*environments.env_ptrs[env_index++]};
+            if (!UsesStage(index)) {
+                continue;
+            }
             const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
             Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
             if (!uses_vertex_a || index != 1) {
@@ -528,7 +537,7 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
         }
         if (!infos_ready) {
             for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
-                if (key.unique_hashes[index] == 0) {
+                if (!UsesStage(index)) {
                     continue;
                 }
                 const size_t stage = index - 1;
@@ -591,7 +600,7 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
         const Shader::IR::Program* previous_stage{};
         size_t kind_index{};
         for (size_t index = 1; index < Maxwell::MaxShaderProgram; ++index) {
-            if (key.unique_hashes[index] == 0) {
+            if (!UsesStage(index)) {
                 continue;
             }
             Shader::IR::Program& program{programs[index]};
