@@ -78,6 +78,7 @@ struct Jit::Impl final {
         if (conf.page_table_pointer_mask != 0) {
             pointer_sign_shift = std::countl_zero(conf.page_table_pointer_mask);
         }
+        frame.resize(kFrameSlots);
         jit_target = MakeJitTarget();
     }
 
@@ -259,8 +260,8 @@ private:
         if (block->end_address > block->start_address) {
             block_ranges.AddRange(boost::icl::discrete_interval<u64>::closed(block->start_address, block->end_address - 1), descriptor);
         }
-        if (frame.size() < block->num_slots) {
-            frame.resize(block->num_slots);
+        if (block->num_slots > frame.size() && overflow_frame.size() < block->num_slots) {
+            overflow_frame.resize(block->num_slots);
         }
 
         CompiledBlock* result = block.get();
@@ -539,6 +540,9 @@ private:
         if (!RegionAllowedAt(A64::LocationDescriptor{entry.location}.PC())) {
             return false;
         }
+        if (entry.num_slots > frame.size()) {
+            return false;
+        }
         std::vector<CompiledBlock*> blocks{&entry};
         std::unordered_set<u64> seen{entry.location.Value()};
         for (size_t i = 0; i < blocks.size() && blocks.size() < kMaxRegionBlocks; ++i) {
@@ -547,7 +551,7 @@ private:
                 const IR::LocationDescriptor location = A64::LocationDescriptor{next}.SetSingleStepping(false);
                 if (blocks.size() < kMaxRegionBlocks && seen.insert(location.Value()).second) {
                     // Blocks already compiled elsewhere are reached through their own region.
-                    if (CompiledBlock* successor = GetBlock(location); !successor->region) {
+                    if (CompiledBlock* successor = GetBlock(location); !successor->region && successor->num_slots <= frame.size()) {
                         blocks.push_back(successor);
                     }
                 }
@@ -622,6 +626,8 @@ private:
 
     JitTarget MakeJitTarget() const {
         JitTarget target;
+        target.state_address = reinterpret_cast<u64>(&state);
+        target.frame_address = reinterpret_cast<u64>(frame.data());
         target.a32 = false;
         target.reg_offset = offsetof(A64State, reg);
         target.sp_offset = offsetof(A64State, sp);
@@ -661,7 +667,7 @@ private:
 
     /// Runs a block and returns the next block to run when it can be chained directly.
     CompiledBlock* Execute(CompiledBlock& block, bool single_step) {
-        Slot* const s = frame.data();
+        Slot* const s = block.num_slots <= frame.size() ? frame.data() : overflow_frame.data();
         if (!block.constants.empty()) {
             std::memcpy(s + block.first_constant, block.constants.data(), block.constants.size() * sizeof(Slot));
         }
@@ -734,6 +740,7 @@ private:
     DispatchTables dispatch_tables;
     Backend::BlockRangeInformation<u64> block_ranges;
     std::vector<Slot> frame;
+    std::vector<Slot> overflow_frame;
     s64 cycles_to_run = 0;
     s64 cycles_remaining = 0;
     int pointer_sign_shift = 0;

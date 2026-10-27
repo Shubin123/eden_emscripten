@@ -125,6 +125,7 @@ struct Jit::Impl final {
         if (conf.page_table_pointer_mask != 0) {
             pointer_sign_shift = std::countl_zero(conf.page_table_pointer_mask);
         }
+        frame.resize(kFrameSlots);
         jit_target = MakeJitTarget();
     }
 
@@ -265,8 +266,8 @@ private:
         if (block->end_address > block->start_address) {
             block_ranges.AddRange(boost::icl::discrete_interval<u32>::closed(u32(block->start_address), u32(block->end_address - 1)), descriptor);
         }
-        if (frame.size() < block->num_slots) {
-            frame.resize(block->num_slots);
+        if (block->num_slots > frame.size() && overflow_frame.size() < block->num_slots) {
+            overflow_frame.resize(block->num_slots);
         }
 
         CompiledBlock* result = block.get();
@@ -570,6 +571,9 @@ private:
     }
 
     bool BuildRegion(CompiledBlock& entry) {
+        if (entry.num_slots > frame.size()) {
+            return false;
+        }
         std::vector<CompiledBlock*> blocks{&entry};
         std::unordered_set<u64> seen{entry.location.Value()};
         for (size_t i = 0; i < blocks.size() && blocks.size() < kMaxRegionBlocks; ++i) {
@@ -578,7 +582,7 @@ private:
                 const IR::LocationDescriptor location = A32::LocationDescriptor{next}.SetSingleStepping(false);
                 if (blocks.size() < kMaxRegionBlocks && seen.insert(location.Value()).second) {
                     // Blocks already compiled elsewhere are reached through their own region.
-                    if (CompiledBlock* successor = GetBlock(location); !successor->region) {
+                    if (CompiledBlock* successor = GetBlock(location); !successor->region && successor->num_slots <= frame.size()) {
                         blocks.push_back(successor);
                     }
                 }
@@ -657,6 +661,8 @@ private:
 
     JitTarget MakeJitTarget() const {
         JitTarget target;
+        target.state_address = reinterpret_cast<u64>(&state);
+        target.frame_address = reinterpret_cast<u64>(frame.data());
         target.a32 = true;
         target.reg_offset = offsetof(A32State, reg);
         target.nzcv_offset = offsetof(A32State, nzcv);
@@ -706,7 +712,7 @@ private:
             return Link(block, block.cond_failed_location, single_step, false);
         }
 
-        Slot* const s = frame.data();
+        Slot* const s = block.num_slots <= frame.size() ? frame.data() : overflow_frame.data();
         if (!block.constants.empty()) {
             std::memcpy(s + block.first_constant, block.constants.data(), block.constants.size() * sizeof(Slot));
         }
@@ -786,6 +792,7 @@ private:
     std::array<FastDispatchEntry, 4096> fast_dispatch{};
     Backend::BlockRangeInformation<u32> block_ranges;
     std::vector<Slot> frame;
+    std::vector<Slot> overflow_frame;
     s64 cycles_to_run = 0;
     s64 cycles_remaining = 0;
     int pointer_sign_shift = 0;

@@ -39,6 +39,11 @@ struct JitTarget {
     u32 ext_offset = 0;
     u32 wrote_pc_offset = 0;  ///< Offset of the A32 BXWritePC flag within the Impl.
 
+    /// Addresses of the guest state and of the frame regions run with, when they never move;
+    /// generated code then addresses them directly. 0 passes them as parameters.
+    u64 state_address = 0;
+    u64 frame_address = 0;
+
     u64 page_table = 0;
     u64 page_table_pointer_mask = 0;
     int pointer_sign_shift = 0;
@@ -134,6 +139,9 @@ bool TrackRegionCode(WasmRegion& region);
 
 /// Compile and instantiation counts and times since the last call, for the stats report.
 std::string JitStats();
+
+/// Debug: EDEN_JIT_NAMES names each region's function r<entry pc>_<blocks> for profilers.
+bool RegionNamesEnabled();
 
 /// Whether compiled execution is enabled (EDEN_INTERP_JIT=0 disables it).
 bool WasmJitEnabled();

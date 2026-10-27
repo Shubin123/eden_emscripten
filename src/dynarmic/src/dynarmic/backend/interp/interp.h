@@ -40,6 +40,10 @@ struct Op {
     std::array<u32, 4> args;
 };
 
+/// Slots in a Jit's frame. The frame never moves, so compiled regions address it directly; blocks
+/// that need more slots run interpreted on a separate overflow frame.
+constexpr size_t kFrameSlots = 16384;
+
 /// An IR block lowered to a flat instruction array over a slot frame. Immediates occupy the
 /// slots after the instruction results and are copied into the frame before execution.
 struct CompiledBlock {

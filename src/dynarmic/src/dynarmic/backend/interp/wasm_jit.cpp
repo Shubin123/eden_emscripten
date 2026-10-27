@@ -55,6 +55,13 @@ EM_JS(uint64_t, dynarmic_wasm_instantiate, (const void* data, size_t size), {
     }
 });
 
+// Debug (Node): writes each compiled module to $EDEN_JIT_DUMP_DIR/r<entry pc>_<blocks>.wasm.
+EM_JS(void, dynarmic_wasm_dump, (const void* data, size_t size, uint64_t pc, uint64_t blocks), {
+    if (typeof process == 'undefined' || !process.env || !process.env.EDEN_JIT_DUMP_DIR) return;
+    const name = process.env.EDEN_JIT_DUMP_DIR + '/r' + pc.toString(16) + '_' + blocks + '.wasm';
+    require('fs').writeFileSync(name, HEAPU8.slice(Number(data), Number(data) + Number(size)));
+});
+
 // Clears a table slot of this thread so its instance can be collected, and keeps it for reuse.
 EM_JS(void, dynarmic_wasm_release, (uint64_t index), {
     wasmTable.set(index, null);
@@ -76,19 +83,31 @@ constexpr u32 kCarryOffset = offsetof(Slot, carry);
 constexpr u32 kOverflowOffset = offsetof(Slot, overflow);
 
 // Typed scratch locals shared by all blocks of a region.
-constexpr u32 kF32A = 25;
-constexpr u32 kF32B = 26;
-constexpr u32 kF64A = 27;
-constexpr u32 kF64B = 28;
-constexpr u32 kV128A = 29;
-constexpr u32 kV128B = 30;
-constexpr u32 kV128C = 31;
+constexpr u32 kF32A = 37;
+constexpr u32 kF32B = 38;
+constexpr u32 kF64A = 39;
+constexpr u32 kF64B = 40;
+constexpr u32 kV128A = 41;
+constexpr u32 kV128B = 42;
+constexpr u32 kV128C = 43;
 
 // Function parameters.
 constexpr u32 kState = 0;
 constexpr u32 kFrame = 1;
 constexpr u32 kImpl = 2;
 constexpr u32 kEntry = 3;
+
+/// Pushes the base address of the guest state or the frame for a memory access. Known addresses
+/// are pushed as constants: Memory64 accesses through a variable base get an explicit bounds
+/// check each, while V8 checks a constant address once at compile time.
+void PushBase(Code& code, const JitTarget& target, u32 param) {
+    const u64 address = param == kState ? target.state_address : param == kFrame ? target.frame_address : 0;
+    if (address != 0) {
+        code.I64Const(address);
+    } else {
+        code.Get(param);
+    }
+}
 
 bool IsFlagPseudoOp(Opcode op) {
     switch (op) {
@@ -316,9 +335,32 @@ struct RegionLocals {
     u32 tlb_base;
 };
 
+/// A64 general registers (x0-x30, then sp) a region keeps in locals. Writes go to the local and
+/// to the guest state, so the state is always current and exits need no write-back; entering the
+/// region loads only the registers the entry block may read before writing them.
+struct RegisterLocals {
+    std::array<u32, 32> local;
+    /// Registers kept in locals: those the region uses often, in regions that loop.
+    u32 mask;
+    /// Registers in mask that the region reads, reloaded after fallbacks that may change guest state.
+    u32 read_mask;
+
+    bool Has(u64 reg) const {
+        return (mask >> (reg & 31)) & 1;
+    }
+};
+
 /// Fallback operations that read or write guest registers, flags or the cycle budget.
 bool HelperTouchesState(Opcode op) {
     switch (op) {
+    case Opcode::A64CallSupervisor:
+    case Opcode::A64ExceptionRaised:
+    case Opcode::A64GetW:
+    case Opcode::A64GetX:
+    case Opcode::A64GetSP:
+    case Opcode::A64SetW:
+    case Opcode::A64SetX:
+    case Opcode::A64SetSP:
     case Opcode::A32CallSupervisor:
     case Opcode::A32ExceptionRaised:
     case Opcode::A32GetCpsr:
@@ -334,8 +376,20 @@ bool HelperTouchesState(Opcode op) {
 /// `local_base`; values do not live across blocks, so regions reuse the same range.
 class BlockCompiler {
 public:
-    BlockCompiler(const CompiledBlock& block_, const JitTarget& target_, Code& code_, u32 local_base, const RegionLocals* cached_)
-        : block{block_}, target{target_}, code{code_}, next_local{local_base}, cached{cached_} {}
+    BlockCompiler(const CompiledBlock& block_, const JitTarget& target_, Code& code_, u32 local_base, const RegionLocals* cached_,
+                  const RegisterLocals* regs_ = nullptr)
+        : block{block_}, target{target_}, code{code_}, next_local{local_base}, cached{cached_}, regs{regs_} {}
+
+    /// Loads the A64 registers in `mask` into their locals.
+    void LoadRegisters(u32 mask) {
+        for (u32 r = 0; r < 32; ++r) {
+            if (regs->Has(r) && ((mask >> r) & 1)) {
+                PushBase(code, target, kState);
+                code.Mem(Insn::I64Load, r == 31 ? target.sp_offset : target.reg_offset + 8 * u64(r));
+                code.Set(regs->local[r]);
+            }
+        }
+    }
 
     /// Writes the cached guest state back to memory.
     void FlushState() {
@@ -343,11 +397,11 @@ public:
             return;
         }
         for (u32 r = 0; r < 16; ++r) {
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.Get(cached->reg[r]);
             code.Mem(Insn::I64Store32, target.reg_offset + 4 * r);
         }
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Get(cached->nzcv);
         code.Mem(Insn::I64Store32, target.nzcv_offset);
         code.I64Const(target.cycles_remaining);
@@ -361,11 +415,11 @@ public:
             return;
         }
         for (u32 r = 0; r < 16; ++r) {
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.Mem(Insn::I64Load32U, target.reg_offset + 4 * r);
             code.Set(cached->reg[r]);
         }
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Mem(Insn::I64Load32U, target.nzcv_offset);
         code.Set(cached->nzcv);
         code.I64Const(target.cycles_remaining);
@@ -393,6 +447,19 @@ public:
     /// Pushes the i32 result of evaluating `cond` against the guest NZCV.
     void PushCondition(IR::Cond cond) {
         PushCond(cond);
+    }
+
+    /// Pushes the guest check bit as an i32.
+    void PushCheckBit() {
+        if (check_bit_op) {
+            // Set in this block: use the value rather than reloading what was just stored.
+            PushArg(*check_bit_op, 0);
+            And(0xFF);
+        } else {
+            PushBase(code, target, kState);
+            code.Mem(Insn::I64Load8U, target.check_bit_offset);
+        }
+        code.Byte(Insn::I32WrapI64);
     }
 
 private:
@@ -498,7 +565,7 @@ private:
         } else if (value_local[slot] != kNone) {
             code.Get(value_local[slot]);
         } else {
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.Mem(Insn::I64Load, u64(slot) * kSlotSize + kLoOffset);
         }
     }
@@ -523,7 +590,7 @@ private:
     void Define(size_t index) {
         code.Set(value_local[index]);
         if (spill[index]) {
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.Get(value_local[index]);
             code.Mem(Insn::I64Store, u64(index) * kSlotSize + kLoOffset);
         }
@@ -534,12 +601,12 @@ private:
             return;
         }
         if (carry_local[index] != kNone) {
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.Get(carry_local[index]);
             code.Mem(Insn::I64Store8, u64(index) * kSlotSize + kCarryOffset);
         }
         if (overflow_local[index] != kNone) {
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.Get(overflow_local[index]);
             code.Mem(Insn::I64Store8, u64(index) * kSlotSize + kOverflowOffset);
         }
@@ -567,27 +634,104 @@ private:
 
     /// Pushes the i32 result of evaluating `cond` against the guest NZCV.
     void PushNZCV() {
-        if (cached) {
+        if (flags_source != kNone) {
+            code.Get(value_local[flags_source]);
+        } else if (cached) {
             code.Get(cached->nzcv);
         } else {
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.Mem(Insn::I64Load32U, target.nzcv_offset);
         }
     }
 
     template<typename F>
     void SetNZCV(F&& value) {
+        flags_source = kNone;
         if (cached) {
             value();
             code.Set(cached->nzcv);
         } else {
-            code.Get(kState);
+            PushBase(code, target, kState);
             value();
             EmitStateStore32(target.nzcv_offset);
         }
     }
 
+    /// The GetNZCVFromOp `slot` refers to, if it is an inline op of this block with its value in a local.
+    u32 FlagsSourceOf(u32 slot) const {
+        if (IsConstant(slot) || slot >= block.ops.size()) {
+            return kNone;
+        }
+        const Op& op = block.ops[slot];
+        if (op.opcode != Opcode::GetNZCVFromOp || !inline_op[slot] || value_local[slot] == kNone) {
+            return kNone;
+        }
+        return slot;
+    }
+
+    /// Pushes `cond` as a comparison of the operands when the flags come from a - b (carry in 1),
+    /// so a guest compare and branch becomes one host compare and branch.
+    bool PushCompareCond(IR::Cond cond) {
+        if (flags_source == kNone) {
+            return false;
+        }
+        const Op& parent = block.ops[block.ops[flags_source].args[0]];
+        if ((parent.opcode != Opcode::Sub32 && parent.opcode != Opcode::Sub64) || !IsConstant(parent.args[2]) ||
+            (ConstantValue(parent.args[2]) & 1) == 0) {
+            return false;
+        }
+        const bool is32 = parent.opcode == Opcode::Sub32;
+        u8 compare;
+        switch (cond) {
+        case IR::Cond::EQ:
+            compare = is32 ? Insn::I32Eq : Insn::I64Eq;
+            break;
+        case IR::Cond::NE:
+            compare = is32 ? Insn::I32Ne : Insn::I64Ne;
+            break;
+        case IR::Cond::CS:
+            compare = is32 ? Insn::I32GeU : Insn::I64GeU;
+            break;
+        case IR::Cond::CC:
+            compare = is32 ? Insn::I32LtU : Insn::I64LtU;
+            break;
+        case IR::Cond::HI:
+            compare = is32 ? Insn::I32GtU : Insn::I64GtU;
+            break;
+        case IR::Cond::LS:
+            compare = is32 ? Insn::I32LeU : Insn::I64LeU;
+            break;
+        case IR::Cond::GE:
+            compare = is32 ? Insn::I32GeS : Insn::I64GeS;
+            break;
+        case IR::Cond::LT:
+            compare = is32 ? Insn::I32LtS : Insn::I64LtS;
+            break;
+        case IR::Cond::GT:
+            compare = is32 ? Insn::I32GtS : Insn::I64GtS;
+            break;
+        case IR::Cond::LE:
+            compare = is32 ? Insn::I32LeS : Insn::I64LeS;
+            break;
+        default:
+            return false;
+        }
+        PushArg(parent, 0);
+        if (is32) {
+            code.Byte(Insn::I32WrapI64);
+        }
+        PushArg(parent, 1);
+        if (is32) {
+            code.Byte(Insn::I32WrapI64);
+        }
+        code.Byte(compare);
+        return true;
+    }
+
     void PushCond(IR::Cond cond) {
+        if (PushCompareCond(cond)) {
+            return;
+        }
         PushNZCV();
         code.Set(nzcv_tmp);
         const auto bit = [&](u32 shift) {
@@ -680,6 +824,9 @@ private:
     }
 
     void CallHelper(size_t index, size_t end) {
+        // A helper may write NZCV or the check bit.
+        flags_source = kNone;
+        check_bit_op = nullptr;
         bool touches_state = false;
         if (cached) {
             for (size_t current = index; current < end; ++current) {
@@ -692,6 +839,14 @@ private:
         CallHelperRaw(index, end);
         if (touches_state) {
             ReloadState();
+        }
+        if (regs) {
+            for (size_t current = index; current < end; ++current) {
+                if (HelperTouchesState(block.ops[current].opcode)) {
+                    LoadRegisters(regs->read_mask);
+                    break;
+                }
+            }
         }
     }
 
@@ -716,7 +871,7 @@ private:
         if (IsConstant(slot) || value_local[slot] == kNone || spill[slot]) {
             return;
         }
-        code.Get(kFrame);
+        PushBase(code, target, kFrame);
         code.Get(value_local[slot]);
         code.Mem(Insn::I64Store, u64(slot) * kSlotSize + kLoOffset);
     }
@@ -831,7 +986,7 @@ private:
         {
             SpillArg(op, 1);
             CallHelper(index);
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.Mem(Insn::I64Load, u64(index) * kSlotSize + kLoOffset);
         }
         code.Else();
@@ -871,7 +1026,7 @@ private:
         }
         code.Else();
         {
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.Get(tmp1);
             SimdOp(0);  // v128.load
             code.U32(0);
@@ -953,13 +1108,13 @@ private:
 
     void EmitExclusiveRead(size_t index, u32 bytes) {
         EmitRead(index, bytes);
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.I64Const(1);
         code.Mem(Insn::I64Store32, target.exclusive_state_offset);
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Get(tmp0);
         code.Mem(target.a32 ? Insn::I64Store32 : Insn::I64Store, target.exclusive_address_offset);
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Get(value_local[index]);
         code.Mem(Insn::I64Store, target.exclusive_value_offset);
     }
@@ -973,17 +1128,17 @@ private:
         }
         code.Set(tmp0);
         // No reservation for this address: fail.
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Mem(Insn::I64Load32U, target.exclusive_state_offset);
         code.Byte(Insn::I64Eqz);
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Mem(target.a32 ? Insn::I64Load32U : Insn::I64Load, target.exclusive_address_offset);
         code.Get(tmp0);
         code.Byte(Insn::I64Ne);
         code.Byte(Insn::I32Or);
         code.IfI64();
         {
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.I64Const(0);
             code.Mem(Insn::I64Store32, target.exclusive_state_offset);
             code.I64Const(1);
@@ -998,16 +1153,16 @@ private:
                 SpillArg(op, 1);
                 SpillArg(op, 2);
                 CallHelper(index);
-                code.Get(kFrame);
+                PushBase(code, target, kFrame);
                 code.Mem(Insn::I64Load, u64(index) * kSlotSize + kLoOffset);
             }
             code.Else();
             {
-                code.Get(kState);
+                PushBase(code, target, kState);
                 code.I64Const(0);
                 code.Mem(Insn::I64Store32, target.exclusive_state_offset);
                 // old = cmpxchg(host, expected, value); result = old != expected
-                code.Get(kState);
+                PushBase(code, target, kState);
                 code.Mem(Insn::I64Load, target.exclusive_value_offset);
                 code.Set(tmp3);
                 code.Get(tmp1);
@@ -1394,7 +1549,7 @@ private:
             }
             return;
         }
-        code.Get(kFrame);
+        PushBase(code, target, kFrame);
         SimdOp(0);  // v128.load
         code.U32(0);
         code.U64(u64(slot) * kSlotSize + kLoOffset);
@@ -1403,7 +1558,7 @@ private:
     /// Stores the v128 on the stack as the result of op `index`.
     void StoreV128(size_t index) {
         code.Set(kV128A);
-        code.Get(kFrame);
+        PushBase(code, target, kFrame);
         code.Get(kV128A);
         SimdOp(11);  // v128.store
         code.U32(0);
@@ -1660,7 +1815,7 @@ private:
             SpillArg(op, i);
         }
         CallHelper(index);
-        code.Get(kFrame);
+        PushBase(code, target, kFrame);
         code.Mem(Insn::I64Load, u64(index) * kSlotSize + kLoOffset);
         code.Else();
         code.Get(tmp3);
@@ -1684,7 +1839,7 @@ private:
         SpillArg(op, 1);
         SpillArg(op, 2);
         CallHelper(index);
-        code.Get(kFrame);
+        PushBase(code, target, kFrame);
         code.Mem(Insn::I64Load, u64(index) * kSlotSize + kLoOffset);
         code.Else();
         PushGuestFloat(op, 0, is64);
@@ -2088,18 +2243,18 @@ private:
             StoreV128(index);
             return true;
         case Opcode::VectorZeroUpper:
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             PushVectorHalf(op, 0, false);
             code.Mem(Insn::I64Store, u64(index) * kSlotSize + kLoOffset);
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.I64Const(0);
             code.Mem(Insn::I64Store, u64(index) * kSlotSize + kHiOffset);
             return true;
         case Opcode::ZeroVector:
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.I64Const(0);
             code.Mem(Insn::I64Store, u64(index) * kSlotSize + kLoOffset);
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.I64Const(0);
             code.Mem(Insn::I64Store, u64(index) * kSlotSize + kHiOffset);
             return true;
@@ -2115,7 +2270,7 @@ private:
                 std::memcpy(&value, reinterpret_cast<const u8*>(lanes) + element * (is64 ? 8 : 4), is64 ? 8 : 4);
                 code.I64Const(is64 ? value : u32(value));
             } else {
-                code.Get(kFrame);
+                PushBase(code, target, kFrame);
                 code.Mem(is64 ? Insn::I64Load : Insn::I64Load32U, u64(slot) * kSlotSize + kLoOffset + element * (is64 ? 8 : 4));
             }
             Define(index);
@@ -2127,7 +2282,7 @@ private:
             const u64 element = ConstantValue(op.args[1]);
             PushV128(op, 0);
             StoreV128(index);
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             PushArg(op, 2);
             code.Mem(is64 ? Insn::I64Store : Insn::I64Store32, u64(index) * kSlotSize + kLoOffset + element * (is64 ? 8 : 4));
             return true;
@@ -2170,7 +2325,7 @@ private:
             SimdOp(splat[size]);
             StoreV128(index);
             if (lower) {
-                code.Get(kFrame);
+                PushBase(code, target, kFrame);
                 code.I64Const(0);
                 code.Mem(Insn::I64Store, u64(index) * kSlotSize + kHiOffset);
             }
@@ -2188,11 +2343,11 @@ private:
         // Constants read by interpreter fallbacks must be present in the shared frame.
         for (const u32 slot : helper_constants) {
             const Slot& constant = block.constants[slot - block.first_constant];
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.I64Const(constant.lo);
             code.Mem(Insn::I64Store, u64(slot) * kSlotSize + kLoOffset);
             if (constant.hi != 0) {
-                code.Get(kFrame);
+                PushBase(code, target, kFrame);
                 code.I64Const(constant.hi);
                 code.Mem(Insn::I64Store, u64(slot) * kSlotSize + kHiOffset);
             }
@@ -2577,10 +2732,10 @@ private:
             define();
             break;
         case Opcode::ZeroExtendLongToQuad:
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             arg(0);
             code.Mem(Insn::I64Store, frame_lo);
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             code.I64Const(0);
             code.Mem(Insn::I64Store, frame_hi);
             break;
@@ -2644,9 +2799,10 @@ private:
         // A64 state
         case Opcode::A64SetCheckBit:
         case Opcode::A32SetCheckBit:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(0);
             code.Mem(Insn::I64Store8, target.check_bit_offset);
+            check_bit_op = &op;
             break;
         case Opcode::A64GetCFlag:
         case Opcode::A32GetCFlag:
@@ -2656,8 +2812,7 @@ private:
             define();
             break;
         case Opcode::A64GetNZCVRaw:
-            code.Get(kState);
-            code.Mem(Insn::I64Load32U, target.nzcv_offset);
+            PushNZCV();
             define();
             break;
         case Opcode::A64SetNZCVRaw:
@@ -2668,28 +2823,40 @@ private:
                 arg(0);
                 And(0xF0000000);
             });
+            if (op.opcode == Opcode::A64SetNZCV || op.opcode == Opcode::A32SetCpsrNZCV) {
+                flags_source = FlagsSourceOf(op.args[0]);
+            }
             break;
         case Opcode::A64GetW:
-            code.Get(kState);
-            code.Mem(Insn::I64Load32U, target.reg_offset + 8 * ConstantValue(op.args[0]));
+            if (regs && regs->Has(ConstantValue(op.args[0]))) {
+                code.Get(regs->local[ConstantValue(op.args[0])]);
+                Mask32();
+            } else {
+                PushBase(code, target, kState);
+                code.Mem(Insn::I64Load32U, target.reg_offset + 8 * ConstantValue(op.args[0]));
+            }
             define();
             break;
         case Opcode::A64GetX:
-            code.Get(kState);
-            code.Mem(Insn::I64Load, target.reg_offset + 8 * ConstantValue(op.args[0]));
+            if (regs && regs->Has(ConstantValue(op.args[0]))) {
+                code.Get(regs->local[ConstantValue(op.args[0])]);
+            } else {
+                PushBase(code, target, kState);
+                code.Mem(Insn::I64Load, target.reg_offset + 8 * ConstantValue(op.args[0]));
+            }
             define();
             break;
         case Opcode::A64GetS:
         case Opcode::A64GetD:
         case Opcode::A64GetQ: {
             const u64 vec = target.ext_offset + 16 * ConstantValue(op.args[0]);
-            code.Get(kFrame);
-            code.Get(kState);
+            PushBase(code, target, kFrame);
+            PushBase(code, target, kState);
             code.Mem(op.opcode == Opcode::A64GetS ? Insn::I64Load32U : Insn::I64Load, vec);
             code.Mem(Insn::I64Store, frame_lo);
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             if (op.opcode == Opcode::A64GetQ) {
-                code.Get(kState);
+                PushBase(code, target, kState);
                 code.Mem(Insn::I64Load, vec + 8);
             } else {
                 code.I64Const(0);
@@ -2698,32 +2865,42 @@ private:
             break;
         }
         case Opcode::A64GetSP:
-            code.Get(kState);
-            code.Mem(Insn::I64Load, target.sp_offset);
+            if (regs && regs->Has(31)) {
+                code.Get(regs->local[31]);
+            } else {
+                PushBase(code, target, kState);
+                code.Mem(Insn::I64Load, target.sp_offset);
+            }
             define();
             break;
         case Opcode::A64SetW:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(1);
             Mask32();
+            if (regs && regs->Has(ConstantValue(op.args[0]))) {
+                code.Tee(regs->local[ConstantValue(op.args[0])]);
+            }
             code.Mem(Insn::I64Store, target.reg_offset + 8 * ConstantValue(op.args[0]));
             break;
         case Opcode::A64SetX:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(1);
+            if (regs && regs->Has(ConstantValue(op.args[0]))) {
+                code.Tee(regs->local[ConstantValue(op.args[0])]);
+            }
             code.Mem(Insn::I64Store, target.reg_offset + 8 * ConstantValue(op.args[0]));
             break;
         case Opcode::A64SetS:
         case Opcode::A64SetD:
         case Opcode::A64SetQ: {
             const u64 vec = target.ext_offset + 16 * ConstantValue(op.args[0]);
-            code.Get(kState);
+            PushBase(code, target, kState);
             PushVectorHalf(op, 1, false);
             if (op.opcode == Opcode::A64SetS) {
                 Mask32();
             }
             code.Mem(Insn::I64Store, vec);
-            code.Get(kState);
+            PushBase(code, target, kState);
             if (op.opcode == Opcode::A64SetQ) {
                 PushVectorHalf(op, 1, true);
             } else {
@@ -2733,12 +2910,15 @@ private:
             break;
         }
         case Opcode::A64SetSP:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(0);
+            if (regs && regs->Has(31)) {
+                code.Tee(regs->local[31]);
+            }
             code.Mem(Insn::I64Store, target.sp_offset);
             break;
         case Opcode::A64SetPC:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(0);
             code.Mem(Insn::I64Store, target.pc_offset);
             break;
@@ -2806,7 +2986,7 @@ private:
             if (cached) {
                 code.Get(cached->reg[r]);
             } else {
-                code.Get(kState);
+                PushBase(code, target, kState);
                 code.Mem(Insn::I64Load32U, target.reg_offset + 4 * u64(r));
             }
             define();
@@ -2819,29 +2999,29 @@ private:
                 Mask32();
                 code.Set(cached->reg[r]);
             } else {
-                code.Get(kState);
+                PushBase(code, target, kState);
                 arg(1);
                 EmitStateStore32(target.reg_offset + 4 * u64(r));
             }
             break;
         }
         case Opcode::A32GetExtendedRegister32:
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.Mem(Insn::I64Load32U, target.ext_offset + 4 * (ConstantValue(op.args[0]) - u64(A32::ExtReg::S0)));
             define();
             break;
         case Opcode::A32SetExtendedRegister32:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(1);
             EmitStateStore32(target.ext_offset + 4 * (ConstantValue(op.args[0]) - u64(A32::ExtReg::S0)));
             break;
         case Opcode::A32GetExtendedRegister64:
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.Mem(Insn::I64Load, target.ext_offset + 8 * (ConstantValue(op.args[0]) - u64(A32::ExtReg::D0)));
             define();
             break;
         case Opcode::A32SetExtendedRegister64:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(1);
             code.Mem(Insn::I64Store, target.ext_offset + 8 * (ConstantValue(op.args[0]) - u64(A32::ExtReg::D0)));
             break;
@@ -2850,15 +3030,15 @@ private:
             const bool is_double = A32::IsDoubleExtReg(reg);
             const u64 offset = is_double ? target.ext_offset + 8 * (u64(reg) - u64(A32::ExtReg::D0))
                                          : target.ext_offset + 16 * (u64(reg) - u64(A32::ExtReg::Q0));
-            code.Get(kFrame);
-            code.Get(kState);
+            PushBase(code, target, kFrame);
+            PushBase(code, target, kState);
             code.Mem(Insn::I64Load, offset);
             code.Mem(Insn::I64Store, frame_lo);
-            code.Get(kFrame);
+            PushBase(code, target, kFrame);
             if (is_double) {
                 code.I64Const(0);
             } else {
-                code.Get(kState);
+                PushBase(code, target, kState);
                 code.Mem(Insn::I64Load, offset + 8);
             }
             code.Mem(Insn::I64Store, frame_hi);
@@ -2869,11 +3049,11 @@ private:
             const bool is_double = A32::IsDoubleExtReg(reg);
             const u64 offset = is_double ? target.ext_offset + 8 * (u64(reg) - u64(A32::ExtReg::D0))
                                          : target.ext_offset + 16 * (u64(reg) - u64(A32::ExtReg::Q0));
-            code.Get(kState);
+            PushBase(code, target, kState);
             PushVectorHalf(op, 1, false);
             code.Mem(Insn::I64Store, offset);
             if (!is_double) {
-                code.Get(kState);
+                PushBase(code, target, kState);
                 PushVectorHalf(op, 1, true);
                 code.Mem(Insn::I64Store, offset + 8);
             }
@@ -2884,7 +3064,7 @@ private:
                 arg(0);
                 And(0xF0000000);
             });
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(0);
             Shr(27);
             And(1);
@@ -2913,8 +3093,8 @@ private:
             });
             break;
         case Opcode::A32OrQFlag:
-            code.Get(kState);
-            code.Get(kState);
+            PushBase(code, target, kState);
+            PushBase(code, target, kState);
             code.Mem(Insn::I64Load32U, target.q_offset);
             arg(0);
             And(1);
@@ -2922,12 +3102,12 @@ private:
             EmitStateStore32(target.q_offset);
             break;
         case Opcode::A32GetGEFlags:
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.Mem(Insn::I64Load32U, target.ge_offset);
             define();
             break;
         case Opcode::A32SetGEFlags:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(0);
             EmitStateStore32(target.ge_offset);
             break;
@@ -2935,7 +3115,7 @@ private:
             const u32 upper_without_t = u32(A32::LocationDescriptor{block.end_location}.SetSingleStepping(false).UniqueHash() >> 32) & 0xFFFFFFFE;
             // pc = value & (value & 1 ? ~1 : ~3)
             if (!cached) {
-                code.Get(kState);
+                PushBase(code, target, kState);
             }
             arg(0);
             code.I64Const(0xFFFFFFFE);
@@ -2951,7 +3131,7 @@ private:
                 EmitStateStore32(target.reg_offset + 4 * 15);
             }
             // upper = upper_without_t | (value & 1)
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(0);
             And(1);
             code.I64Const(upper_without_t);
@@ -2962,19 +3142,19 @@ private:
             break;
         }
         case Opcode::A32GetFpscrNZCV:
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.Mem(Insn::I64Load32U, target.fpsr_nzcv_offset);
             define();
             break;
         case Opcode::A32SetFpscrNZCV:
-            code.Get(kState);
+            PushBase(code, target, kState);
             arg(0);
             And(0xF0000000);
             code.Mem(Insn::I64Store32, target.fpsr_nzcv_offset);
             break;
         case Opcode::A64ClearExclusive:
         case Opcode::A32ClearExclusive:
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.I64Const(0);
             code.Mem(Insn::I64Store32, target.exclusive_state_offset);
             break;
@@ -3020,7 +3200,7 @@ private:
             code.Get(wrote_pc_local);
             code.Byte(Insn::I64Eqz);
             code.If();
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.I64Const(upper);
             EmitStateStore32(target.upper_offset);
             code.End();
@@ -3043,7 +3223,7 @@ private:
             code.I64Const(high ? constant.hi : constant.lo);
             return;
         }
-        code.Get(kFrame);
+        PushBase(code, target, kFrame);
         code.Mem(Insn::I64Load, u64(slot) * kSlotSize + (high ? kHiOffset : kLoOffset));
     }
 
@@ -3360,6 +3540,7 @@ private:
 
     u32 next_local;
     const RegionLocals* cached;
+    const RegisterLocals* regs;
     std::vector<u32> helper_constants;
     std::vector<bool> inline_op;
     std::vector<u32> value_local;
@@ -3372,6 +3553,10 @@ private:
     u32 tmp0 = 0, tmp1 = 0, tmp2 = 0, tmp3 = 0;
     u32 nzcv_tmp = 0;
     u32 wrote_pc_local = 0;
+    /// The GetNZCVFromOp whose value the guest NZCV holds, when this block last set NZCV from it.
+    u32 flags_source = kNone;
+    /// The A64SetCheckBit/A32SetCheckBit that last set the check bit in this block.
+    const Op* check_bit_op = nullptr;
 };
 
 }  // Anonymous namespace
@@ -3421,8 +3606,14 @@ public:
             loader.ReloadState();
         }
         const RegionLocals* cached_ptr = cached ? &*cached : nullptr;
+        const RegisterLocals* regs_ptr = nullptr;
+        if (!target.a32 && EmitRegisterEntry()) {
+            regs_ptr = &*regs;
+        }
 
-        // Regions may be entered at any of their blocks.
+        // Regions may be entered at any of their blocks: the loop dispatches on kCurrent to the
+        // block's label, for entries and backward edges. Block i's code follows the end of label
+        // i, inside the labels of the blocks after it, so forward edges branch there directly.
         code.Get(kEntry);
         code.Set(kCurrent);
         code.BlockStart();
@@ -3432,6 +3623,7 @@ public:
         for (u32 i = 0; i < n; ++i) {
             code.BlockStart();
         }
+        block_count = n;
         code.Get(kCurrent);
         code.Byte(Insn::I32WrapI64);
         code.Byte(0x0E);  // br_table
@@ -3445,7 +3637,15 @@ public:
             code.End();
             current_index = i;
             const CompiledBlock& block = *blocks[i];
-            BlockCompiler compiler{block, target, code, kLocalBase, cached_ptr};
+            // A block that links to itself loops in place rather than through the dispatch.
+            bool self_loop = false;
+            ForEachRegionSuccessor(i, [&](u32 next) { self_loop |= next == i; });
+            self_loop_nest = 0;
+            if (self_loop) {
+                code.LoopStart();
+                self_loop_nest = code.nest;
+            }
+            BlockCompiler compiler{block, target, code, kLocalBase, cached_ptr, regs_ptr};
             compiler.Prepare();
             if (block.cond != IR::Cond::AL) {
                 // Conditional A32 block: skip the body when the condition fails.
@@ -3463,6 +3663,9 @@ public:
             SubtractCycles(block.cycle_count);
             EmitTerminal(compiler, block.terminal);
             Exit();
+            if (self_loop) {
+                code.End();
+            }
         }
         code.End();  // loop
         code.End();  // exit block
@@ -3481,8 +3684,151 @@ public:
 private:
     static constexpr u32 kCurrent = 4;
     static constexpr u32 kCachedBase = 5;
+    /// Accesses to a guest register in a region before it is kept in a local.
+    static constexpr u32 kMinRegisterUses = 3;
+
+    /// The index in this region of the block at `location`, or kNone.
+    u32 RegionIndex(IR::LocationDescriptor location) const {
+        const IR::LocationDescriptor plain = target.a32 ? IR::LocationDescriptor{A32::LocationDescriptor{location}.SetSingleStepping(false)}
+                                                        : IR::LocationDescriptor{A64::LocationDescriptor{location}.SetSingleStepping(false)};
+        const auto it = index_of.find(plain.Value());
+        return it == index_of.end() ? kNone : it->second;
+    }
+
+    /// Successors of block `index` inside this region.
+    template<typename F>
+    void ForEachRegionSuccessor(u32 index, F&& f) const {
+        using namespace IR::Term;
+        const CompiledBlock& block = *blocks[index];
+        const auto link = [&](IR::LocationDescriptor next) {
+            if (const u32 successor = RegionIndex(next); successor != kNone) {
+                f(successor);
+            }
+        };
+        if (block.cond != IR::Cond::AL) {
+            link(block.cond_failed_location);
+        }
+        const auto leaf = [&](const LeafTerminal& term) {
+            std::visit([&](const auto& t) {
+                using T = std::decay_t<decltype(t)>;
+                if constexpr (std::is_same_v<T, LinkBlock> || std::is_same_v<T, LinkBlockFast>) {
+                    link(t.next);
+                }
+            }, term);
+        };
+        const IR::Term::Terminal& terminal = block.terminal;
+        std::visit([&](const auto& term) {
+            using T = std::decay_t<decltype(term)>;
+            if constexpr (std::is_same_v<T, LeafTerminal>) {
+                leaf(term);
+            } else if constexpr (std::is_same_v<T, If> || std::is_same_v<T, CheckBit>) {
+                leaf(term.then_);
+                leaf(term.else_);
+            } else if constexpr (std::is_same_v<T, CheckHalt>) {
+                leaf(term.else_);
+            }
+        }, terminal);
+    }
+
+    /// A64: computes which registers each block may read before writing them (liveness over the
+    /// region's blocks), and emits the entry: a dispatch on the entry block to a load of the
+    /// registers live into it.
+    bool EmitRegisterEntry() {
+        const u32 n = u32(blocks.size());
+        std::vector<u32> use(n), def(n), live(n);
+        std::array<u32, 32> uses{};
+        bool loops = false;
+        for (u32 i = 0; i < n; ++i) {
+            ForEachRegionSuccessor(i, [&](u32 next) { loops |= next <= i; });
+        }
+        regs.emplace();
+        regs->read_mask = 0;
+        regs->mask = 0;
+        for (u32 r = 0; r < 32; ++r) {
+            regs->local[r] = kCachedBase + r;
+        }
+        for (u32 i = 0; i < n; ++i) {
+            const CompiledBlock& block = *blocks[i];
+            for (const Op& op : block.ops) {
+                const auto reg = [&] { return block.constants[op.args[0] - block.first_constant].lo & 31; };
+                switch (op.opcode) {
+                case Opcode::A64GetW:
+                case Opcode::A64GetX:
+                    use[i] |= (1u << reg()) & ~def[i];
+                    regs->read_mask |= 1u << reg();
+                    ++uses[reg()];
+                    break;
+                case Opcode::A64GetSP:
+                    use[i] |= (1u << 31) & ~def[i];
+                    regs->read_mask |= 1u << 31;
+                    ++uses[31];
+                    break;
+                case Opcode::A64SetW:
+                case Opcode::A64SetX:
+                    def[i] |= 1u << reg();
+                    ++uses[reg()];
+                    break;
+                case Opcode::A64SetSP:
+                    def[i] |= 1u << 31;
+                    ++uses[31];
+                    break;
+                default:
+                    break;
+                }
+            }
+            live[i] = use[i];
+        }
+        // Loading the registers costs every entry into the region, which games make constantly:
+        // only regions that loop repay it, and only for registers they touch repeatedly.
+        if (loops) {
+            for (u32 r = 0; r < 32; ++r) {
+                if (uses[r] >= kMinRegisterUses) {
+                    regs->mask |= 1u << r;
+                }
+            }
+        }
+        if (regs->mask == 0) {
+            regs.reset();
+            return false;
+        }
+        regs->read_mask &= regs->mask;
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (u32 i = n; i-- > 0;) {
+                u32 out = 0;
+                ForEachRegionSuccessor(i, [&](u32 next) { out |= live[next]; });
+                const u32 in = use[i] | (out & ~def[i]);
+                if (in != live[i]) {
+                    live[i] = in;
+                    changed = true;
+                }
+            }
+        }
+
+        BlockCompiler loader{*blocks[0], target, code, kLocalBase, nullptr, &*regs};
+        code.BlockStart();
+        const u32 loaded_nest = code.nest;
+        for (u32 i = 0; i < n; ++i) {
+            code.BlockStart();
+        }
+        code.Get(kEntry);
+        code.Byte(Insn::I32WrapI64);
+        code.Byte(0x0E);  // br_table
+        code.U32(n);
+        for (u32 i = 0; i < n; ++i) {
+            code.U32(i);
+        }
+        code.U32(n - 1);
+        for (u32 i = 0; i < n; ++i) {
+            code.End();
+            loader.LoadRegisters(live[i]);
+            code.BrTo(loaded_nest);
+        }
+        code.End();
+        return true;
+    }
     static constexpr u32 kLocalBase = kV128C + 1;
-    static_assert(kCachedBase + 20 == kF32A);
+    static_assert(kCachedBase + 32 == kF32A);
 
     void Exit() {
         code.BrTo(exit_nest);
@@ -3501,11 +3847,11 @@ private:
         code.Byte(Insn::I32And);
         code.If();
         // location = (pc & pc_mask) | ((fpcr & fpcr_mask) << fpcr_shift)
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Mem(Insn::I64Load, target.pc_offset);
         code.I64Const(A64::LocationDescriptor::pc_mask);
         code.Byte(Insn::I64And);
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Mem(Insn::I64Load32U, target.fpcr_offset);
         code.I64Const(A64::LocationDescriptor::fpcr_mask);
         code.Byte(Insn::I64And);
@@ -3514,7 +3860,7 @@ private:
         code.Byte(Insn::I64Or);
         code.Set(kLocation);
         // entry = table + IndexOf(location) * sizeof(DispatchEntry)
-        code.Get(kState);
+        PushBase(code, target, kState);
         code.Mem(Insn::I64Load, target.dispatch_table_offset);
         code.Get(kLocation);
         code.Get(kLocation);
@@ -3590,9 +3936,7 @@ private:
                 EmitLeaf(term.else_);
                 code.End();
             } else if constexpr (std::is_same_v<T, CheckBit>) {
-                code.Get(kState);
-                code.Mem(Insn::I64Load8U, target.check_bit_offset);
-                code.Byte(Insn::I32WrapI64);
+                compiler.PushCheckBit();
                 code.If();
                 EmitLeaf(term.then_);
                 code.Else();
@@ -3639,17 +3983,17 @@ private:
                 code.I64Const(plain.PC());
                 code.Set(cached->reg[15]);
             } else {
-                code.Get(kState);
+                PushBase(code, target, kState);
                 code.I64Const(plain.PC());
                 code.Mem(Insn::I64Store32, target.reg_offset + 4 * 15);
             }
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.I64Const(u32(plain.UniqueHash() >> 32));
             code.Mem(Insn::I64Store32, target.upper_offset);
         } else {
             const A64::LocationDescriptor a64{next};
             location = a64.SetSingleStepping(false);
-            code.Get(kState);
+            PushBase(code, target, kState);
             code.I64Const(a64.PC());
             code.Mem(Insn::I64Store, target.pc_offset);
         }
@@ -3659,24 +4003,36 @@ private:
             Exit();
             return;
         }
-        code.I64Const(it->second);
-        code.Set(kCurrent);
-        if (it->second > current_index && !target.cycle_counting) {
-            // Without cycle counting only loops need to observe halts, and forward edges cannot
-            // loop; check halts on backward edges only.
-            code.BrTo(loop_nest);
+        const u32 next_index = it->second;
+        const bool forward = next_index > current_index;
+        if (!forward || target.cycle_counting) {
+            // Continue while cycles remain and nothing asked execution to halt. Without cycle
+            // counting only loops need to observe halts, and forward edges cannot loop.
+            PushCycles();
+            code.I64Const(0);
+            code.Byte(Insn::I64LeS);
+            PushHalted();
+            code.Byte(Insn::I32Or);
+            code.If();
+            Exit();
+            code.End();
+        }
+        if (forward) {
+            code.BrTo(LabelNest(next_index));
             return;
         }
-        // Continue while cycles remain and nothing asked execution to halt.
-        PushCycles();
-        code.I64Const(0);
-        code.Byte(Insn::I64LeS);
-        PushHalted();
-        code.Byte(Insn::I32Or);
-        code.If();
-        Exit();
-        code.End();
+        if (next_index == current_index && self_loop_nest != 0) {
+            code.BrTo(self_loop_nest);
+            return;
+        }
+        code.I64Const(next_index);
+        code.Set(kCurrent);
         code.BrTo(loop_nest);
+    }
+
+    /// Nesting depth at which the label that ends right before block `index` was opened.
+    u32 LabelNest(u32 index) const {
+        return loop_nest + block_count - index;
     }
 
     void BuildModule(std::vector<u8>& out, u32 locals_end) {
@@ -3751,6 +4107,23 @@ private:
         bodies.Sized(body);
         Section(module, 10, bodies);
 
+        if (RegionNamesEnabled()) {
+            // Names the function after the guest entry point, so profilers attribute time per region.
+            const u64 location = blocks.front()->location.Value();
+            const u64 pc = target.a32 ? u64(A32::LocationDescriptor{IR::LocationDescriptor{location}}.PC())
+                                      : A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC();
+            const std::string name = fmt::format("r{:x}_{}", pc, blocks.size());
+            Writer function_names;
+            function_names.U32(1);
+            function_names.U32(0);
+            function_names.Name(name.c_str());
+            Writer names;
+            names.Name("name");
+            names.Byte(1);
+            names.Sized(function_names);
+            Section(module, 0, names);
+        }
+
         out = std::move(module.bytes);
     }
 
@@ -3766,7 +4139,11 @@ private:
     u32 loop_nest = 0;
     u32 exit_nest = 0;
     u32 current_index = 0;
+    u32 block_count = 0;
+    /// Nesting depth of the loop around the current block when it links to itself, or 0.
+    u32 self_loop_nest = 0;
     std::optional<RegionLocals> cached;
+    std::optional<RegisterLocals> regs;
 };
 
 }  // Anonymous namespace
@@ -3795,6 +4172,12 @@ bool CompileRegion(const std::vector<CompiledBlock*>& blocks, const JitTarget& t
     const u64 start = NowUs();
     RegionCompiler compiler{blocks, target};
     const bool ok = compiler.Compile(out);
+    if (ok && std::getenv("EDEN_JIT_DUMP_DIR")) {
+        const u64 location = blocks.front()->location.Value();
+        const u64 pc = target.a32 ? u64(A32::LocationDescriptor{IR::LocationDescriptor{location}}.PC())
+                                  : A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC();
+        dynarmic_wasm_dump(out.data(), out.size(), pc, blocks.size());
+    }
     g_compile_count.fetch_add(1, std::memory_order_relaxed);
     g_compile_us.fetch_add(NowUs() - start, std::memory_order_relaxed);
     g_compile_bytes.fetch_add(out.size(), std::memory_order_relaxed);
@@ -3935,6 +4318,11 @@ bool RegionAllowedAt(u64 pc) {
         return std::pair<u64, u64>{lo, hi};
     }();
     return pc >= range.first && pc < range.second;
+}
+
+bool RegionNamesEnabled() {
+    static const bool enabled = std::getenv("EDEN_JIT_NAMES") != nullptr;
+    return enabled;
 }
 
 bool WasmJitEnabled() {
