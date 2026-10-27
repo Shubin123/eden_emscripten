@@ -7,11 +7,19 @@
 #pragma once
 
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
 
 namespace Dynarmic::Backend::Interp::Wasm {
+
+/// Values of the metadata.code.branch_hint section.
+enum class BranchHint : u8 {
+    Unlikely = 0,
+    Likely = 1,
+    None = 2,
+};
 
 enum class ValType : u8 {
     I32 = 0x7F,
@@ -175,15 +183,25 @@ public:
         U32(0);
         U64(offset);
     }
-    void If() {
+    /// `unlikely`/`likely` say whether the then-branch (or a taken br_if) is rare or common, which
+    /// V8 uses to lay rare code out of line (WebAssembly branch hinting).
+    void If(BranchHint hint = BranchHint::None) {
+        Hint(hint);
         Byte(Insn::If);
         Byte(0x40);
         ++nest;
     }
-    void IfI64() {
+    void IfI64(BranchHint hint = BranchHint::None) {
+        Hint(hint);
         Byte(Insn::If);
         Byte(u8(ValType::I64));
         ++nest;
+    }
+    /// Branches `depth` constructs out when the i32 on the stack is non-zero.
+    void BrIf(u32 depth, BranchHint hint = BranchHint::None) {
+        Hint(hint);
+        Byte(Insn::BrIf);
+        U32(depth);
     }
     void Else() {
         Byte(Insn::Else);
@@ -210,6 +228,16 @@ public:
 
     /// Number of currently open structured control constructs.
     u32 nest = 0;
+
+    /// Branch hints recorded so far: offset of the instruction in this code, and the hint.
+    std::vector<std::pair<u32, BranchHint>> hints;
+
+private:
+    void Hint(BranchHint hint) {
+        if (hint != BranchHint::None) {
+            hints.emplace_back(u32(bytes.size()), hint);
+        }
+    }
 };
 
 }  // namespace Dynarmic::Backend::Interp::Wasm

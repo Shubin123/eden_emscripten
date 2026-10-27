@@ -61,6 +61,13 @@ EM_JS(void, dynarmic_wasm_release, (uint64_t index), {
     (globalThis.dynarmicFreeSlots ??= []).push(index);
 });
 
+// Debug (Node): writes each compiled module to $EDEN_JIT_DUMP_DIR/r<entry pc>_<blocks>.wasm.
+EM_JS(void, dynarmic_wasm_dump, (const void* data, size_t size, uint64_t pc, uint64_t blocks), {
+    if (typeof process == 'undefined' || !process.env || !process.env.EDEN_JIT_DUMP_DIR) return;
+    const name = process.env.EDEN_JIT_DUMP_DIR + '/r' + pc.toString(16) + '_' + blocks + '.wasm';
+    require('fs').writeFileSync(name, HEAPU8.slice(Number(data), Number(data) + Number(size)));
+});
+
 namespace Dynarmic::Backend::Interp {
 
 using IR::Opcode;
@@ -737,8 +744,7 @@ private:
         And(0xFFF);
         code.I64Const(0x1000 - bytes);
         code.Byte(Insn::I64GtU);
-        code.Byte(Insn::BrIf);
-        code.U32(0);
+        code.BrIf(0, BranchHint::Unlikely);
         const bool use_tlb = cached && target.absolute_offset_page_table;
         if (use_tlb) {
             // One-entry translation cache: same page as the previous access.
@@ -770,8 +776,7 @@ private:
                 Shr(index_bits);
                 code.I64Const(0);
                 code.Byte(Insn::I64Ne);
-                code.Byte(Insn::BrIf);
-                code.U32(0);
+                code.BrIf(0, BranchHint::Unlikely);
             }
         }
         code.Get(tmp2);
@@ -785,8 +790,7 @@ private:
             Shr(*target.page_table_marked_bit);
             And(1);
             code.Byte(Insn::I32WrapI64);
-            code.Byte(Insn::BrIf);
-            code.U32(0);
+            code.BrIf(0, BranchHint::Unlikely);
         }
         if (target.page_table_pointer_mask != 0) {
             code.Get(tmp2);
@@ -798,8 +802,7 @@ private:
         }
         code.Get(tmp2);
         code.Byte(Insn::I64Eqz);
-        code.Byte(Insn::BrIf);
-        code.U32(0);
+        code.BrIf(0, BranchHint::Unlikely);
         if (use_tlb) {
             code.Get(tmp2);
             code.Set(cached->tlb_base);
@@ -827,7 +830,7 @@ private:
         EmitHostAddress(bytes);
         code.Get(tmp1);
         code.Byte(Insn::I64Eqz);
-        code.IfI64();
+        code.IfI64(BranchHint::Unlikely);
         {
             SpillArg(op, 1);
             CallHelper(index);
@@ -864,7 +867,7 @@ private:
         EmitHostAddress(16);
         code.Get(tmp1);
         code.Byte(Insn::I64Eqz);
-        code.If();
+        code.If(BranchHint::Unlikely);
         {
             SpillArg(op, 1);
             CallHelper(index);
@@ -890,7 +893,7 @@ private:
         EmitHostAddress(16);
         code.Get(tmp1);
         code.Byte(Insn::I64Eqz);
-        code.If();
+        code.If(BranchHint::Unlikely);
         {
             SpillArg(op, 1);
             CallHelper(index);
@@ -993,7 +996,7 @@ private:
             EmitHostAddress(bytes);
             code.Get(tmp1);
             code.Byte(Insn::I64Eqz);
-            code.IfI64();
+            code.IfI64(BranchHint::Unlikely);
             {
                 SpillArg(op, 1);
                 SpillArg(op, 2);
@@ -1051,7 +1054,7 @@ private:
         EmitHostAddress(bytes);
         code.Get(tmp1);
         code.Byte(Insn::I64Eqz);
-        code.If();
+        code.If(BranchHint::Unlikely);
         {
             SpillArg(op, 1);
             SpillArg(op, 2);
@@ -1621,7 +1624,7 @@ private:
                     code.Byte(Insn::I32Or);
                 }
             }
-            code.If();
+            code.If(BranchHint::Unlikely);
             CallHelper(index);
             code.Else();
             code.Get(kV128C);
@@ -1655,7 +1658,7 @@ private:
                 code.Byte(Insn::I32Or);
             }
         }
-        code.IfI64();
+        code.IfI64(BranchHint::Unlikely);
         for (size_t i = 0; i < num_inputs; ++i) {
             SpillArg(op, i);
         }
@@ -1679,7 +1682,7 @@ private:
             PushSpecialFloat(is64, true, fz);
             code.Byte(Insn::I32Or);
         }
-        code.IfI64();
+        code.IfI64(BranchHint::Unlikely);
         SpillArg(op, 0);
         SpillArg(op, 1);
         SpillArg(op, 2);
@@ -3499,7 +3502,7 @@ private:
         PushHalted();
         code.Byte(Insn::I32Eqz);
         code.Byte(Insn::I32And);
-        code.If();
+        code.If(BranchHint::Likely);
         // location = (pc & pc_mask) | ((fpcr & fpcr_mask) << fpcr_shift)
         code.Get(kState);
         code.Mem(Insn::I64Load, target.pc_offset);
@@ -3533,7 +3536,7 @@ private:
         code.Mem(Insn::I64Load, offsetof(DispatchEntry, location));
         code.Get(kLocation);
         code.Byte(Insn::I64Eq);
-        code.If();
+        code.If(BranchHint::Likely);
         code.Get(kState);
         code.Get(kFrame);
         code.Get(kImpl);
@@ -3600,7 +3603,7 @@ private:
                 code.End();
             } else if constexpr (std::is_same_v<T, CheckHalt>) {
                 PushHalted();
-                code.If();
+                code.If(BranchHint::Unlikely);
                 Exit();
                 code.End();
                 EmitLeaf(term.else_);
@@ -3673,7 +3676,7 @@ private:
         code.Byte(Insn::I64LeS);
         PushHalted();
         code.Byte(Insn::I32Or);
-        code.If();
+        code.If(BranchHint::Unlikely);
         Exit();
         code.End();
         code.BrTo(loop_nest);
@@ -3743,8 +3746,27 @@ private:
         body.Byte(0x7B);  // v128
         body.U32(locals_end - kLocalBase);
         body.Byte(u8(ValType::I64));
+        const u32 code_start = u32(body.bytes.size());
         body.Append(code);
         body.Byte(Insn::End);
+
+        // Branch hints (a custom section that must precede the code section). Offsets are from
+        // the start of the function body, which begins with the local declarations.
+        if (!code.hints.empty()) {
+            Writer hints;
+            hints.U32(1);  // functions with hints
+            hints.U32(0);  // function index
+            hints.U32(u32(code.hints.size()));
+            for (const auto& [offset, hint] : code.hints) {
+                hints.U32(code_start + offset);
+                hints.U32(1);
+                hints.Byte(u8(hint));
+            }
+            Writer section;
+            section.Name("metadata.code.branch_hint");
+            section.Append(hints);
+            Section(module, 0, section);
+        }
 
         Writer bodies;
         bodies.U32(1);
@@ -3795,6 +3817,12 @@ bool CompileRegion(const std::vector<CompiledBlock*>& blocks, const JitTarget& t
     const u64 start = NowUs();
     RegionCompiler compiler{blocks, target};
     const bool ok = compiler.Compile(out);
+    if (ok && std::getenv("EDEN_JIT_DUMP_DIR")) {
+        const u64 location = blocks.front()->location.Value();
+        const u64 pc = target.a32 ? u64(A32::LocationDescriptor{IR::LocationDescriptor{location}}.PC())
+                                  : A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC();
+        dynarmic_wasm_dump(out.data(), out.size(), pc, blocks.size());
+    }
     g_compile_count.fetch_add(1, std::memory_order_relaxed);
     g_compile_us.fetch_add(NowUs() - start, std::memory_order_relaxed);
     g_compile_bytes.fetch_add(out.size(), std::memory_order_relaxed);
