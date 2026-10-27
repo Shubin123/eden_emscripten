@@ -552,7 +552,9 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
     if (kind == TextureKind::Float && IsUnfilterable(host_format)) {
         kind = TextureKind::UnfilterableFloat;
     }
-    has_stencil = format_info.stencil;
+    // WebGPU wants stencil load and store ops whenever the attachment's format has stencil, also
+    // when the guest views a depth-stencil image through a depth-only format.
+    has_stencil = HasStencilAspect(host_format);
     view_width = std::max(1u, image.info.size.width >> info.range.base.level);
     view_height = std::max(1u, image.info.size.height >> info.range.base.level);
 

@@ -7,6 +7,7 @@
 
 #include "common/logging.h"
 #include "video_core/renderer_webgpu/wgpu_blit.h"
+#include "video_core/renderer_webgpu/wgpu_formats.h"
 #include "video_core/renderer_webgpu/wgpu_texture_cache.h"
 #include "video_core/renderer_webgpu/wgpu_thread.h"
 
@@ -246,6 +247,7 @@ void Blitter::Blit(const wgpu::TextureView& dst, wgpu::TextureFormat dst_format,
     if (IsDepthFormat(dst_format)) {
         targets.depth_stencil = dst;
         targets.depth_format = dst_format;
+        targets.has_stencil = HasStencilAspect(dst_format);
     } else {
         targets.colors[0] = dst;
         targets.color_formats[0] = dst_format;

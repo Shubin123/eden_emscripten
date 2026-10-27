@@ -51,4 +51,7 @@ bool IsViewCompatible(wgpu::TextureFormat base, wgpu::TextureFormat view);
 /// sRGB/linear twin of a format, or Undefined.
 wgpu::TextureFormat SrgbTwin(wgpu::TextureFormat format);
 
+/// Whether a host format has a stencil aspect (render passes then need stencil load/store ops).
+bool HasStencilAspect(wgpu::TextureFormat format);
+
 } // namespace WebGPU

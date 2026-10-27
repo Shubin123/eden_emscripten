@@ -847,10 +847,7 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
             depth_stencil.depthCompare = dynamic.depth_test_enable
                                              ? MaxwellToWGPU::Compare(dynamic.DepthTestFunc())
                                              : wgpu::CompareFunction::Always;
-            const bool has_stencil = variant_key.depth_format == wgpu::TextureFormat::Depth24PlusStencil8 ||
-                                     variant_key.depth_format == wgpu::TextureFormat::Depth32FloatStencil8 ||
-                                     variant_key.depth_format == wgpu::TextureFormat::Stencil8;
-            if (has_stencil && dynamic.stencil_enable) {
+            if (HasStencilAspect(variant_key.depth_format) && dynamic.stencil_enable) {
                 const auto face = [](const auto& f) {
                     wgpu::StencilFaceState s{};
                     s.compare = MaxwellToWGPU::Compare(f.TestFunc());

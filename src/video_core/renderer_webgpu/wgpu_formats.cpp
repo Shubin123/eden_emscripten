@@ -244,6 +244,12 @@ void ConvertTexels(Conversion conversion, std::span<const u8> input, std::vector
     }
 }
 
+bool HasStencilAspect(wgpu::TextureFormat format) {
+    return format == wgpu::TextureFormat::Depth24PlusStencil8 ||
+           format == wgpu::TextureFormat::Depth32FloatStencil8 ||
+           format == wgpu::TextureFormat::Stencil8;
+}
+
 wgpu::TextureFormat SrgbTwin(wgpu::TextureFormat format) {
     static constexpr std::array<std::pair<TF, TF>, 24> pairs{{
         {TF::RGBA8Unorm, TF::RGBA8UnormSrgb}, {TF::BGRA8Unorm, TF::BGRA8UnormSrgb},
