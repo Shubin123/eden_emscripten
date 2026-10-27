@@ -7,6 +7,9 @@
  */
 
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -202,7 +205,18 @@ void RunTestInstance(A64::Jit& jit,
         jit.ClearCache();
 
         jit_env.ticks_left = ticks_left;
+        // EDEN_BENCH_TICKS runs that many guest instructions instead, and reports the rate on stderr.
+        const char* bench = std::getenv("EDEN_BENCH_TICKS");
+        if (bench) {
+            jit_env.ticks_left = std::strtoull(bench, nullptr, 10);
+        }
+        const auto start = std::chrono::steady_clock::now();
         jit.Run();
+        if (bench) {
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "bench: %.1f M guest instructions/s\n",
+                         double(std::strtoull(bench, nullptr, 10) - jit_env.ticks_left) / seconds / 1e6);
+        }
     }
 
     fmt::print("instructions:");

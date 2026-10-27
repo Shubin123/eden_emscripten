@@ -8,6 +8,8 @@
 //
 //   node wasm_jit_diff.mjs <dir with dynarmic_test_reader.js and dynarmic_test_generator.js>
 //       [--seeds N] [--iterations N]
+// wasm_jit_programs.mjs adds multi-block loops, calls and every condition code, in seconds, and
+// measures guest instructions per second for comparing builds.
 
 import { spawn } from 'node:child_process';
 import os from 'node:os';

@@ -792,6 +792,15 @@ int main(int argc, char** argv) {
     const int seconds = argc > 2 ? std::atoi(argv[2]) : 60;
     // --tap-a=<s>: from <s> seconds after start, toggle A every main-loop tick to get past menus.
     int tap_a_after = -1;
+    // --tap-a-frames=<first>:<every>: press A for a few frames every <every> game frames from frame
+    // <first>; --measure-frames=<from>:<to> reports the time and guest work between those game
+    // frames and exits. Input timed by game frames reaches the same game state on any build.
+    u64 tap_first = 0, tap_every = 0, measure_from = 0, measure_to = 0;
+    const auto parse_pair = [](std::string_view text, u64& a, u64& b) {
+        const size_t colon = text.find(':');
+        a = std::strtoull(std::string{text.substr(0, colon)}.c_str(), nullptr, 10);
+        b = colon == std::string_view::npos ? 0 : std::strtoull(std::string{text.substr(colon + 1)}.c_str(), nullptr, 10);
+    };
     for (int i = 3; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (arg == "--stats") {
@@ -811,19 +820,47 @@ int main(int argc, char** argv) {
             tap_a_after = std::atoi(std::string{arg.substr(8)}.c_str());
         } else if (arg.starts_with("--dump=")) {
             setenv("EDEN_INTERP_DUMP", std::string{arg.substr(7)}.c_str(), 1);
+        } else if (arg.starts_with("--tap-a-frames=")) {
+            parse_pair(arg.substr(15), tap_first, tap_every);
+        } else if (arg.starts_with("--measure-frames=")) {
+            parse_pair(arg.substr(17), measure_from, measure_to);
         }
     }
     PushRequest({Request::Kind::Boot, argv[1]});
     const auto start = std::chrono::steady_clock::now();
     const auto deadline = start + std::chrono::seconds(seconds);
     bool tap_a_pressed = false;
+    const bool frame_timed = tap_every != 0 || measure_to != 0;
+    auto last_report = start;
+    struct Mark {
+        std::chrono::steady_clock::time_point at;
+        double cpu_seconds;
+        std::array<Dynarmic::ExecStats, Core::Hardware::NUM_CPU_CORES> cores;
+    };
+    std::optional<Mark> measure_start;
+    const auto mark = [] {
+        // CPU time of the whole process (every thread), which other load on the machine barely
+        // changes, unlike wall time.
+        const double cpu = EM_ASM_DOUBLE({
+            const usage = process.cpuUsage();
+            return (usage.user + usage.system) / 1e6;
+        });
+        Mark m{std::chrono::steady_clock::now(), cpu, {}};
+        for (u32 core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+            m.cores[core] = Dynarmic::GetExecStats(core);
+        }
+        return m;
+    };
+#else
+    constexpr bool frame_timed = false;
 #endif
 
     for (;;) {
         std::optional<Request> request;
         {
             std::unique_lock lock{g_request_mutex};
-            g_request_cv.wait_for(lock, std::chrono::seconds(1),
+            // Frame-timed headless runs poll often enough to act on individual game frames.
+            g_request_cv.wait_for(lock, frame_timed ? std::chrono::milliseconds(2) : std::chrono::milliseconds(1000),
                                   [] { return !g_requests.empty() || g_camera_pending; });
             if (!g_requests.empty()) {
                 request = std::move(g_requests.front());
@@ -871,7 +908,37 @@ int main(int argc, char** argv) {
             tap_a_pressed = !tap_a_pressed;
             emulator->SetButton(0, 0, tap_a_pressed);
         }
-        if (g_state == int(EmuState::Running)) {
+        const u64 game_frame = Core::PerfStats::GetGameFrameCount();
+        if (tap_every != 0 && g_state == int(EmuState::Running) && game_frame >= tap_first) {
+            const bool press = (game_frame - tap_first) % tap_every < 6;
+            if (press != tap_a_pressed) {
+                tap_a_pressed = press;
+                emulator->SetButton(0, 0, press);
+            }
+        }
+        if (measure_to != 0 && g_state == int(EmuState::Running)) {
+            if (!measure_start && game_frame >= measure_from) {
+                measure_start = mark();
+            } else if (measure_start && game_frame >= measure_to) {
+                const Mark end = mark();
+                const double wall = std::chrono::duration<double>(end.at - measure_start->at).count();
+                u64 cycles = 0, busy = 0;
+                for (u32 core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+                    cycles += end.cores[core].cycles - measure_start->cores[core].cycles;
+                    busy += end.cores[core].busy_ns - measure_start->cores[core].busy_ns;
+                }
+                const u64 core0 = end.cores[0].cycles - measure_start->cores[0].cycles;
+                const u64 core0_busy = end.cores[0].busy_ns - measure_start->cores[0].busy_ns;
+                std::fprintf(stderr, "measure: frames %llu-%llu in %.2f s, cpu %.2f s, %.1f fps, guest %.1f M cycles per busy s, core 0 %.1f M cycles/s %.1f M per busy s\n",
+                             (unsigned long long)measure_from, (unsigned long long)measure_to, wall, end.cpu_seconds - measure_start->cpu_seconds,
+                             double(measure_to - measure_from) / wall, busy ? double(cycles) / (double(busy) / 1e9) / 1e6 : 0.0,
+                             double(core0) / wall / 1e6, core0_busy ? double(core0) / (double(core0_busy) / 1e9) / 1e6 : 0.0);
+                break;
+            }
+        }
+        if (g_state == int(EmuState::Running) &&
+            std::chrono::steady_clock::now() - last_report >= std::chrono::seconds(1)) {
+            last_report = std::chrono::steady_clock::now();
             // Guest cycles per real second, and per second the cores spent executing: the second
             // measures CPU emulation speed even when a game is capped at its frame rate.
             static u64 last_cycles = 0, last_busy = 0;
