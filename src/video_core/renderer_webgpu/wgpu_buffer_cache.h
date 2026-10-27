@@ -195,6 +195,7 @@ private:
 
     std::vector<BufferDescriptor> descriptors;
     std::vector<u32> index_scratch;
+    wgpu::Buffer copy_scratch;
 };
 
 struct BufferCacheParams {

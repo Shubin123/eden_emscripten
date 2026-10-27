@@ -155,6 +155,9 @@ void BufferCacheRuntime::CopyBuffer(const wgpu::Buffer& dst, const wgpu::Buffer&
         return;
     }
     auto& encoder = scheduler.Encoder();
+    // WebGPU rejects copies within one buffer, even between disjoint ranges, and the error
+    // invalidates the whole command buffer; those go through a scratch buffer.
+    const bool same_buffer = dst.Get() == src.Get();
     for (const VideoCommon::BufferCopy& copy : copies) {
         // Buffer copies must be four byte aligned.
         const u64 src_offset = Common::AlignDown(copy.src_offset, 4);
@@ -162,9 +165,21 @@ void BufferCacheRuntime::CopyBuffer(const wgpu::Buffer& dst, const wgpu::Buffer&
         const u64 size = Common::AlignUp(copy.size + (copy.src_offset - src_offset), 4);
         const u64 limit = std::min(src.GetSize() - src_offset, dst.GetSize() - dst_offset);
         const u64 clamped = std::min(size, Common::AlignDown(limit, 4));
-        if (clamped > 0) {
-            encoder.CopyBufferToBuffer(src, src_offset, dst, dst_offset, clamped);
+        if (clamped == 0) {
+            continue;
         }
+        if (!same_buffer) {
+            encoder.CopyBufferToBuffer(src, src_offset, dst, dst_offset, clamped);
+            continue;
+        }
+        if (!copy_scratch || copy_scratch.GetSize() < clamped) {
+            wgpu::BufferDescriptor desc{};
+            desc.size = Common::AlignUp(clamped, u64{64} << 10);
+            desc.usage = wgpu::BufferUsage::CopySrc | wgpu::BufferUsage::CopyDst;
+            copy_scratch = Thread::Get().device.CreateBuffer(&desc);
+        }
+        encoder.CopyBufferToBuffer(src, src_offset, copy_scratch, 0, clamped);
+        encoder.CopyBufferToBuffer(copy_scratch, 0, dst, dst_offset, clamped);
     }
 }
 
