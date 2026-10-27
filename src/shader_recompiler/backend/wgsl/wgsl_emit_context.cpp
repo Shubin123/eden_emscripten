@@ -277,7 +277,7 @@ void EmitContext::DefineStorageBuffers(Bindings& bindings) {
     for (const auto& desc : info.storage_buffers_descriptors) {
         count += desc.count;
     }
-    packed_ssbo_first = PackedSsboFirst(count, options.max_storage_buffers);
+    packed_ssbo_first = PackedSsboFirst(count, options.max_storage_buffers, options.pack_all_ssbos);
     const auto element{uses_storage_atomics ? "atomic<u32>" : "u32"};
     bool pack_writable{};
     u32 pack_binding{};

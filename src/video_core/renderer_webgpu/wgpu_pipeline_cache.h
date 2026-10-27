@@ -211,7 +211,9 @@ private:
 
     /// Translates the guest shader; builds `variant` unless only descriptor info is wanted.
     bool Translate(const std::vector<TextureSampleKind>& texture_kinds, Variant* variant,
-                   bool nested_barriers = false);
+                   bool pack_all = false, bool nested_barriers = false);
+    /// The variant for these texture kinds, with every storage buffer packed or not.
+    Variant& FindVariant(const std::vector<TextureSampleKind>& texture_kinds, bool pack_all);
 
     PipelineCache& cache;
     ComputePipelineKey key;
@@ -222,7 +224,7 @@ private:
     std::vector<size_t> written_entries;
     bool valid{};
 
-    std::map<std::vector<TextureSampleKind>, Variant> variants;
+    std::map<std::pair<std::vector<TextureSampleKind>, bool>, Variant> variants;
 };
 
 class PipelineCache : public VideoCommon::ShaderCache {

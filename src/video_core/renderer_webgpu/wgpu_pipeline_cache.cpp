@@ -1234,7 +1234,7 @@ ComputePipeline::ComputePipeline(PipelineCache& cache_, const ComputePipelineKey
 }
 
 bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_kinds,
-                                Variant* variant, bool nested_barriers) {
+                                Variant* variant, bool pack_all, bool nested_barriers) {
     auto& pools = cache.pools;
     pools.ReleaseContents();
     try {
@@ -1257,6 +1257,7 @@ bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_ki
         Options options;
         options.texture_kinds = texture_kinds;
         options.max_storage_buffers = cache.max_storage_buffers;
+        options.pack_all_ssbos = pack_all;
         options.max_samplers = cache.max_samplers;
         options.nested_barriers = nested_barriers;
         variant->nested_barriers = nested_barriers;
@@ -1280,7 +1281,7 @@ bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_ki
         }
         const u32 num_ssbos{Shader::NumDescriptors(info.storage_buffers_descriptors)};
         const u32 packed_first{
-            Shader::Backend::WGSL::PackedSsboFirst(num_ssbos, cache.max_storage_buffers)};
+            Shader::Backend::WGSL::PackedSsboFirst(num_ssbos, cache.max_storage_buffers, pack_all)};
         if (num_ssbos - packed_first > Shader::Backend::WGSL::MAX_PACKED_SSBOS) {
             LOG_WARNING(Render, "WebGPU: compute shader {:016x} uses too many storage buffers",
                         key.unique_hash);
@@ -1387,6 +1388,24 @@ bool ComputePipeline::Translate(const std::vector<TextureSampleKind>& texture_ki
     }
 }
 
+ComputePipeline::Variant& ComputePipeline::FindVariant(
+    const std::vector<TextureSampleKind>& texture_kinds, bool pack_all) {
+    auto [it, is_new] = variants.try_emplace(std::make_pair(texture_kinds, pack_all));
+    Variant& variant = it->second;
+    if (is_new && !Translate(texture_kinds, &variant, pack_all, true)) {
+        variant.failed = true;
+    }
+    if (!variant.failed && variant.nested_barriers && variant.creation_failed->load()) {
+        // Rebuild with barriers inside control flow dropped, as the IR pass would.
+        variant.creation_failed = std::make_shared<std::atomic<bool>>(false);
+        variant.pipeline = std::make_shared<wgpu::ComputePipeline>();
+        if (!Translate(texture_kinds, &variant, pack_all, false)) {
+            variant.failed = true;
+        }
+    }
+    return variant;
+}
+
 bool ComputePipeline::Configure() {
     if (!valid) {
         return false;
@@ -1449,25 +1468,45 @@ bool ComputePipeline::Configure() {
             }
         }
     }
-    auto [it, is_new] = variants.try_emplace(texture_kinds);
-    Variant& variant = it->second;
-    if (is_new && !Translate(texture_kinds, &variant, true)) {
-        variant.failed = true;
+    auto& descriptors = runtime.Descriptors();
+    const u32 num_cbufs{Shader::NumDescriptors(info.constant_buffer_descriptors)};
+    const u32 num_ssbos{Shader::NumDescriptors(info.storage_buffers_descriptors)};
+    if (descriptors.size() < num_cbufs + num_ssbos) {
+        return false;
     }
-    if (!variant.failed && variant.nested_barriers && variant.creation_failed->load()) {
-        // Rebuild with barriers inside control flow dropped, as the IR pass would.
-        variant.creation_failed = std::make_shared<std::atomic<bool>>(false);
-        variant.pipeline = std::make_shared<wgpu::ComputePipeline>();
-        if (!Translate(texture_kinds, &variant, false)) {
-            variant.failed = true;
+    // WebGPU forbids a writable binding overlapping another binding of the same buffer. Storage
+    // buffers the guest binds over each other are then all read through the packed binding, where
+    // the overlapping ranges share one copy.
+    const auto overlaps_written = [&](const Variant& variant) {
+        const auto writable = [&](u32 index) {
+            return index < variant.storage_writable.size() && variant.storage_writable[index];
+        };
+        for (u32 a = 0; a < num_ssbos; ++a) {
+            const BufferDescriptor& first = descriptors[num_cbufs + a];
+            for (u32 b = a + 1; b < num_ssbos; ++b) {
+                const BufferDescriptor& second = descriptors[num_cbufs + b];
+                if (first.buffer && first.buffer.Get() == second.buffer.Get() &&
+                    (writable(a) || writable(b)) &&
+                    first.offset < second.offset + second.size &&
+                    second.offset < first.offset + first.size) {
+                    return true;
+                }
+            }
         }
+        return false;
+    };
+    Variant* selected = &FindVariant(texture_kinds, false);
+    const bool pack_all = !selected->failed && num_ssbos <= Shader::Backend::WGSL::MAX_PACKED_SSBOS &&
+                          overlaps_written(*selected);
+    if (pack_all) {
+        selected = &FindVariant(texture_kinds, true);
     }
+    Variant& variant = *selected;
     if (variant.failed || !*variant.pipeline) {
         return false;
     }
     pipeline = *variant.pipeline;
 
-    auto& descriptors = runtime.Descriptors();
     std::vector<wgpu::BindGroupEntry> entries;
     written_buffers.clear();
     read_buffers.clear();
@@ -1488,14 +1527,20 @@ bool ComputePipeline::Configure() {
             entry.size = size;
         }
     }
-    const u32 num_ssbos{Shader::NumDescriptors(info.storage_buffers_descriptors)};
     const u32 packed_first{
-        Shader::Backend::WGSL::PackedSsboFirst(num_ssbos, cache.max_storage_buffers)};
+        Shader::Backend::WGSL::PackedSsboFirst(num_ssbos, cache.max_storage_buffers, pack_all)};
     packed_copies.clear();
     shadow_copies.clear();
     written_entries.clear();
+    struct PackedRange {
+        wgpu::Buffer buffer;
+        u64 offset;
+        u64 size;
+        bool written;
+        size_t slot;
+    };
+    boost::container::small_vector<PackedRange, Shader::Backend::WGSL::MAX_PACKED_SSBOS> packed;
     std::array<u32, Shader::Backend::WGSL::MAX_PACKED_SSBOS> pack_bases{};
-    u64 pack_size{};
     u32 pack_binding{};
     size_t storage_index{};
     for (const auto& desc : info.storage_buffers_descriptors) {
@@ -1517,10 +1562,8 @@ bool ComputePipeline::Configure() {
                 }
                 const u64 size = std::min<u64>(Common::AlignUp(bound.size, 4),
                                                bound.buffer.GetSize() - bound.offset) & ~3ULL;
-                pack_bases[storage_index - packed_first] = static_cast<u32>(pack_size / 4);
-                packed_copies.push_back({bound.buffer, bound.offset, size, pack_size,
-                                         desc.is_written});
-                pack_size = Common::AlignUp(pack_size + size, 256);
+                packed.push_back({bound.buffer, bound.offset, size, desc.is_written,
+                                  storage_index - packed_first});
                 ++binding_index;
                 ++storage_index;
                 continue;
@@ -1538,6 +1581,26 @@ bool ComputePipeline::Configure() {
             }
             (writable ? written_buffers : read_buffers).push_back(bound.buffer.Get());
         }
+    }
+    // Overlapping packed ranges of one buffer become one copy, so the shader sees its writes
+    // through either of them.
+    std::ranges::sort(packed, {}, [](const PackedRange& range) {
+        return std::pair{reinterpret_cast<uintptr_t>(range.buffer.Get()), range.offset};
+    });
+    u64 pack_size{};
+    for (const PackedRange& range : packed) {
+        PackedCopy* copy = packed_copies.empty() ? nullptr : &packed_copies.back();
+        if (copy && copy->buffer.Get() == range.buffer.Get() &&
+            range.offset < copy->offset + copy->size) {
+            copy->size = std::max(copy->size, range.offset + range.size - copy->offset);
+            copy->written |= range.written;
+        } else {
+            copy = &packed_copies.emplace_back(range.buffer, range.offset, range.size, pack_size,
+                                               range.written);
+        }
+        pack_bases[range.slot] =
+            static_cast<u32>((copy->pack_offset + range.offset - copy->offset) / 4);
+        pack_size = Common::AlignUp(copy->pack_offset + copy->size, 256);
     }
     if (!packed_copies.empty()) {
         if (!cache.ssbo_pack || cache.ssbo_pack.GetSize() < pack_size) {

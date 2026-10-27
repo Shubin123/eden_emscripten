@@ -68,6 +68,9 @@ struct Options {
     /// Storage buffer bindings the stage may use; zero for no limit. Past it, the storage buffers
     /// from index max_storage_buffers - 1 on share one binding (see PackedSsboFirst).
     u32 max_storage_buffers = 0;
+    /// Read every storage buffer through the packed binding (see PackedSsboFirst), for buffers
+    /// the guest binds over each other, which WebGPU forbids as separate writable bindings.
+    bool pack_all_ssbos = false;
     /// Samplers the stage may use; zero for no limit. Past it, the textures from element
     /// max_samplers - 1 on share that element's sampler (see SharedSamplerFirst).
     u32 max_samplers = 0;
@@ -95,8 +98,13 @@ constexpr u32 MAX_PACKED_SSBOS = 16;
 /// Index of the first storage buffer read through the packed binding, or `count` when all storage
 /// buffers get their own binding. The packed binding takes the first packed buffer's binding
 /// number and is followed by a uniform array<vec4<u32>, 4> holding each packed buffer's base, in
-/// 32-bit words; the bindings of the remaining packed buffers are left unused.
-[[nodiscard]] constexpr u32 PackedSsboFirst(u32 count, u32 max_storage_buffers) {
+/// 32-bit words; the bindings of the remaining packed buffers are left unused. With `pack_all`,
+/// two to MAX_PACKED_SSBOS storage buffers are all packed.
+[[nodiscard]] constexpr u32 PackedSsboFirst(u32 count, u32 max_storage_buffers,
+                                            bool pack_all = false) {
+    if (pack_all && count >= 2 && count <= MAX_PACKED_SSBOS) {
+        return 0;
+    }
     if (max_storage_buffers < 2 || count <= max_storage_buffers) {
         return count;
     }
