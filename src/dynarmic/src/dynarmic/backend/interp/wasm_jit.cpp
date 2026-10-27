@@ -1243,6 +1243,38 @@ private:
         }
     }
 
+    /// Conversions between integers and floats whose native code matches the guest exactly, so
+    /// they need neither Unsafe_InaccurateNaN nor a slow path: integers never convert to NaN or a
+    /// denormal, and float-to-integer conversions flush denormal inputs as the guest does and
+    /// saturate NaN to zero like it. Only round to nearest-even is native for integer to float,
+    /// and ties-away rounding has no native counterpart for float to integer.
+    bool ExactConversion(const Op& op) const {
+        switch (op.opcode) {
+        case Opcode::FPSingleToFixedS32:
+        case Opcode::FPSingleToFixedU32:
+        case Opcode::FPSingleToFixedS64:
+        case Opcode::FPSingleToFixedU64:
+        case Opcode::FPDoubleToFixedS32:
+        case Opcode::FPDoubleToFixedU32:
+        case Opcode::FPDoubleToFixedS64:
+        case Opcode::FPDoubleToFixedU64:
+            return ConstantValue(op.args[2]) <= u64(FP::RoundingMode::TowardsZero);
+        case Opcode::FPFixedS32ToSingle:
+        case Opcode::FPFixedU32ToSingle:
+        case Opcode::FPFixedS32ToDouble:
+        case Opcode::FPFixedU32ToDouble:
+        case Opcode::FPFixedS64ToSingle:
+        case Opcode::FPFixedU64ToSingle:
+        case Opcode::FPFixedS64ToDouble:
+        case Opcode::FPFixedU64ToDouble:
+        case Opcode::FPVectorFromSignedFixed32:
+        case Opcode::FPVectorFromUnsignedFixed32:
+            return ConstantValue(op.args[2]) == u64(FP::RoundingMode::ToNearest_TieEven);
+        default:
+            return false;
+        }
+    }
+
     /// Flush-to-zero for a guarded op: ASIMD ops that ignore the FPCR use the standard value.
     bool GuardedFlushToZero(const Op& op) const {
         switch (op.opcode) {
@@ -1302,10 +1334,47 @@ private:
         case Opcode::VectorEqual32:
         case Opcode::VectorGetElement32:
         case Opcode::VectorGetElement64:
+        case Opcode::VectorSetElement8:
+        case Opcode::VectorSetElement16:
         case Opcode::VectorSetElement32:
         case Opcode::VectorSetElement64:
         case Opcode::VectorBroadcast32:
         case Opcode::VectorBroadcast64:
+        case Opcode::VectorTranspose8:
+        case Opcode::VectorTranspose16:
+        case Opcode::VectorTranspose32:
+        case Opcode::VectorTranspose64:
+        case Opcode::VectorInterleaveLower8:
+        case Opcode::VectorInterleaveLower16:
+        case Opcode::VectorInterleaveLower32:
+        case Opcode::VectorInterleaveLower64:
+        case Opcode::VectorInterleaveUpper8:
+        case Opcode::VectorInterleaveUpper16:
+        case Opcode::VectorInterleaveUpper32:
+        case Opcode::VectorInterleaveUpper64:
+        case Opcode::VectorExtract:
+        case Opcode::VectorExtractLower:
+        case Opcode::VectorLogicalShiftLeft8:
+        case Opcode::VectorLogicalShiftLeft16:
+        case Opcode::VectorLogicalShiftLeft32:
+        case Opcode::VectorLogicalShiftLeft64:
+        case Opcode::VectorLogicalShiftRight8:
+        case Opcode::VectorLogicalShiftRight16:
+        case Opcode::VectorLogicalShiftRight32:
+        case Opcode::VectorLogicalShiftRight64:
+        case Opcode::VectorArithmeticShiftRight8:
+        case Opcode::VectorArithmeticShiftRight16:
+        case Opcode::VectorArithmeticShiftRight32:
+        case Opcode::VectorArithmeticShiftRight64:
+        case Opcode::VectorSignExtend8:
+        case Opcode::VectorSignExtend16:
+        case Opcode::VectorSignExtend32:
+        case Opcode::VectorZeroExtend8:
+        case Opcode::VectorZeroExtend16:
+        case Opcode::VectorZeroExtend32:
+        case Opcode::VectorBroadcastLower8:
+        case Opcode::VectorBroadcastLower16:
+        case Opcode::VectorBroadcastLower32:
             return true;
         case Opcode::VectorBroadcastElementLower8:
         case Opcode::VectorBroadcastElementLower16:
@@ -1318,7 +1387,7 @@ private:
         default:
             break;
         }
-        if (GuardedFloat(op)) {
+        if (GuardedFloat(op) || ExactConversion(op)) {
             return true;
         }
         if (!NativeFloatAllowed()) {
@@ -1474,6 +1543,23 @@ private:
     void SimdOp(u32 opcode) {
         code.Byte(0xFD);
         code.U32(opcode);
+    }
+
+    /// Stores i8x16.shuffle of the first two arguments: lanes 0-15 pick bytes of the first,
+    /// 16-31 bytes of the second. `zero_upper` clears the upper 64 bits of the result.
+    void Shuffle(const Op& op, size_t index, const std::array<u8, 16>& lanes, bool zero_upper = false) {
+        PushV128(op, 0);
+        PushV128(op, 1);
+        SimdOp(13);  // i8x16.shuffle
+        for (const u8 lane : lanes) {
+            code.Byte(lane);
+        }
+        if (zero_upper) {
+            code.I64Const(0);
+            SimdOp(30);  // i64x2.replace_lane
+            code.Byte(1);
+        }
+        StoreV128(index);
     }
 
     /// Pushes a 128-bit argument (frame slot or constant).
@@ -2217,15 +2303,161 @@ private:
             Define(index);
             return true;
         }
+        case Opcode::VectorSetElement8:
+        case Opcode::VectorSetElement16:
         case Opcode::VectorSetElement32:
         case Opcode::VectorSetElement64: {
-            const bool is64 = op.opcode == Opcode::VectorSetElement64;
+            static constexpr u8 stores[] = {Insn::I64Store8, Insn::I64Store16, Insn::I64Store32, Insn::I64Store};
+            const size_t size_log2 = size_t(op.opcode) - size_t(Opcode::VectorSetElement8);
             const u64 element = ConstantValue(op.args[1]);
             PushV128(op, 0);
             StoreV128(index);
             code.Get(kFrame);
             PushArg(op, 2);
-            code.Mem(is64 ? Insn::I64Store : Insn::I64Store32, u64(index) * kSlotSize + kLoOffset + element * (is64 ? 8 : 4));
+            code.Mem(stores[size_log2], u64(index) * kSlotSize + kLoOffset + (element << size_log2));
+            return true;
+        }
+        case Opcode::VectorTranspose8:
+        case Opcode::VectorTranspose16:
+        case Opcode::VectorTranspose32:
+        case Opcode::VectorTranspose64: {
+            // r[i] = x[i + part], r[i + 1] = y[i + part] for even i.
+            const size_t esize = size_t(1) << (size_t(op.opcode) - size_t(Opcode::VectorTranspose8));
+            const size_t part = ConstantValue(op.args[2]) & 1;
+            std::array<u8, 16> lanes;
+            for (size_t lane = 0; lane < 16 / esize; ++lane) {
+                const size_t source = (lane & ~size_t(1)) + part;
+                for (size_t byte = 0; byte < esize; ++byte) {
+                    lanes[lane * esize + byte] = u8((lane & 1) * 16 + source * esize + byte);
+                }
+            }
+            Shuffle(op, index, lanes);
+            return true;
+        }
+        case Opcode::VectorInterleaveLower8:
+        case Opcode::VectorInterleaveLower16:
+        case Opcode::VectorInterleaveLower32:
+        case Opcode::VectorInterleaveLower64:
+        case Opcode::VectorInterleaveUpper8:
+        case Opcode::VectorInterleaveUpper16:
+        case Opcode::VectorInterleaveUpper32:
+        case Opcode::VectorInterleaveUpper64: {
+            // r[2i] = x[i + offset], r[2i + 1] = y[i + offset], from the lower or upper halves.
+            const bool upper = op.opcode >= Opcode::VectorInterleaveUpper8;
+            const size_t size_log2 = size_t(op.opcode) -
+                                     size_t(upper ? Opcode::VectorInterleaveUpper8 : Opcode::VectorInterleaveLower8);
+            const size_t esize = size_t(1) << size_log2;
+            const size_t half = 8 / esize;
+            std::array<u8, 16> lanes;
+            for (size_t lane = 0; lane < 16 / esize; ++lane) {
+                const size_t source = lane / 2 + (upper ? half : 0);
+                for (size_t byte = 0; byte < esize; ++byte) {
+                    lanes[lane * esize + byte] = u8((lane & 1) * 16 + source * esize + byte);
+                }
+            }
+            Shuffle(op, index, lanes);
+            return true;
+        }
+        case Opcode::VectorLogicalShiftLeft8:
+        case Opcode::VectorLogicalShiftLeft16:
+        case Opcode::VectorLogicalShiftLeft32:
+        case Opcode::VectorLogicalShiftLeft64:
+        case Opcode::VectorLogicalShiftRight8:
+        case Opcode::VectorLogicalShiftRight16:
+        case Opcode::VectorLogicalShiftRight32:
+        case Opcode::VectorLogicalShiftRight64:
+        case Opcode::VectorArithmeticShiftRight8:
+        case Opcode::VectorArithmeticShiftRight16:
+        case Opcode::VectorArithmeticShiftRight32:
+        case Opcode::VectorArithmeticShiftRight64: {
+            // shl, shr_s and shr_u for 8, 16, 32 and 64-bit lanes. WebAssembly takes the shift
+            // modulo the lane width; the guest clears logical shifts by the width or more and
+            // fills arithmetic ones with the sign.
+            static constexpr u32 shl[] = {107, 139, 171, 203};
+            static constexpr u32 shr_s[] = {108, 140, 172, 204};
+            static constexpr u32 shr_u[] = {109, 141, 173, 205};
+            size_t size_log2;
+            const u32* table;
+            if (op.opcode >= Opcode::VectorArithmeticShiftRight8 && op.opcode <= Opcode::VectorArithmeticShiftRight64) {
+                size_log2 = size_t(op.opcode) - size_t(Opcode::VectorArithmeticShiftRight8);
+                table = shr_s;
+            } else if (op.opcode >= Opcode::VectorLogicalShiftRight8) {
+                size_log2 = size_t(op.opcode) - size_t(Opcode::VectorLogicalShiftRight8);
+                table = shr_u;
+            } else {
+                size_log2 = size_t(op.opcode) - size_t(Opcode::VectorLogicalShiftLeft8);
+                table = shl;
+            }
+            const u64 width = u64(8) << size_log2;
+            u64 shift = ConstantValue(op.args[1]);
+            if (shift >= width && table != shr_s) {
+                V128Splat64(0);
+                StoreV128(index);
+                return true;
+            }
+            shift = std::min(shift, width - 1);
+            PushV128(op, 0);
+            code.I32Const(u32(shift));
+            SimdOp(table[size_log2]);
+            StoreV128(index);
+            return true;
+        }
+        case Opcode::VectorSignExtend8:
+        case Opcode::VectorSignExtend16:
+        case Opcode::VectorSignExtend32:
+        case Opcode::VectorZeroExtend8:
+        case Opcode::VectorZeroExtend16:
+        case Opcode::VectorZeroExtend32: {
+            // extend_low_s and extend_low_u to 16, 32 and 64-bit lanes.
+            static constexpr u32 extend_s[] = {135, 167, 199};
+            static constexpr u32 extend_u[] = {137, 169, 201};
+            const bool is_signed = op.opcode <= Opcode::VectorSignExtend32;
+            const size_t size_log2 = size_t(op.opcode) -
+                                     size_t(is_signed ? Opcode::VectorSignExtend8 : Opcode::VectorZeroExtend8);
+            PushV128(op, 0);
+            SimdOp(is_signed ? extend_s[size_log2] : extend_u[size_log2]);
+            StoreV128(index);
+            return true;
+        }
+        case Opcode::VectorBroadcastLower8:
+        case Opcode::VectorBroadcastLower16:
+        case Opcode::VectorBroadcastLower32: {
+            static constexpr u32 splat[] = {15, 16, 17};
+            PushArg(op, 0);
+            code.Byte(Insn::I32WrapI64);
+            SimdOp(splat[size_t(op.opcode) - size_t(Opcode::VectorBroadcastLower8)]);
+            code.I64Const(0);
+            SimdOp(30);  // i64x2.replace_lane
+            code.Byte(1);
+            StoreV128(index);
+            return true;
+        }
+        case Opcode::FPVectorFromSignedFixed32:
+        case Opcode::FPVectorFromUnsignedFixed32: {
+            // Exact at round to nearest: the conversion rounds once and scaling by a power of two
+            // cannot round, and integers never become NaN or a denormal.
+            const u64 fbits = ConstantValue(op.args[1]);
+            PushV128(op, 0);
+            SimdOp(op.opcode == Opcode::FPVectorFromSignedFixed32 ? 250 : 251);  // f32x4.convert_i32x4_s/u
+            if (fbits != 0) {
+                V128Splat(std::bit_cast<u32>(std::ldexp(1.0f, -int(fbits))));
+                SimdOp(230);  // f32x4.mul
+            }
+            StoreV128(index);
+            return true;
+        }
+        case Opcode::VectorExtract:
+        case Opcode::VectorExtractLower: {
+            // Bytes from position on of y:x (the lower halves for ExtractLower, upper half zero).
+            const bool lower = op.opcode == Opcode::VectorExtractLower;
+            const size_t bytes = size_t(ConstantValue(op.args[2]) / 8);
+            const size_t width = lower ? 8 : 16;
+            std::array<u8, 16> lanes{};
+            for (size_t i = 0; i < width; ++i) {
+                const size_t j = i + bytes;
+                lanes[i] = u8(j < width ? j : 16 + j - width);
+            }
+            Shuffle(op, index, lanes, lower);
             return true;
         }
         case Opcode::VectorBroadcast32:

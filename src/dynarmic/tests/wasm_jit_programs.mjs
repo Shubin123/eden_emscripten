@@ -36,15 +36,34 @@ const PROGRAMS = {
         0xca030020, 0x91001c00, 0x93c00c00, 0xd65f03c0],
     // A block that loops on itself (subs; b.ne) inside an outer loop.
     self: [0x91000421, 0xca010042, 0x8b020863, 0xcac31ca5, 0xf1000484, 0x54ffff61, 0x17fffffa],
+    // Lane inserts (ins .b/.h/.d), trn1/trn2, zip1/zip2 and ext on 8- and 16-byte vectors, shifts
+    // by immediates up to the lane width, uxtl/sxtl, dup into 64 bits, vector ucvtf/scvtf, and
+    // scalar ucvtf/scvtf/fcvt{zu,zs,ms,ps,ns,as} with and without fixed-point bits, also on raw
+    // bit patterns (NaN, infinity, denormals); everything folds into x3-x14 and the vectors.
+    simd: [0x91278c21, 0xcac13442, 0x8b011442, 0x4e040c20, 0x4e181c40, 0x4e0e1c40, 0x4e131c20, 0x4e1a1c20,
+        0x4ea01c01, 0x4e081c41, 0x4e051c41, 0x4e812802, 0x4e406823, 0x4e012804, 0x4ec16805, 0x0e016806,
+        0x4e813807, 0x4e007828, 0x0e013809, 0x4ec1780a, 0x4e40382b, 0x6e01280c, 0x2e01180d, 0x6e00782e,
+        0x1e23004f, 0x9e620050, 0x1e03e451, 0x1e02f432, 0x9e43b033, 0x9e220054, 0x1e270055, 0x9e670056,
+        0x1e3901e3, 0x9e780204, 0x1e19f225, 0x1e300246, 0x1e280227, 0x9e2001e8, 0x1e240249, 0x1e3902aa,
+        0x9e3002ab, 0x1e6802cc, 0x1e58decd, 0x4f275417, 0x6f1d0438, 0x6f200419, 0x4f20043a, 0x4f0e041b,
+        0x4f7f543c, 0x2f10a41d, 0x0f08a43e, 0x2f20a43f, 0x6e371c42, 0x6e381c63, 0x6e391c84, 0x6e3a1ca5,
+        0x6e3b1cc6, 0x6e3c1ce7, 0x6e3d1d08, 0x6e3e1d29, 0x6e3f1d4a, 0x0e040c57, 0x0e020c38, 0x0e010c59,
+        0x6e21d81a, 0x6f3be43b, 0x4f3de41c, 0x4e21d83d, 0x4eb787de, 0x4eba87ff, 0x6e3b1fbd, 0x6e381f9c,
+        0x6e391d6b, 0xca040063, 0xca0600a5, 0xca0800e7, 0xca0a0129, 0xca0c016b, 0x8b0d01ce, 0x4e083c4f,
+        0x4e183c70, 0x4e083d91, 0x4e183db2, 0x9e6601f3, 0x9e660234, 0x9e660275, 0xca0f01ce, 0xcad00dce,
+        0xcad11dce, 0xca1201ce, 0x8b1301ce, 0x8b1401ce, 0x8b1501ce, 0x17ffffa3],
 };
+// FPCR values each program runs under (default: 0). Flush-to-zero and every rounding mode change
+// which float conversions the JIT can emit natively.
+const PROGRAM_FPCRS = { simd: [0, 0x01000000, 0x00400000, 0x00800000, 0x00C00000, 0x01C00000] };
 
 const hex = word => (word >>> 0).toString(16).padStart(8, '0');
 const START_REGS = Array(31).fill('0');
 
-function input(words, regs = START_REGS) {
+function input(words, regs = START_REGS, fpcr = 0) {
     return [`instructions: ${words.map(hex).join(' ')}`, `initial_regs: ${regs.join(' ')}`,
         `initial_vecs: ${Array(32).fill('0:0').join(' ')}`, 'initial_sp: 10000', 'initial_pstate: 0',
-        'initial_fpcr: 0', ''].join('\n');
+        `initial_fpcr: ${fpcr.toString(16)}`, ''].join('\n');
 }
 
 function run(reader, env, stdin) {
@@ -72,7 +91,7 @@ async function pool(tasks, limit = os.availableParallelism()) {
     return results;
 }
 
-const finalState = out => out.split('\n').filter(line => /^final_(regs|pstate|sp|pc)/.test(line)).join('\n');
+const finalState = out => out.split('\n').filter(line => /^final_(regs|vecs|pstate|sp|pc)/.test(line)).join('\n');
 
 if (args.bench) {
     const readers = positionals.map(dir => path.join(path.resolve(dir), 'dynarmic_test_reader.js'));
@@ -100,10 +119,12 @@ const INTERP = { EDEN_INTERP_JIT: '0', EDEN_BENCH_TICKS: args.ticks };
 const JIT = { EDEN_JIT_THRESHOLD: '1', EDEN_BENCH_TICKS: args.ticks };
 
 // Whole programs: the same guest state after the same number of instructions.
-const programResults = await pool(Object.entries(PROGRAMS).map(([name, words]) => async () => {
-    const [interp, jit] = await Promise.all([run(reader, INTERP, input(words)), run(reader, JIT, input(words))]);
-    return { name, same: finalState(interp.out) === finalState(jit.out), interp: finalState(interp.out), jit: finalState(jit.out) };
-}));
+const programResults = await pool(Object.entries(PROGRAMS).flatMap(([name, words]) => (PROGRAM_FPCRS[name] ?? [0]).map(fpcr => async () => {
+    const stdin = input(words, START_REGS, fpcr);
+    const [interp, jit] = await Promise.all([run(reader, INTERP, stdin), run(reader, JIT, stdin)]);
+    const label = fpcr ? `${name} (fpcr ${fpcr.toString(16)})` : name;
+    return { name: label, same: finalState(interp.out) === finalState(jit.out), interp: finalState(interp.out), jit: finalState(jit.out) };
+})));
 for (const r of programResults) {
     if (!r.same) {
         failures++;
