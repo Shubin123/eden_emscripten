@@ -402,6 +402,19 @@ public:
         PushCond(cond);
     }
 
+    /// Pushes the guest check bit as an i32.
+    void PushCheckBit() {
+        if (check_bit_op) {
+            // Set in this block: use the value rather than reloading what was just stored.
+            PushArg(*check_bit_op, 0);
+            And(0xFF);
+        } else {
+            code.Get(kState);
+            code.Mem(Insn::I64Load8U, target.check_bit_offset);
+        }
+        code.Byte(Insn::I32WrapI64);
+    }
+
 private:
     // Analysis
 
@@ -574,7 +587,9 @@ private:
 
     /// Pushes the i32 result of evaluating `cond` against the guest NZCV.
     void PushNZCV() {
-        if (cached) {
+        if (flags_source != kNone) {
+            code.Get(value_local[flags_source]);
+        } else if (cached) {
             code.Get(cached->nzcv);
         } else {
             code.Get(kState);
@@ -584,6 +599,7 @@ private:
 
     template<typename F>
     void SetNZCV(F&& value) {
+        flags_source = kNone;
         if (cached) {
             value();
             code.Set(cached->nzcv);
@@ -594,7 +610,81 @@ private:
         }
     }
 
+    /// The GetNZCVFromOp `slot` refers to, if it is an inline op of this block with its value in a local.
+    u32 FlagsSourceOf(u32 slot) const {
+        if (IsConstant(slot) || slot >= block.ops.size()) {
+            return kNone;
+        }
+        const Op& op = block.ops[slot];
+        if (op.opcode != Opcode::GetNZCVFromOp || !inline_op[slot] || value_local[slot] == kNone) {
+            return kNone;
+        }
+        return slot;
+    }
+
+    /// Pushes `cond` as a comparison of the operands when the flags come from a - b (carry in 1),
+    /// so a guest compare and branch becomes one host compare and branch.
+    bool PushCompareCond(IR::Cond cond) {
+        if (flags_source == kNone) {
+            return false;
+        }
+        const Op& parent = block.ops[block.ops[flags_source].args[0]];
+        if ((parent.opcode != Opcode::Sub32 && parent.opcode != Opcode::Sub64) || !IsConstant(parent.args[2]) ||
+            (ConstantValue(parent.args[2]) & 1) == 0) {
+            return false;
+        }
+        const bool is32 = parent.opcode == Opcode::Sub32;
+        u8 compare;
+        switch (cond) {
+        case IR::Cond::EQ:
+            compare = is32 ? Insn::I32Eq : Insn::I64Eq;
+            break;
+        case IR::Cond::NE:
+            compare = is32 ? Insn::I32Ne : Insn::I64Ne;
+            break;
+        case IR::Cond::CS:
+            compare = is32 ? Insn::I32GeU : Insn::I64GeU;
+            break;
+        case IR::Cond::CC:
+            compare = is32 ? Insn::I32LtU : Insn::I64LtU;
+            break;
+        case IR::Cond::HI:
+            compare = is32 ? Insn::I32GtU : Insn::I64GtU;
+            break;
+        case IR::Cond::LS:
+            compare = is32 ? Insn::I32LeU : Insn::I64LeU;
+            break;
+        case IR::Cond::GE:
+            compare = is32 ? Insn::I32GeS : Insn::I64GeS;
+            break;
+        case IR::Cond::LT:
+            compare = is32 ? Insn::I32LtS : Insn::I64LtS;
+            break;
+        case IR::Cond::GT:
+            compare = is32 ? Insn::I32GtS : Insn::I64GtS;
+            break;
+        case IR::Cond::LE:
+            compare = is32 ? Insn::I32LeS : Insn::I64LeS;
+            break;
+        default:
+            return false;
+        }
+        PushArg(parent, 0);
+        if (is32) {
+            code.Byte(Insn::I32WrapI64);
+        }
+        PushArg(parent, 1);
+        if (is32) {
+            code.Byte(Insn::I32WrapI64);
+        }
+        code.Byte(compare);
+        return true;
+    }
+
     void PushCond(IR::Cond cond) {
+        if (PushCompareCond(cond)) {
+            return;
+        }
         PushNZCV();
         code.Set(nzcv_tmp);
         const auto bit = [&](u32 shift) {
@@ -687,6 +777,9 @@ private:
     }
 
     void CallHelper(size_t index, size_t end) {
+        // A helper may write NZCV or the check bit.
+        flags_source = kNone;
+        check_bit_op = nullptr;
         bool touches_state = false;
         if (cached) {
             for (size_t current = index; current < end; ++current) {
@@ -2650,6 +2743,7 @@ private:
             code.Get(kState);
             arg(0);
             code.Mem(Insn::I64Store8, target.check_bit_offset);
+            check_bit_op = &op;
             break;
         case Opcode::A64GetCFlag:
         case Opcode::A32GetCFlag:
@@ -2659,8 +2753,7 @@ private:
             define();
             break;
         case Opcode::A64GetNZCVRaw:
-            code.Get(kState);
-            code.Mem(Insn::I64Load32U, target.nzcv_offset);
+            PushNZCV();
             define();
             break;
         case Opcode::A64SetNZCVRaw:
@@ -2671,6 +2764,9 @@ private:
                 arg(0);
                 And(0xF0000000);
             });
+            if (op.opcode == Opcode::A64SetNZCV || op.opcode == Opcode::A32SetCpsrNZCV) {
+                flags_source = FlagsSourceOf(op.args[0]);
+            }
             break;
         case Opcode::A64GetW:
             code.Get(kState);
@@ -3375,6 +3471,10 @@ private:
     u32 tmp0 = 0, tmp1 = 0, tmp2 = 0, tmp3 = 0;
     u32 nzcv_tmp = 0;
     u32 wrote_pc_local = 0;
+    /// The GetNZCVFromOp whose value the guest NZCV holds, when this block last set NZCV from it.
+    u32 flags_source = kNone;
+    /// The A64SetCheckBit/A32SetCheckBit that last set the check bit in this block.
+    const Op* check_bit_op = nullptr;
 };
 
 }  // Anonymous namespace
@@ -3425,7 +3525,9 @@ public:
         }
         const RegionLocals* cached_ptr = cached ? &*cached : nullptr;
 
-        // Regions may be entered at any of their blocks.
+        // Regions may be entered at any of their blocks: the loop dispatches on kCurrent to the
+        // block's label, for entries and backward edges. Block i's code follows the end of label
+        // i, inside the labels of the blocks after it, so forward edges branch there directly.
         code.Get(kEntry);
         code.Set(kCurrent);
         code.BlockStart();
@@ -3435,6 +3537,7 @@ public:
         for (u32 i = 0; i < n; ++i) {
             code.BlockStart();
         }
+        block_count = n;
         code.Get(kCurrent);
         code.Byte(Insn::I32WrapI64);
         code.Byte(0x0E);  // br_table
@@ -3448,6 +3551,14 @@ public:
             code.End();
             current_index = i;
             const CompiledBlock& block = *blocks[i];
+            // A block that links to itself loops in place rather than through the dispatch.
+            bool self_loop = false;
+            ForEachRegionSuccessor(i, [&](u32 next) { self_loop |= next == i; });
+            self_loop_nest = 0;
+            if (self_loop) {
+                code.LoopStart();
+                self_loop_nest = code.nest;
+            }
             BlockCompiler compiler{block, target, code, kLocalBase, cached_ptr};
             compiler.Prepare();
             if (block.cond != IR::Cond::AL) {
@@ -3466,6 +3577,9 @@ public:
             SubtractCycles(block.cycle_count);
             EmitTerminal(compiler, block.terminal);
             Exit();
+            if (self_loop) {
+                code.End();
+            }
         }
         code.End();  // loop
         code.End();  // exit block
@@ -3484,6 +3598,50 @@ public:
 private:
     static constexpr u32 kCurrent = 4;
     static constexpr u32 kCachedBase = 5;
+
+    /// The index in this region of the block at `location`, or kNone.
+    u32 RegionIndex(IR::LocationDescriptor location) const {
+        const IR::LocationDescriptor plain = target.a32 ? IR::LocationDescriptor{A32::LocationDescriptor{location}.SetSingleStepping(false)}
+                                                        : IR::LocationDescriptor{A64::LocationDescriptor{location}.SetSingleStepping(false)};
+        const auto it = index_of.find(plain.Value());
+        return it == index_of.end() ? kNone : it->second;
+    }
+
+    /// Successors of block `index` inside this region.
+    template<typename F>
+    void ForEachRegionSuccessor(u32 index, F&& f) const {
+        using namespace IR::Term;
+        const CompiledBlock& block = *blocks[index];
+        const auto link = [&](IR::LocationDescriptor next) {
+            if (const u32 successor = RegionIndex(next); successor != kNone) {
+                f(successor);
+            }
+        };
+        if (block.cond != IR::Cond::AL) {
+            link(block.cond_failed_location);
+        }
+        const auto leaf = [&](const LeafTerminal& term) {
+            std::visit([&](const auto& t) {
+                using T = std::decay_t<decltype(t)>;
+                if constexpr (std::is_same_v<T, LinkBlock> || std::is_same_v<T, LinkBlockFast>) {
+                    link(t.next);
+                }
+            }, term);
+        };
+        const IR::Term::Terminal& terminal = block.terminal;
+        std::visit([&](const auto& term) {
+            using T = std::decay_t<decltype(term)>;
+            if constexpr (std::is_same_v<T, LeafTerminal>) {
+                leaf(term);
+            } else if constexpr (std::is_same_v<T, If> || std::is_same_v<T, CheckBit>) {
+                leaf(term.then_);
+                leaf(term.else_);
+            } else if constexpr (std::is_same_v<T, CheckHalt>) {
+                leaf(term.else_);
+            }
+        }, terminal);
+    }
+
     static constexpr u32 kLocalBase = kV128C + 1;
     static_assert(kCachedBase + 20 == kF32A);
 
@@ -3593,9 +3751,7 @@ private:
                 EmitLeaf(term.else_);
                 code.End();
             } else if constexpr (std::is_same_v<T, CheckBit>) {
-                code.Get(kState);
-                code.Mem(Insn::I64Load8U, target.check_bit_offset);
-                code.Byte(Insn::I32WrapI64);
+                compiler.PushCheckBit();
                 code.If();
                 EmitLeaf(term.then_);
                 code.Else();
@@ -3662,24 +3818,36 @@ private:
             Exit();
             return;
         }
-        code.I64Const(it->second);
-        code.Set(kCurrent);
-        if (it->second > current_index && !target.cycle_counting) {
-            // Without cycle counting only loops need to observe halts, and forward edges cannot
-            // loop; check halts on backward edges only.
-            code.BrTo(loop_nest);
+        const u32 next_index = it->second;
+        const bool forward = next_index > current_index;
+        if (!forward || target.cycle_counting) {
+            // Continue while cycles remain and nothing asked execution to halt. Without cycle
+            // counting only loops need to observe halts, and forward edges cannot loop.
+            PushCycles();
+            code.I64Const(0);
+            code.Byte(Insn::I64LeS);
+            PushHalted();
+            code.Byte(Insn::I32Or);
+            code.If(BranchHint::Unlikely);
+            Exit();
+            code.End();
+        }
+        if (forward) {
+            code.BrTo(LabelNest(next_index));
             return;
         }
-        // Continue while cycles remain and nothing asked execution to halt.
-        PushCycles();
-        code.I64Const(0);
-        code.Byte(Insn::I64LeS);
-        PushHalted();
-        code.Byte(Insn::I32Or);
-        code.If(BranchHint::Unlikely);
-        Exit();
-        code.End();
+        if (next_index == current_index && self_loop_nest != 0) {
+            code.BrTo(self_loop_nest);
+            return;
+        }
+        code.I64Const(next_index);
+        code.Set(kCurrent);
         code.BrTo(loop_nest);
+    }
+
+    /// Nesting depth at which the label that ends right before block `index` was opened.
+    u32 LabelNest(u32 index) const {
+        return loop_nest + block_count - index;
     }
 
     void BuildModule(std::vector<u8>& out, u32 locals_end) {
@@ -3773,6 +3941,23 @@ private:
         bodies.Sized(body);
         Section(module, 10, bodies);
 
+        if (RegionNamesEnabled()) {
+            // Names the function after the guest entry point, so profilers attribute time per region.
+            const u64 location = blocks.front()->location.Value();
+            const u64 pc = target.a32 ? u64(A32::LocationDescriptor{IR::LocationDescriptor{location}}.PC())
+                                      : A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC();
+            const std::string name = fmt::format("r{:x}_{}", pc, blocks.size());
+            Writer function_names;
+            function_names.U32(1);
+            function_names.U32(0);
+            function_names.Name(name.c_str());
+            Writer names;
+            names.Name("name");
+            names.Byte(1);
+            names.Sized(function_names);
+            Section(module, 0, names);
+        }
+
         out = std::move(module.bytes);
     }
 
@@ -3788,6 +3973,9 @@ private:
     u32 loop_nest = 0;
     u32 exit_nest = 0;
     u32 current_index = 0;
+    u32 block_count = 0;
+    /// Nesting depth of the loop around the current block when it links to itself, or 0.
+    u32 self_loop_nest = 0;
     std::optional<RegionLocals> cached;
 };
 
@@ -3963,6 +4151,11 @@ bool RegionAllowedAt(u64 pc) {
         return std::pair<u64, u64>{lo, hi};
     }();
     return pc >= range.first && pc < range.second;
+}
+
+bool RegionNamesEnabled() {
+    static const bool enabled = std::getenv("EDEN_JIT_NAMES") != nullptr;
+    return enabled;
 }
 
 bool WasmJitEnabled() {

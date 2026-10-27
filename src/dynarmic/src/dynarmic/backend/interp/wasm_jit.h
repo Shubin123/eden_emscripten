@@ -135,6 +135,9 @@ bool TrackRegionCode(WasmRegion& region);
 /// Compile and instantiation counts and times since the last call, for the stats report.
 std::string JitStats();
 
+/// Debug: EDEN_JIT_NAMES names each region's function r<entry pc>_<blocks> for profilers.
+bool RegionNamesEnabled();
+
 /// Whether compiled execution is enabled (EDEN_INTERP_JIT=0 disables it).
 bool WasmJitEnabled();
 
