@@ -631,6 +631,12 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
         set(Shader::TextureType::Color2D, 1);
         set(Shader::TextureType::Color2DRect, 1);
         set(Shader::TextureType::ColorArray2D, num_layers);
+        // Games sample square 2D arrays of six layers or more as cube maps (NieR:Automata's
+        // reflections); the hardware takes the layers as faces.
+        if (info.type == ImageViewType::e2DArray && view_width == view_height) {
+            set(Shader::TextureType::ColorCube, num_layers >= 6 ? 6 : 0);
+            set(Shader::TextureType::ColorArrayCube, num_layers - num_layers % 6);
+        }
         break;
     case ImageViewType::e3D:
         set(Shader::TextureType::Color3D, 1);
