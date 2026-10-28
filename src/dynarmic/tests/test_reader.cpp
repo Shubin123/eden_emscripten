@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -162,6 +163,89 @@ void RunTestInstance(Dynarmic::A32::Jit& jit,
     fmt::print("===\n");
 }
 
+/// EDEN_PAGE_TABLE=1: guest addresses below 16 MiB live in host memory reached through a page
+/// table in Eden's format (host offset in bits 12-55, bit 0 marks a page for the callbacks), so
+/// compiled code takes its inline memory path. Guest pages map to scattered host pages, so a
+/// translation that is off by a page reads other data. Every 7th
+/// page is marked and every 11th unmapped, as are the pages holding code; the callbacks use the
+/// same memory, so results match a run without the page table.
+class PagedA64TestEnv final : public A64TestEnv {
+public:
+    static constexpr u64 kSpanBits = 24;
+    static constexpr u64 kSpan = u64(1) << kSpanBits;
+    static constexpr u64 kPointerMask = 0x00FF'FFFF'FFFF'F000;
+
+    PagedA64TestEnv(u64 code_start, u64 code_end)
+        : memory(static_cast<u8*>(std::aligned_alloc(4096, kSpan))), table(kSpan >> 12) {
+        for (u64 vaddr = 0; vaddr < kSpan; ++vaddr) {
+            *Host(vaddr) = u8(vaddr);
+        }
+        for (u64 page = 0; page < table.size(); ++page) {
+            const u64 vaddr = page << 12;
+            if (page % 11 == 0 || (vaddr < code_end && vaddr + 4096 > code_start)) {
+                continue;
+            }
+            // Absolute offset: host page minus guest page.
+            const u64 offset = reinterpret_cast<u64>(Host(vaddr)) - vaddr;
+            table[page] = (offset & kPointerMask) | (page % 7 == 0 ? 1 : 0);
+        }
+    }
+    ~PagedA64TestEnv() {
+        std::free(memory);
+    }
+
+    void Configure(A64::UserConfig& config) {
+        config.page_table = reinterpret_cast<void**>(table.data());
+        config.page_table_address_space_bits = kSpanBits;
+        config.page_table_pointer_mask = kPointerMask;
+        config.page_table_marked_bit = u8(0);
+        config.silently_mirror_page_table = false;
+        config.absolute_offset_page_table = true;
+        config.detect_misaligned_access_via_page_table = 16 | 32 | 64 | 128;
+        config.only_detect_misalignment_via_page_table_on_page_boundary = true;
+    }
+
+    u64 MemoryRead(u64 vaddr, size_t size) override {
+        if (!Backed(vaddr, size)) {
+            return A64TestEnv::MemoryRead(vaddr, size);
+        }
+        u64 value = 0;
+        std::memcpy(&value, Host(vaddr), size);
+        return value;
+    }
+
+    void MemoryWrite(u64 vaddr, u64 value, size_t size) override {
+        if (!Backed(vaddr, size)) {
+            A64TestEnv::MemoryWrite(vaddr, value, size);
+            return;
+        }
+        std::memcpy(Host(vaddr), &value, size);
+    }
+
+    /// Adds the bytes the run changed in host memory to modified_memory.
+    void CollectWrites() {
+        for (u64 vaddr = 0; vaddr < kSpan; ++vaddr) {
+            if (*Host(vaddr) != u8(vaddr) && !IsInCodeMem(vaddr)) {
+                modified_memory[vaddr] = *Host(vaddr);
+            }
+        }
+    }
+
+private:
+    /// Callbacks handle accesses within one backed page; wider ones split into smaller reads.
+    bool Backed(u64 vaddr, size_t size) const {
+        return vaddr + size <= kSpan && (vaddr & 0xFFF) + size <= 0x1000 && !IsInCodeMem(vaddr) && !IsInCodeMem(vaddr + size - 1);
+    }
+
+    /// An odd multiplier permutes the 4096 pages.
+    u8* Host(u64 vaddr) const {
+        return memory + ((((vaddr >> 12) * 0x9E5) & 0xFFF) << 12) + (vaddr & 0xFFF);
+    }
+
+    u8* memory;
+    std::vector<u64> table;
+};
+
 A64::UserConfig GetA64UserConfig(A64TestEnv& jit_env, bool noopt) {
     A64::UserConfig jit_user_config{};
     jit_user_config.callbacks = &jit_env;
@@ -176,9 +260,9 @@ A64::UserConfig GetA64UserConfig(A64TestEnv& jit_env, bool noopt) {
     return jit_user_config;
 }
 
-template<size_t num_jit_reruns = 1>
+template<size_t num_jit_reruns = 1, typename Env>
 void RunTestInstance(A64::Jit& jit,
-                     A64TestEnv& jit_env,
+                     Env& jit_env,
                      const std::array<u64, 31>& regs,
                      const std::array<std::array<u64, 2>, 32>& vecs,
                      const std::vector<u32>& instructions,
@@ -255,6 +339,9 @@ void RunTestInstance(A64::Jit& jit,
     fmt::print("final_fpcr: {:08x}\n", jit.GetFpcr());
     fmt::print("final_qc : {}\n", FP::FPSR{jit.GetFpsr()}.QC());
 
+    if constexpr (requires { jit_env.CollectWrites(); }) {
+        jit_env.CollectWrites();
+    }
     fmt::print("mod_mem:");
     for (auto [addr, value] : jit_env.modified_memory) {
         fmt::print(" {:08x}:{:02x}", addr, value);
@@ -420,6 +507,16 @@ void RunA64(bool noopt) {
             SkipHeader(sv);
             initial_fpcr = (u32)ParseHex(NextToken(sv));
         }
+    }
+
+    if (std::getenv("EDEN_PAGE_TABLE")) {
+        PagedA64TestEnv jit_env{start_address, start_address + 4 * (instructions.size() + 1)};
+        A64::UserConfig config = GetA64UserConfig(jit_env, noopt);
+        jit_env.Configure(config);
+        A64::Jit jit{config};
+        RunTestInstance(jit, jit_env, initial_regs, initial_vecs, instructions, initial_pstate, initial_fpcr,
+                        initial_sp, start_address, instructions.size());
+        return;
     }
 
     A64TestEnv jit_env{};

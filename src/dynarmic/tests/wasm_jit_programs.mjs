@@ -1686,6 +1686,16 @@ const PROGRAMS = {
         0x8b1403bd, 0x1000006d, 0xd71f09a1, 0x910007bd, 0x1000006d, 0xd61f0dbf, 0x910007bd, 0x1000006d,
         0xd71f0dbf, 0x910007bd, 0x1000006d, 0xd61f09bf, 0x910007bd, 0x9100079c, 0x17ffff9a, 0xd280002e,
         0xd65f0bff, 0xd280004f, 0xd65f0fff, 0xd2800071, 0xd65f0bff],
+    // Loads of every size (ldrb to ldr q, ldp) and overlapping stores across five page
+    // boundaries of the EDEN_PAGE_TABLE layout (normal/marked, normal/unmapped, normal/normal,
+    // marked/normal), folded into x20. The boundary list follows the code. Runs with and without
+    // the page table must agree.
+    paged: [0x100004ca, 0xd28000ab, 0xf8408541, 0xd1005022, 0x91005023, 0x39400044, 0xcad41c94, 0x79400044,
+        0xcad41c94, 0xb9400044, 0xcad41c94, 0xf9400044, 0xcad41c94, 0xa9401444, 0xcad41c94, 0xcad41cb4,
+        0x3dc00040, 0x9e660004, 0x4e183c05, 0xcad41c94, 0xcad41cb4, 0x8b020286, 0xb9000046, 0x78005046,
+        0xf85fe044, 0xcad41c94, 0xd1002447, 0xa90050e6, 0xf85fc044, 0xcad41c94, 0x91000442, 0xeb03005f,
+        0x54fffcab, 0xf100056b, 0x54fffc01, 0x9100079c, 0x17ffffdc, 0xd503201f, 0x000fc000, 0x00000000,
+        0x00108000, 0x00000000, 0x00101000, 0x00000000, 0x000fd000, 0x00000000, 0x0010c000, 0x00000000],
 };
 // Programs that check their own results: the register that counts mismatches, which must end at
 // zero, and the one that counts completed rounds, which must not.
@@ -1762,24 +1772,31 @@ let failures = 0;
 const INTERP = { EDEN_INTERP_JIT: '0', EDEN_BENCH_TICKS: args.ticks };
 const JIT = { EDEN_JIT_THRESHOLD: '1', EDEN_BENCH_TICKS: args.ticks };
 
-// Whole programs: the same guest state after the same number of instructions.
+// Whole programs: the same guest state after the same number of instructions, on the interpreter
+// and the JIT, with memory reached through callbacks and through a page table (EDEN_PAGE_TABLE:
+// low guest memory is host memory with some pages marked or unmapped, the inline memory path).
+const PAGED = { EDEN_PAGE_TABLE: '1' };
 const programResults = await pool(Object.entries(PROGRAMS).flatMap(([name, words]) => (PROGRAM_FPCRS[name] ?? [0]).map(fpcr => async () => {
     const stdin = input(words, START_REGS, fpcr);
     const ticks = PROGRAM_TICKS[name] ? { EDEN_BENCH_TICKS: String(PROGRAM_TICKS[name]) } : {};
-    const [interp, jit] = await Promise.all([run(reader, { ...INTERP, ...ticks }, stdin), run(reader, { ...JIT, ...ticks }, stdin)]);
+    const [interp, jit, pagedInterp, pagedJit] = await Promise.all([INTERP, JIT, { ...INTERP, ...PAGED }, { ...JIT, ...PAGED }]
+        .map(env => run(reader, { ...env, ...ticks }, stdin)));
     const label = fpcr ? `${name} (fpcr ${fpcr.toString(16)})` : name;
     const check = PROGRAM_SELF_CHECKS[name];
     const selfCheck = out => {
         const regs = out.match(/^final_regs: (.*)$/m)[1].split(' ').map(r => BigInt(`0x${r}`));
         return regs[check.errors] === 0n && regs[check.rounds] > 0n;
     };
-    const checked = !check || (selfCheck(interp.out) && selfCheck(jit.out));
-    return { name: label, same: checked && finalState(interp.out) === finalState(jit.out), interp: finalState(interp.out), jit: finalState(jit.out) };
+    const runs = [interp, jit, pagedInterp, pagedJit];
+    const checked = !check || runs.every(r => selfCheck(r.out));
+    const same = runs.every(r => finalState(r.out) === finalState(interp.out));
+    return { name: label, same: checked && same, states: runs.map(r => finalState(r.out)) };
 })));
 for (const r of programResults) {
     if (!r.same) {
         failures++;
-        console.log(`FAIL ${r.name}:\n--- interpreter\n${r.interp}\n--- jit\n${r.jit}`);
+        const labels = ['interpreter', 'jit', 'interpreter, page table', 'jit, page table'];
+        console.log(`FAIL ${r.name}:\n${r.states.map((state, i) => `--- ${labels[i]}\n${state}`).join('\n')}`);
     }
 }
 console.log(`programs: ${programResults.length - programResults.filter(r => !r.same).length}/${programResults.length} match`);
