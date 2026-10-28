@@ -6,10 +6,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <vector>
 
+#include "common/div_ceil.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -71,6 +73,9 @@ struct Options {
     /// Read every storage buffer through the packed binding (see PackedSsboFirst), for buffers
     /// the guest binds over each other, which WebGPU forbids as separate writable bindings.
     bool pack_all_ssbos = false;
+    /// Uniform buffer bindings the stage's constant buffers may use; zero for no limit. Past it,
+    /// constant buffers are read from one storage binding (see PackedCbufFirst).
+    u32 max_uniform_buffers = 0;
     /// Samplers the stage may use; zero for no limit. Past it, the textures from element
     /// max_samplers - 1 on share that element's sampler (see SharedSamplerFirst).
     u32 max_samplers = 0;
@@ -90,6 +95,33 @@ struct Options {
         return count;
     }
     return max_samplers - 1;
+}
+
+/// Vectors of the uniform array a constant buffer is bound as, at most 64 KiB.
+[[nodiscard]] inline u32 CbufVectors(const Info& info, u32 index) {
+    return std::min(Common::DivCeil(std::max(info.constant_buffer_used_sizes[index], 16U), 16U),
+                    4096U);
+}
+
+/// Index of the first constant buffer descriptor read from the packed storage binding, or the
+/// number of descriptors when each is its own uniform binding. A shader that picks the buffer at
+/// run time declares every buffer at the 64 KiB maximum, so all of its buffers are packed;
+/// otherwise those from descriptor max_uniform_buffers - 1 on are. Packed buffers lie back to back
+/// at their bound sizes: the storage binding takes the first packed buffer's binding number and
+/// the next number holds a uniform array<vec4<u32>, MAX_CBUFS / 2> with the first and last vector
+/// of each packed buffer in descriptor order; the other packed bindings are left unused.
+[[nodiscard]] inline u32 PackedCbufFirst(const Info& info, u32 max_uniform_buffers) {
+    const auto& descs{info.constant_buffer_descriptors};
+    const u32 count{static_cast<u32>(descs.size())};
+    if (max_uniform_buffers < 2 ||
+        (!info.uses_cbuf_indirect && NumDescriptors(descs) <= max_uniform_buffers)) {
+        return count;
+    }
+    const u32 first{info.uses_cbuf_indirect ? 0 : max_uniform_buffers - 1};
+    if (count - first < 2 || NumDescriptors(descs) != count) {
+        return count;
+    }
+    return first;
 }
 
 /// Maximum number of storage buffers that can share the packed binding.

@@ -169,6 +169,12 @@ public:
     /// Expression for word `word` of storage buffer `index`.
     [[nodiscard]] std::string SsboElement(u32 index, std::string_view word) const;
 
+    /// Position of each constant buffer among the packed ones, or ~0 when it has its own binding.
+    std::array<u32, Info::MAX_CBUFS> cbuf_pack_slot{};
+
+    /// Expression for vector `vector` of constant buffer `index`.
+    [[nodiscard]] std::string CbufVector(u32 index, std::string_view vector) const;
+
 private:
     void DefineConstantBuffers(Bindings& bindings);
     void DefineConstantBufferIndirect();

@@ -95,6 +95,8 @@ public:
     wgpu::BindGroupLayout pulled_layout;
     /// Guest vertex buffers the shader fetches itself, in pulled-buffer order.
     std::vector<u32> pulled_buffers;
+    /// Constant buffers read from the packed storage binding, copied for the current draw.
+    std::vector<u8> cbuf_pack;
     wgpu::BindGroup bind_group;
     u32 draw_info_offset{};
     const RenderTargets* targets{};
@@ -136,6 +138,9 @@ private:
     bool UsesStage(size_t index) const {
         return key.unique_hashes[index] != 0 && !(index == 4 && skip_geometry);
     }
+    /// Uniform buffers left for the constant buffers of `stage` next to the draw info and, in
+    /// the vertex stage, the pulled vertex buffer bases.
+    u32 CbufLimit(size_t stage) const;
     Variant* FindVariant(const VariantKey& variant_key);
 
     PipelineCache& cache;
@@ -268,6 +273,7 @@ private:
     u32 max_storage_buffers{};
     u32 max_vertex_buffers{8};
     u32 max_samplers{16};
+    u32 max_uniform_buffers{12};
 
     std::map<std::pair<Shader::TextureType, TextureKind>, wgpu::TextureView> dummy_views;
 

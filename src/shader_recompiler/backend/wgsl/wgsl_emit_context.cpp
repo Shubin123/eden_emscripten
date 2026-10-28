@@ -249,13 +249,36 @@ EmitContext::EmitContext(IR::Program& program, Bindings& bindings, const Profile
 }
 
 void EmitContext::DefineConstantBuffers(Bindings& bindings) {
-    for (const auto& desc : info.constant_buffer_descriptors) {
-        const u32 used_size{std::max(info.constant_buffer_used_sizes[desc.index], 16U)};
-        const u32 num_vectors{std::min(Common::DivCeil(used_size, 16U), 4096U)};
-        header += fmt::format("@group(0) @binding({}) var<uniform> {}_cbuf{}: array<vec4<u32>, {}>;\n",
-                              bindings.unified, stage_name, desc.index, num_vectors);
-        bindings.unified += desc.count;
+    const auto& descs{info.constant_buffer_descriptors};
+    const u32 packed_first{PackedCbufFirst(info, options.max_uniform_buffers)};
+    cbuf_pack_slot.fill(~0u);
+    for (u32 i = 0; i < descs.size(); ++i) {
+        if (i < packed_first) {
+            header += fmt::format("@group(0) @binding({}) var<uniform> {}_cbuf{}: array<vec4<u32>, {}>;\n",
+                                  bindings.unified, stage_name, descs[i].index,
+                                  CbufVectors(info, descs[i].index));
+        } else if (i == packed_first) {
+            header += fmt::format("@group(0) @binding({}) var<storage, read> {}_cbuf_pack: array<vec4<u32>>;\n"
+                                  "@group(0) @binding({}) var<uniform> {}_cbuf_range: array<vec4<u32>, {}>;\n",
+                                  bindings.unified, stage_name, bindings.unified + 1, stage_name,
+                                  Info::MAX_CBUFS / 2);
+        }
+        if (i >= packed_first) {
+            cbuf_pack_slot[descs[i].index] = i - packed_first;
+        }
+        bindings.unified += descs[i].count;
     }
+}
+
+std::string EmitContext::CbufVector(u32 index, std::string_view vector) const {
+    const u32 slot{cbuf_pack_slot[index]};
+    if (slot == ~0u) {
+        return fmt::format("{}_cbuf{}[{}]", stage_name, index, vector);
+    }
+    // Clamped to the bound size like an access past the end of a buffer with its own binding.
+    const auto range{fmt::format("{}_cbuf_range[{}u]", stage_name, slot / 2)};
+    return fmt::format("{}_cbuf_pack[{}.{}+min({},{}.{})]", stage_name, range,
+                       slot % 2 ? 'z' : 'x', vector, range, slot % 2 ? 'w' : 'y');
 }
 
 void EmitContext::DefineConstantBufferIndirect() {
@@ -264,10 +287,9 @@ void EmitContext::DefineConstantBufferIndirect() {
     }
     header += "fn GetCbufIndirect(binding: u32, offset: u32) -> vec4<u32> {\nswitch (binding) {\n";
     for (const auto& desc : info.constant_buffer_descriptors) {
-        const u32 used_size{std::max(info.constant_buffer_used_sizes[desc.index], 16U)};
-        const u32 num_vectors{std::min(Common::DivCeil(used_size, 16U), 4096U)};
-        header += fmt::format("case {}u: {{ return {}_cbuf{}[min(offset, {}u)]; }}\n", desc.index,
-                              stage_name, desc.index, num_vectors - 1);
+        const u32 last{CbufVectors(info, desc.index) - 1};
+        header += fmt::format("case {}u: {{ return {}; }}\n", desc.index,
+                              CbufVector(desc.index, fmt::format("min(offset, {}u)", last)));
     }
     header += "default: { return vec4<u32>(0u); }\n}\n}\n";
 }

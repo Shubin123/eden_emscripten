@@ -277,9 +277,11 @@ Shader::Backend::WGSL::PulledAttribute PulledFormat(wgpu::VertexFormat format) {
     }
 }
 
+/// First and last vector of each packed constant buffer (see PackedCbufFirst).
+using CbufRanges = std::array<u32, Shader::Info::MAX_CBUFS * 2>;
+
 u32 UniformBindingSize(const Shader::Info& info, u32 index) {
-    const u32 used_size{std::max(info.constant_buffer_used_sizes[index], 16U)};
-    return std::min(Common::DivCeil(used_size, 16U), 4096U) * 16;
+    return Shader::Backend::WGSL::CbufVectors(info, index) * 16;
 }
 
 wgpu::ShaderModule MakeModule(const std::string& code, u64 hash) {
@@ -364,6 +366,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         max_storage_buffers = limits.maxStorageBuffersPerShaderStage;
         max_vertex_buffers = limits.maxVertexBuffers;
         max_samplers = limits.maxSamplersPerShaderStage;
+        max_uniform_buffers = limits.maxUniformBuffersPerShaderStage;
     }
 }
 
@@ -511,6 +514,10 @@ GraphicsPipeline::GraphicsPipeline(PipelineCache& cache_, const GraphicsPipeline
     valid = true;
 }
 
+u32 GraphicsPipeline::CbufLimit(size_t stage) const {
+    return cache.max_uniform_buffers - 1 - (stage == 0 && !pulled_buffers.empty() ? 1 : 0);
+}
+
 bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant, bool infos_only) {
     auto& pools = cache.pools;
     pools.ReleaseContents();
@@ -615,6 +622,7 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
             kind_index += stage_textures;
             options.has_depth_target = variant_key.depth_format != wgpu::TextureFormat::Undefined;
             options.max_samplers = cache.max_samplers;
+            options.max_uniform_buffers = CbufLimit(stage);
             if (program.stage == Shader::Stage::VertexB && key.unique_hashes[5] != 0) {
                 options.output_interpolation = programs[5].info.interpolation;
             }
@@ -656,7 +664,24 @@ bool GraphicsPipeline::Translate(const VariantKey& variant_key, Variant& variant
             }
             const Shader::Info& info{stage_infos[stage]};
             const auto visibility = StageVisibility(stage);
-            for (const auto& desc : info.constant_buffer_descriptors) {
+            const u32 packed_cbuf_first{Shader::Backend::WGSL::PackedCbufFirst(info, CbufLimit(stage))};
+            for (u32 desc_index = 0; desc_index < info.constant_buffer_descriptors.size(); ++desc_index) {
+                const auto& desc{info.constant_buffer_descriptors[desc_index]};
+                if (desc_index == packed_cbuf_first) {
+                    auto& pack = entries.emplace_back();
+                    pack.binding = binding_index;
+                    pack.visibility = visibility;
+                    pack.buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+                    auto& range = entries.emplace_back();
+                    range.binding = binding_index + 1;
+                    range.visibility = visibility;
+                    range.buffer.type = wgpu::BufferBindingType::Uniform;
+                    range.buffer.minBindingSize = sizeof(CbufRanges);
+                }
+                if (desc_index >= packed_cbuf_first) {
+                    binding_index += desc.count;
+                    continue;
+                }
                 for (u32 i = 0; i < desc.count; ++i) {
                     auto& entry = entries.emplace_back();
                     entry.binding = binding_index++;
@@ -1109,7 +1134,34 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
             continue;
         }
         const Shader::Info& info{stage_infos[stage]};
-        for (const auto& desc : info.constant_buffer_descriptors) {
+        const u32 packed_cbuf_first{Shader::Backend::WGSL::PackedCbufFirst(info, CbufLimit(stage))};
+        cbuf_pack.clear();
+        CbufRanges ranges{};
+        u32 pack_binding{};
+        for (u32 desc_index = 0; desc_index < info.constant_buffer_descriptors.size(); ++desc_index) {
+            const auto& desc{info.constant_buffer_descriptors[desc_index]};
+            if (desc_index >= packed_cbuf_first) {
+                // Packed buffers are copied back to back at their bound sizes.
+                if (descriptor_index >= descriptors.size()) {
+                    return false;
+                }
+                const BufferDescriptor& bound = descriptors[descriptor_index++];
+                if (desc_index == packed_cbuf_first) {
+                    pack_binding = binding_index;
+                }
+                const size_t slot = desc_index - packed_cbuf_first;
+                const size_t base = cbuf_pack.size();
+                const size_t size = std::min<size_t>(
+                    Common::AlignUp(std::max<size_t>(bound.data.size(), 16), 16),
+                    UniformBindingSize(info, desc.index));
+                cbuf_pack.resize(base + size, 0);
+                std::copy_n(bound.data.begin(), std::min(bound.data.size(), size),
+                            cbuf_pack.begin() + base);
+                ranges[slot * 2] = static_cast<u32>(base / 16);
+                ranges[slot * 2 + 1] = static_cast<u32>(size / 16 - 1);
+                ++binding_index;
+                continue;
+            }
             for (u32 i = 0; i < desc.count; ++i) {
                 if (descriptor_index >= descriptors.size()) {
                     return false;
@@ -1130,6 +1182,19 @@ bool GraphicsPipeline::Configure(bool is_indexed) {
                 entry.offset = cache.uniform_ring.Push(bound.data);
                 entry.size = size;
             }
+        }
+        if (!cbuf_pack.empty()) {
+            auto& pack = entries.emplace_back();
+            pack.binding = pack_binding;
+            pack.buffer = cache.uniform_ring.Buffer();
+            pack.offset = cache.uniform_ring.Push(cbuf_pack);
+            pack.size = cbuf_pack.size();
+            auto& range = entries.emplace_back();
+            range.binding = pack_binding + 1;
+            range.buffer = cache.uniform_ring.Buffer();
+            range.offset = cache.uniform_ring.Push(
+                {reinterpret_cast<const u8*>(ranges.data()), sizeof(ranges)});
+            range.size = sizeof(ranges);
         }
         for (const auto& desc : info.storage_buffers_descriptors) {
             for (u32 i = 0; i < desc.count; ++i) {

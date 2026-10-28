@@ -20,23 +20,25 @@ constexpr char SWIZZLE[]{"xyzw"};
 /// Formats accesses to one constant buffer, consuming a dynamic binding exactly once.
 class CbufAccess {
 public:
-    CbufAccess(EmitContext& ctx, const IR::Value& binding) {
+    CbufAccess(EmitContext& ctx_, const IR::Value& binding) : ctx{ctx_} {
         if (binding.IsImmediate()) {
-            prefix = fmt::format("{}_cbuf{}[", ctx.stage_name, binding.U32());
-            suffix = "]";
+            index = binding.U32();
         } else {
-            prefix = fmt::format("GetCbufIndirect({},", ctx.var_alloc.Consume(binding));
-            suffix = ")";
+            indirect = ctx_.var_alloc.Consume(binding);
         }
     }
 
-    std::string operator()(std::string_view index) const {
-        return prefix + std::string{index} + suffix;
+    std::string operator()(std::string_view vector) const {
+        if (indirect.empty()) {
+            return ctx.CbufVector(index, vector);
+        }
+        return fmt::format("GetCbufIndirect({},{})", indirect, vector);
     }
 
 private:
-    std::string prefix;
-    std::string suffix;
+    const EmitContext& ctx;
+    u32 index{};
+    std::string indirect;
 };
 
 std::string ChooseCbuf(EmitContext& ctx, const IR::Value& binding, std::string_view index) {
