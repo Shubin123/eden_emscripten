@@ -1238,6 +1238,37 @@ private:
         case Opcode::FPVectorMulAdd32:
         case Opcode::FPVectorMulAdd64:
             return target.unfuse_fma && vector_usable(3);
+        case Opcode::FPVectorPairedAdd32:
+        case Opcode::FPVectorPairedAdd64:
+        case Opcode::FPVectorPairedAddLower32:
+            return vector_usable(2);
+        // These never round: NaN operands (and denormals under FZ) take the slow path.
+        case Opcode::FPMax32:
+        case Opcode::FPMax64:
+        case Opcode::FPMin32:
+        case Opcode::FPMin64:
+        case Opcode::FPMaxNumeric32:
+        case Opcode::FPMaxNumeric64:
+        case Opcode::FPMinNumeric32:
+        case Opcode::FPMinNumeric64:
+        case Opcode::FPVectorMax32:
+        case Opcode::FPVectorMax64:
+        case Opcode::FPVectorMin32:
+        case Opcode::FPVectorMin64:
+        case Opcode::FPVectorMaxNumeric32:
+        case Opcode::FPVectorMaxNumeric64:
+        case Opcode::FPVectorMinNumeric32:
+        case Opcode::FPVectorMinNumeric64:
+        case Opcode::FPVectorEqual32:
+        case Opcode::FPVectorEqual64:
+        case Opcode::FPVectorGreater32:
+        case Opcode::FPVectorGreater64:
+        case Opcode::FPVectorGreaterEqual32:
+        case Opcode::FPVectorGreaterEqual64:
+            return true;
+        case Opcode::FPSingleToHalf:
+            // Native results are below the range where alternative half precision differs.
+            return ConstantValue(op.args[1]) == u64(FP::RoundingMode::ToNearest_TieEven);
         default:
             return false;
         }
@@ -1286,6 +1317,23 @@ private:
         case Opcode::FPVectorMul64:
         case Opcode::FPVectorDiv32:
         case Opcode::FPVectorDiv64:
+        case Opcode::FPVectorPairedAdd32:
+        case Opcode::FPVectorPairedAdd64:
+        case Opcode::FPVectorPairedAddLower32:
+        case Opcode::FPVectorMax32:
+        case Opcode::FPVectorMax64:
+        case Opcode::FPVectorMin32:
+        case Opcode::FPVectorMin64:
+        case Opcode::FPVectorMaxNumeric32:
+        case Opcode::FPVectorMaxNumeric64:
+        case Opcode::FPVectorMinNumeric32:
+        case Opcode::FPVectorMinNumeric64:
+        case Opcode::FPVectorEqual32:
+        case Opcode::FPVectorEqual64:
+        case Opcode::FPVectorGreater32:
+        case Opcode::FPVectorGreater64:
+        case Opcode::FPVectorGreaterEqual32:
+        case Opcode::FPVectorGreaterEqual64:
             return !(ConstantValue(op.args[2]) & 1) || FlushToZero();
         case Opcode::FPVectorMulAdd32:
         case Opcode::FPVectorMulAdd64:
@@ -1375,7 +1423,25 @@ private:
         case Opcode::VectorBroadcastLower8:
         case Opcode::VectorBroadcastLower16:
         case Opcode::VectorBroadcastLower32:
+        case Opcode::VectorLogicalVShift32:
+        case Opcode::VectorLogicalVShift64:
+        case Opcode::VectorDeinterleaveEven8:
+        case Opcode::VectorDeinterleaveEven16:
+        case Opcode::VectorDeinterleaveEven32:
+        case Opcode::VectorDeinterleaveEven64:
+        case Opcode::VectorDeinterleaveEvenLower8:
+        case Opcode::VectorDeinterleaveEvenLower16:
+        case Opcode::VectorDeinterleaveEvenLower32:
+        case Opcode::VectorDeinterleaveOdd8:
+        case Opcode::VectorDeinterleaveOdd16:
+        case Opcode::VectorDeinterleaveOdd32:
+        case Opcode::VectorDeinterleaveOdd64:
+        case Opcode::VectorDeinterleaveOddLower8:
+        case Opcode::VectorDeinterleaveOddLower16:
+        case Opcode::VectorDeinterleaveOddLower32:
             return true;
+        case Opcode::VectorRotateWholeVectorRight:
+            return IsConstant(op.args[1]) && ConstantValue(op.args[1]) % 8 == 0;
         case Opcode::VectorBroadcastElementLower8:
         case Opcode::VectorBroadcastElementLower16:
         case Opcode::VectorBroadcastElementLower32:
@@ -1750,7 +1816,39 @@ private:
         u32 simd_op = 0;
         bool muladd = false;
         bool subtract = false;
+        // Compares check their inputs instead: a true lane is a NaN pattern.
+        bool compare = false;
+        bool paired = false;
+        bool lower = false;
         switch (op.opcode) {
+        case Opcode::FPSingleToHalf:
+            return EmitGuardedSingleToHalf(index);
+        // A NaN operand gives a NaN native result, so FMAXNM/FMINNM can share FMAX/FMIN.
+        case Opcode::FPMax32:
+        case Opcode::FPMaxNumeric32: scalar_op = 0x97; break;
+        case Opcode::FPMax64:
+        case Opcode::FPMaxNumeric64: scalar_op = 0xA5; is64 = true; break;
+        case Opcode::FPMin32:
+        case Opcode::FPMinNumeric32: scalar_op = 0x96; break;
+        case Opcode::FPMin64:
+        case Opcode::FPMinNumeric64: scalar_op = 0xA4; is64 = true; break;
+        case Opcode::FPVectorMax32:
+        case Opcode::FPVectorMaxNumeric32: simd_op = 233; vector = true; break;
+        case Opcode::FPVectorMax64:
+        case Opcode::FPVectorMaxNumeric64: simd_op = 245; vector = true; is64 = true; break;
+        case Opcode::FPVectorMin32:
+        case Opcode::FPVectorMinNumeric32: simd_op = 232; vector = true; break;
+        case Opcode::FPVectorMin64:
+        case Opcode::FPVectorMinNumeric64: simd_op = 244; vector = true; is64 = true; break;
+        case Opcode::FPVectorEqual32: simd_op = 65; vector = compare = true; break;
+        case Opcode::FPVectorEqual64: simd_op = 71; vector = compare = true; is64 = true; break;
+        case Opcode::FPVectorGreater32: simd_op = 68; vector = compare = true; break;
+        case Opcode::FPVectorGreater64: simd_op = 74; vector = compare = true; is64 = true; break;
+        case Opcode::FPVectorGreaterEqual32: simd_op = 70; vector = compare = true; break;
+        case Opcode::FPVectorGreaterEqual64: simd_op = 76; vector = compare = true; is64 = true; break;
+        case Opcode::FPVectorPairedAddLower32: lower = true; [[fallthrough]];
+        case Opcode::FPVectorPairedAdd32: simd_op = 228; vector = paired = true; break;
+        case Opcode::FPVectorPairedAdd64: simd_op = 240; vector = paired = true; is64 = true; break;
         case Opcode::FPAdd32: scalar_op = 0x92; break;
         case Opcode::FPAdd64: scalar_op = 0xA0; is64 = true; break;
         case Opcode::FPSub32: scalar_op = 0x93; break;
@@ -1783,8 +1881,34 @@ private:
         }
 
         if (vector) {
+            // Pairwise adds sum the even and odd elements of the operands' concatenation; the
+            // lower form only has two of each, repeated so that no lane is left over.
+            std::array<std::array<u8, 16>, 2> pairs{};
+            if (paired) {
+                static constexpr u8 elements32[2][4] = {{0, 2, 4, 6}, {1, 3, 5, 7}};
+                static constexpr u8 lower32[2][4] = {{0, 4, 0, 4}, {1, 5, 1, 5}};
+                static constexpr u8 elements64[2][2] = {{0, 2}, {1, 3}};
+                for (size_t i = 0; i < 2; ++i) {
+                    for (size_t byte = 0; byte < 16; ++byte) {
+                        const size_t element = is64 ? elements64[i][byte / 8] : (lower ? lower32 : elements32)[i][byte / 4];
+                        pairs[i][byte] = u8(element * (is64 ? 8 : 4) + byte % (is64 ? 8 : 4));
+                    }
+                }
+            }
+            const auto push_input = [&](size_t i) {
+                if (!paired) {
+                    PushV128(op, i);
+                    return;
+                }
+                PushV128(op, 0);
+                PushV128(op, 1);
+                SimdOp(13);  // i8x16.shuffle
+                for (const u8 lane : pairs[i]) {
+                    code.Byte(lane);
+                }
+            };
             for (size_t i = 0; i < num_inputs; ++i) {
-                PushV128(op, i);
+                push_input(i);
             }
             if (muladd) {
                 SimdOp(is64 ? 242 : 230);  // mul
@@ -1793,20 +1917,34 @@ private:
                 SimdOp(simd_op);
             }
             code.Set(kV128C);
-            code.Get(kV128C);
-            PushSpecialV128(is64, true, fz);
-            if (fz) {
-                // NaN inputs give NaN results, so inputs only need the denormal check.
+            if (compare) {
+                code.I32Const(0);
                 for (size_t i = 0; i < num_inputs; ++i) {
-                    PushV128(op, i);
-                    PushSpecialV128(is64, false, true);
+                    push_input(i);
+                    PushSpecialV128(is64, true, fz);
                     code.Byte(Insn::I32Or);
+                }
+            } else {
+                code.Get(kV128C);
+                PushSpecialV128(is64, true, fz);
+                if (fz) {
+                    // NaN inputs give NaN results, so inputs only need the denormal check.
+                    for (size_t i = 0; i < num_inputs; ++i) {
+                        push_input(i);
+                        PushSpecialV128(is64, false, true);
+                        code.Byte(Insn::I32Or);
+                    }
                 }
             }
             code.If(BranchHint::Unlikely);
             CallHelper(index);
             code.Else();
             code.Get(kV128C);
+            if (lower) {
+                code.I64Const(0);
+                SimdOp(30);  // i64x2.replace_lane
+                code.Byte(1);
+            }
             StoreV128(index);
             code.End();
             return true;
@@ -1884,6 +2022,52 @@ private:
         code.Get(b);
         code.Byte(is64 ? 0x61 : 0x5B);  // eq
         code.Byte(Insn::Select);
+        code.End();
+        Define(index);
+        return true;
+    }
+
+    /// FCVT from single to half at round to nearest. Results that are half denormals, overflow,
+    /// or come from NaN take the slow path for their exceptions; the rest round natively.
+    bool EmitGuardedSingleToHalf(size_t index) {
+        const Op& op = block.ops[index];
+        PushArg(op, 0);
+        And(0x7FFFFFFF);
+        code.Set(tmp2);
+        // Nonzero and below the smallest normal half, or 65520 (rounds to infinity) and above.
+        code.Get(tmp2);
+        code.I64Const(1);
+        code.Byte(Insn::I64Sub);
+        code.I64Const(0x38800000 - 1);
+        code.Byte(Insn::I64LtU);
+        code.Get(tmp2);
+        code.I64Const(0x477FF000);
+        code.Byte(Insn::I64GeU);
+        code.Byte(Insn::I32Or);
+        code.IfI64(BranchHint::Unlikely);
+        SpillArg(op, 0);
+        SpillArg(op, 1);
+        CallHelper(index);
+        code.Get(kFrame);
+        code.Mem(Insn::I64Load, u64(index) * kSlotSize + kLoOffset);
+        code.Else();
+        // Rebias the exponent and round the 13 dropped mantissa bits to nearest even.
+        code.Get(tmp2);
+        code.I64Const(0xFFF - 0x38000000);
+        code.Byte(Insn::I64Add);
+        code.Get(tmp2);
+        Shr(13);
+        And(1);
+        code.Byte(Insn::I64Add);
+        Shr(13);
+        code.I64Const(0);
+        code.Get(tmp2);
+        code.Byte(Insn::I32WrapI64);
+        code.Byte(Insn::Select);
+        PushArg(op, 0);
+        Shr(16);
+        And(0x8000);
+        code.Byte(Insn::I64Or);
         code.End();
         Define(index);
         return true;
@@ -2458,6 +2642,99 @@ private:
                 lanes[i] = u8(j < width ? j : 16 + j - width);
             }
             Shuffle(op, index, lanes, lower);
+            return true;
+        }
+        case Opcode::VectorDeinterleaveEven8:
+        case Opcode::VectorDeinterleaveEven16:
+        case Opcode::VectorDeinterleaveEven32:
+        case Opcode::VectorDeinterleaveEven64:
+        case Opcode::VectorDeinterleaveEvenLower8:
+        case Opcode::VectorDeinterleaveEvenLower16:
+        case Opcode::VectorDeinterleaveEvenLower32:
+        case Opcode::VectorDeinterleaveOdd8:
+        case Opcode::VectorDeinterleaveOdd16:
+        case Opcode::VectorDeinterleaveOdd32:
+        case Opcode::VectorDeinterleaveOdd64:
+        case Opcode::VectorDeinterleaveOddLower8:
+        case Opcode::VectorDeinterleaveOddLower16:
+        case Opcode::VectorDeinterleaveOddLower32: {
+            // The even or odd elements of x then of y; the lower forms only use the lower halves.
+            const size_t kind = size_t(op.opcode) - size_t(Opcode::VectorDeinterleaveEven8);
+            const size_t odd = kind / 7;
+            const bool lower = kind % 7 >= 4;
+            const size_t esize = size_t(1) << (lower ? kind % 7 - 4 : kind % 7);
+            const size_t half = (lower ? 8 : 16) / esize / 2;
+            std::array<u8, 16> lanes{};
+            for (size_t lane = 0; lane < 2 * half; ++lane) {
+                const size_t source = (lane >= half ? 16 / esize : 0) + 2 * (lane % half) + odd;
+                for (size_t byte = 0; byte < esize; ++byte) {
+                    lanes[lane * esize + byte] = u8(source * esize + byte);
+                }
+            }
+            Shuffle(op, index, lanes, lower);
+            return true;
+        }
+        case Opcode::VectorRotateWholeVectorRight: {
+            const size_t bytes = size_t(ConstantValue(op.args[1]) & 127) / 8;
+            PushV128(op, 0);
+            PushV128(op, 0);
+            SimdOp(13);  // i8x16.shuffle
+            for (size_t i = 0; i < 16; ++i) {
+                code.Byte(u8((i + bytes) % 16));
+            }
+            StoreV128(index);
+            return true;
+        }
+        case Opcode::VectorLogicalVShift32:
+        case Opcode::VectorLogicalVShift64: {
+            // Per lane: shift left by the signed low byte of y, right when it is negative, and
+            // zero when it reaches the lane width either way.
+            const bool is64 = op.opcode == Opcode::VectorLogicalVShift64;
+            const u64 width = is64 ? 64 : 32;
+            PushV128(op, 0);
+            code.Set(kV128B);
+            PushV128(op, 1);
+            code.Set(kV128C);
+            code.Get(kV128B);
+            for (size_t lane = 0; lane < 128 / width; ++lane) {
+                code.Get(kV128B);
+                SimdOp(is64 ? 29 : 27);  // i64x2/i32x4.extract_lane
+                code.Byte(u8(lane));
+                if (!is64) {
+                    code.Byte(Insn::I64ExtendI32U);
+                }
+                code.Set(tmp0);
+                code.Get(kV128C);
+                SimdOp(21);  // i8x16.extract_lane_s
+                code.Byte(u8(lane * width / 8));
+                code.Byte(Insn::I64ExtendI32S);
+                code.Set(tmp1);
+                code.Get(tmp0);
+                code.Get(tmp1);
+                code.Byte(Insn::I64Shl);
+                code.Get(tmp0);
+                code.I64Const(0);
+                code.Get(tmp1);
+                code.Byte(Insn::I64Sub);
+                code.Byte(Insn::I64ShrU);
+                code.Get(tmp1);
+                code.I64Const(0);
+                code.Byte(Insn::I64GeS);
+                code.Byte(Insn::Select);
+                code.I64Const(0);
+                code.Get(tmp1);
+                code.I64Const(width - 1);
+                code.Byte(Insn::I64Add);
+                code.I64Const(2 * width - 1);
+                code.Byte(Insn::I64LtU);
+                code.Byte(Insn::Select);
+                if (!is64) {
+                    code.Byte(Insn::I32WrapI64);
+                }
+                SimdOp(is64 ? 30 : 28);  // i64x2/i32x4.replace_lane
+                code.Byte(u8(lane));
+            }
+            StoreV128(index);
             return true;
         }
         case Opcode::VectorBroadcast32:
