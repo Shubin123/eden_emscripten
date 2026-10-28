@@ -95,7 +95,7 @@ static_assert(sizeof(DispatchEntry) == 32);
 /// the next location there and tail-calls its region while there is budget left.
 class DispatchTables {
 public:
-    static constexpr size_t kEntries = 2048;
+    static constexpr size_t kEntries = 8192;
 
     static size_t IndexOf(u64 location) {
         return ((location ^ (location >> 32)) >> 2) % kEntries;
