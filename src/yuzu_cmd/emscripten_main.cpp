@@ -117,6 +117,8 @@ std::deque<Request> g_requests;
 
 std::atomic<int> g_state{int(EmuState::Idle)};
 std::atomic<int> g_load_result{0};
+/// Whether the title last booted says it is for the Nintendo Switch 2, which is not supported.
+std::atomic<bool> g_switch2_title{false};
 std::atomic<double> g_game_fps{0.0};
 std::atomic<double> g_system_fps{0.0};
 std::atomic<double> g_emulation_speed{0.0};
@@ -193,6 +195,7 @@ public:
         LOG_INFO(Frontend, "CPU: {} emulated cores, multicore {}", Core::Hardware::NUM_CPU_CORES,
                  Settings::values.use_multi_core.GetValue() ? "on" : "off");
         SetGameInfo("{}");
+        g_switch2_title = false;
         ResetFrameTimes();
         WebGPU::pipeline_stats.Reset();
 
@@ -215,6 +218,7 @@ public:
         g_load_result = int(result);
         if (result != Core::SystemResultStatus::Success) {
             LOG_CRITICAL(Frontend, "Failed to load {} (result {})", path, u32(result));
+            NoteSwitch2Title(ReadsAsSwitch2(path));
             g_state = int(EmuState::Failed);
             return false;
         }
@@ -320,6 +324,27 @@ public:
         g_game_info = std::move(info);
     }
 
+    /// Whether the file's own control data says it is for the Nintendo Switch 2, for a title that
+    /// did not load (a loaded one is checked from its metadata in CacheGameInfo).
+    bool ReadsAsSwitch2(const std::string& path) {
+        const auto file = system.GetFilesystem()->OpenFile(path, FileSys::OpenMode::Read);
+        if (!file) {
+            return false;
+        }
+        const auto loader = Loader::GetLoader(system, file);
+        FileSys::NACP nacp;
+        return loader && loader->ReadControlData(nacp) == Loader::ResultStatus::Success &&
+               nacp.GetApparentPlatform() == FileSys::ApparentPlatform::Ounce;
+    }
+
+    static void NoteSwitch2Title(bool switch2) {
+        g_switch2_title = switch2;
+        if (switch2) {
+            LOG_CRITICAL(Frontend, "This is a Nintendo Switch 2 game. Switch 2 games are not "
+                                   "supported yet: they may not boot or run correctly.");
+        }
+    }
+
     /// Title metadata, gathered the same way the Qt frontend titles its window.
     void CacheGameInfo(const std::string& path) {
         const u64 program_id = system.GetApplicationProcessProgramID();
@@ -335,14 +360,19 @@ public:
                                        system.GetContentProvider()};
         std::string name;
         std::string display_version;
+        bool switch2 = false;
         if (const auto metadata = pm.GetControlMetadata(); metadata.first) {
             name = metadata.first->GetApplicationName();
             display_version = metadata.first->GetVersionString();
+            switch2 = metadata.first->GetApparentPlatform() == FileSys::ApparentPlatform::Ounce;
         } else if (FileSys::NACP nacp; loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
             // Content opened straight from a file is not installed, so read the file's own NACP.
             name = nacp.GetApplicationName();
             display_version = nacp.GetVersionString();
+            switch2 = nacp.GetApparentPlatform() == FileSys::ApparentPlatform::Ounce;
         }
+        NoteSwitch2Title(switch2);
+        info["switch2"] = switch2;
         if (name.empty()) {
             void(loader.ReadTitle(name));
         }
@@ -514,6 +544,12 @@ EMSCRIPTEN_KEEPALIVE int eden_get_state() {
 
 EMSCRIPTEN_KEEPALIVE int eden_get_load_result() {
     return g_load_result;
+}
+
+/// 1 when the title last booted is a Nintendo Switch 2 game (its control data says Ounce), so the
+/// page can say why it fails or misbehaves.
+EMSCRIPTEN_KEEPALIVE int eden_is_switch2_title() {
+    return g_switch2_title ? 1 : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE double eden_get_game_fps() {

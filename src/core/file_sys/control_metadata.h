@@ -289,6 +289,7 @@ public:
     [[nodiscard]] u64 GetDeviceSaveDataSize() const;
     [[nodiscard]] u32 GetParentalControlFlag() const;
     [[nodiscard]] const std::array<u8, 0x20>& GetRatingAge() const;
+    [[nodiscard]] ApparentPlatform GetApparentPlatform() const;
 
     RawNACP raw{};
     std::vector<LanguageEntry> language_entries;

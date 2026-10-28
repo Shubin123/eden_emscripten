@@ -214,6 +214,10 @@ const std::array<u8, 0x20>& NACP::GetRatingAge() const {
     return raw.rating_age;
 }
 
+ApparentPlatform NACP::GetApparentPlatform() const {
+    return raw.apparent_platform;
+}
+
 std::vector<u8> NACP::GetRawBytes() const {
     std::vector<u8> out(sizeof(RawNACP));
     std::memcpy(out.data(), &raw, sizeof(RawNACP));
