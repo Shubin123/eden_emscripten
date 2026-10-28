@@ -120,3 +120,4 @@ bool TranslateSingleInstruction(IR::Block& block, LocationDescriptor descriptor,
 #include "dynarmic/frontend/A64/translate/impl/system_flag_format.cpp"
 #include "dynarmic/frontend/A64/translate/impl/system_flag_manipulation.cpp"
 #include "dynarmic/frontend/A64/translate/impl/simd_rdm.cpp"
+#include "dynarmic/frontend/A64/translate/impl/simd_half_precision.cpp"
