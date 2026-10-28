@@ -1667,11 +1667,31 @@ const PROGRAMS = {
         0x5f219802, 0x4e083c43, 0x4e183c45, 0xcadb1c7b, 0xcadb2cbb, 0x4ebf1fe2, 0x7f119002, 0x4e083c43,
         0x4e183c45, 0xcadb1c7b, 0xcadb2cbb, 0xd51b441f, 0xd28d6d87, 0xf2b61067, 0xf2c5af27, 0xf2e6dbc7,
         0xeb07037f, 0x1a9f07fd, 0xd280003c, 0x14000000],
+    // Armv8.3 pointer authentication without keys: pacia, pacib, pacda, pacdb, their autia/autib/
+    // autda/autdb pairs and zero-modifier forms, xpaci and xpacd leave the pointer unchanged and
+    // pacga gives zero; ldraa/ldrab at the offset limits and with writeback; braa, brab, braaz,
+    // brabz, blraa (also through x30), blrabz, retaa and retab. x29 counts mismatches and branches
+    // not taken.
+    pauth: [0xd2a0040a, 0xd2824680, 0xf2aacf00, 0xf2c00120, 0xd28009a1, 0xaa0003ec, 0xdac10020, 0xdac11020,
+        0xdac107e0, 0xdac117e0, 0xdac123e0, 0xdac133e0, 0xdac127e0, 0xdac137e0, 0xdac10820, 0xdac11820,
+        0xdac10c20, 0xdac11c20, 0xdac12be0, 0xdac13be0, 0xdac12fe0, 0xdac13fe0, 0xdac143e0, 0xdac147e0,
+        0xeb0c001f, 0x1a9f07f4, 0x8b1403bd, 0xd28000a2, 0x9ac13002, 0xf100005f, 0x1a9f07f4, 0x8b1403bd,
+        0xd2955543, 0xf2f77763, 0xf9000543, 0xd2888884, 0xf2c22224, 0xf81f0144, 0xd28aaaa5, 0xf907fd45,
+        0xd28cccc6, 0xd1400547, 0xf90000e6, 0xf8201548, 0xeb03011f, 0x1a9f07f4, 0x8b1403bd, 0xf8bff548,
+        0xeb05011f, 0x1a9f07f4, 0x8b1403bd, 0xf8600548, 0xeb06011f, 0x1a9f07f4, 0x8b1403bd, 0xf148015f,
+        0x1a9f07f4, 0x8b1403bd, 0xaa0a03eb, 0xf8ffed68, 0xeb04011f, 0x1a9f07f4, 0x8b1403bd, 0xd1004147,
+        0xeb07017f, 0x1a9f07f4, 0x8b1403bd, 0xaa1f03ee, 0x1000046d, 0xd73f09a1, 0x10000010, 0xeb1003df,
+        0x1a9f07f4, 0x8b1403bd, 0xf10005df, 0x1a9f07f4, 0x8b1403bd, 0xaa1f03ef, 0x1000036d, 0xd63f0dbf,
+        0xf10009ff, 0x1a9f07f4, 0x8b1403bd, 0xaa1f03f1, 0x100002fe, 0xd73f0bdf, 0xf1000e3f, 0x1a9f07f4,
+        0x8b1403bd, 0x1000006d, 0xd71f09a1, 0x910007bd, 0x1000006d, 0xd61f0dbf, 0x910007bd, 0x1000006d,
+        0xd71f0dbf, 0x910007bd, 0x1000006d, 0xd61f09bf, 0x910007bd, 0x9100079c, 0x17ffff9a, 0xd280002e,
+        0xd65f0bff, 0xd280004f, 0xd65f0fff, 0xd2800071, 0xd65f0bff],
 };
 // Programs that check their own results: the register that counts mismatches, which must end at
 // zero, and the one that counts completed rounds, which must not.
 const PROGRAM_SELF_CHECKS = { lse: { errors: 29, rounds: 28 }, fp16: { errors: 29, rounds: 28 },
-    rdm: { errors: 29, rounds: 28 }, fp16vec: { errors: 29, rounds: 28 } };
+    rdm: { errors: 29, rounds: 28 }, fp16vec: { errors: 29, rounds: 28 },
+    pauth: { errors: 29, rounds: 28 } };
 // Guest instructions to run for programs longer than --ticks that do not loop.
 const PROGRAM_TICKS = { fp16: 6000, rdm: 6000, fp16vec: 5220 };
 // FPCR values each program runs under (default: 0). Flush-to-zero, default NaN, alternative half
