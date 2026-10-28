@@ -235,9 +235,11 @@ inline F RoundedArith(HostOp op, F a, F b, FP::RoundingMode mode) {
         }
         break;
     case HostOp::Div: {
+        // A NaN remainder comes from an infinite operand or a zero divisor, where the quotient
+        // (zero or infinity) is exact.
         if constexpr (std::is_same_v<F, float>) {
             const double r = std::fma(-double(q), double(b), double(a));
-            error = (r == 0) ? F(0) : ((r > 0) == (b > 0) ? F(1) : F(-1));
+            error = (r == 0 || std::isnan(r)) ? F(0) : ((r > 0) == (b > 0) ? F(1) : F(-1));
         } else {
             F r = std::fma(-q, b, a);
             if (std::abs(q) < std::numeric_limits<F>::min() && a != 0 && std::isfinite(a) && std::isfinite(b) && b != 0) {
@@ -245,7 +247,7 @@ inline F RoundedArith(HostOp op, F a, F b, FP::RoundingMode mode) {
                 constexpr F scale = 0x1p200;
                 r = std::fma(-q * scale, b, a * scale);
             }
-            error = (r == 0) ? F(0) : ((r > 0) == (b > 0) ? F(1) : F(-1));
+            error = (r == 0 || std::isnan(r)) ? F(0) : ((r > 0) == (b > 0) ? F(1) : F(-1));
         }
         break;
     }
