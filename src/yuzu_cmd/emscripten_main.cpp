@@ -586,6 +586,16 @@ EMSCRIPTEN_KEEPALIVE int eden_get_speed_limit() {
     return Settings::values.use_speed_limit.GetValue() ? Settings::SpeedLimit() : 0;
 }
 
+/// Presents only every `interval`-th game frame (1 = all). Game speed and the game frame count are
+/// unchanged, so test scripts keep their timing while the browser composites less.
+EMSCRIPTEN_KEEPALIVE void eden_set_present_interval(int interval) {
+    WebGPU::present_interval.store(static_cast<u32>(std::clamp(interval, 1, 60)), std::memory_order_relaxed);
+}
+
+EMSCRIPTEN_KEEPALIVE int eden_get_present_interval() {
+    return static_cast<int>(WebGPU::present_interval.load(std::memory_order_relaxed));
+}
+
 /// Browser audio controls run on the calling UI thread; no emulation locks are needed.
 EMSCRIPTEN_KEEPALIVE int eden_get_audio_state() {
 #ifdef EDEN_WEB_HEADLESS

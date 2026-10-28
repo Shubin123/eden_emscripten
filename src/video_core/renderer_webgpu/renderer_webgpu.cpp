@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "core/frontend/emu_window.h"
@@ -9,6 +10,7 @@
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_webgpu/renderer_webgpu.h"
+#include "video_core/renderer_webgpu/wgpu_stats.h"
 #include "video_core/renderer_webgpu/wgpu_thread.h"
 
 namespace WebGPU {
@@ -42,8 +44,9 @@ void RendererWebGPU::Composite(std::span<const Tegra::FramebufferConfig> layers)
     }
     auto& thread = Thread::Get();
     rasterizer->FlushCommands();
+    const bool present = m_current_frame % std::max(present_interval.load(std::memory_order_relaxed), 1u) == 0;
     wgpu::CommandEncoder encoder = thread.device.CreateCommandEncoder();
-    if (presenter->BeginFrame(encoder)) {
+    if (present && presenter->BeginFrame(encoder)) {
         for (const auto& layer : layers) {
             u32 width = layer.width;
             u32 height = layer.height;

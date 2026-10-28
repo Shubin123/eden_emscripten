@@ -35,4 +35,8 @@ struct PipelineStats {
 
 inline PipelineStats pipeline_stats;
 
+/// Composite (blit and present) only every present_interval-th frame; the others are still
+/// rendered, flushed and counted as game frames. Tests raise it to skip host work they do not use.
+inline std::atomic<u32> present_interval{1};
+
 } // namespace WebGPU
