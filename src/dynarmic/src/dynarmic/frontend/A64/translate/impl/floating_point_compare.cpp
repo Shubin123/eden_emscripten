@@ -9,16 +9,20 @@ namespace Dynarmic::A64 {
 namespace {
 bool FPCompare(TranslatorVisitor& v, Imm<2> type, Vec Vm, Vec Vn, bool exc_on_qnan, bool cmp_with_zero) {
     const auto datasize = FPGetDataSize(type);
-    if (!datasize || *datasize == 16) {
+    if (!datasize) {
         return v.UnallocatedEncoding();
     }
 
-    const IR::U32U64 operand1 = v.V_scalar(*datasize, Vn);
+    IR::U32U64 operand1;
     IR::U32U64 operand2;
-    if (cmp_with_zero) {
-        operand2 = v.I(*datasize, 0);
+    if (*datasize == 16) {
+        // Compared in single precision: the conversion is exact, and raises Invalid Operation
+        // for a signalling NaN as the comparison would.
+        operand1 = v.HalfOperand(IR::U16{v.V_scalar(16, Vn)});
+        operand2 = cmp_with_zero ? IR::U32{v.ir.Imm32(0)} : v.HalfOperand(IR::U16{v.V_scalar(16, Vm)});
     } else {
-        operand2 = v.V_scalar(*datasize, Vm);
+        operand1 = v.V_scalar(*datasize, Vn);
+        operand2 = cmp_with_zero ? IR::U32U64{v.I(*datasize, 0)} : IR::U32U64{v.V_scalar(*datasize, Vm)};
     }
 
     const auto nzcv = v.ir.FPCompare(operand1, operand2, exc_on_qnan);

@@ -144,8 +144,10 @@ bool ShouldTestA32Inst(u32 instruction, u32 pc, bool is_thumb, bool is_last_inst
     return ShouldTestInst(block);
 }
 
-bool ShouldTestA64Inst(u32 instruction, u64 pc, bool is_last_inst) {
-    const A64::LocationDescriptor location = A64::LocationDescriptor{pc, {}};
+bool ShouldTestA64Inst(u32 instruction, u64 pc, bool is_last_inst, u32 fpcr) {
+    // Translated under the FPCR the test runs with: whether an instruction is defined can depend
+    // on it (half-precision arithmetic under alternative half precision).
+    const A64::LocationDescriptor location = A64::LocationDescriptor{pc, FP::FPCR{fpcr}};
     IR::Block block{location};
     const bool should_continue = A64::TranslateSingleInstruction(block, location, instruction);
 
@@ -325,7 +327,7 @@ std::vector<u16> GenRandomThumbInst(u32 pc, bool is_last_inst, A32::ITState it_s
     }
 }
 
-u32 GenRandomA64Inst(u64 pc, bool is_last_inst) {
+u32 GenRandomA64Inst(u64 pc, bool is_last_inst, u32 fpcr) {
     static const struct InstructionGeneratorInfo {
         std::vector<InstructionGenerator> generators;
         std::vector<InstructionGenerator> invalid;
@@ -378,7 +380,7 @@ u32 GenRandomA64Inst(u64 pc, bool is_last_inst) {
         if (std::any_of(instructions.invalid.begin(), instructions.invalid.end(), [inst](const auto& invalid) { return invalid.Match(inst); })) {
             continue;
         }
-        if (ShouldTestA64Inst(inst, pc, is_last_inst)) {
+        if (ShouldTestA64Inst(inst, pc, is_last_inst, fpcr)) {
             return inst;
         }
     }
@@ -653,7 +655,7 @@ void TestA64(size_t num_instructions, size_t num_iterations, bool noopt, bool sh
 
         instructions.clear();
         for (size_t i = 0; i < num_instructions; ++i) {
-            instructions.emplace_back(GenRandomA64Inst(static_cast<u32>(start_address + 4 * instructions.size()), i == num_instructions - 1));
+            instructions.emplace_back(GenRandomA64Inst(static_cast<u32>(start_address + 4 * instructions.size()), i == num_instructions - 1, fpcr));
         }
 
         RunTestInstance(jit, jit_env, regs, vecs, instructions, pstate, fpcr, initial_sp, start_address, num_instructions, show_disas);

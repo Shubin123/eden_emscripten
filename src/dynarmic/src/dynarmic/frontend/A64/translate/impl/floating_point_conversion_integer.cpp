@@ -11,11 +11,21 @@ namespace Dynarmic::A64 {
 bool TranslatorVisitor::SCVTF_float_int(bool sf, Imm<2> type, Reg Rn, Vec Vd) {
     const size_t intsize = sf ? 64 : 32;
     const auto fltsize = FPGetDataSize(type);
-    if (!fltsize || *fltsize == 16) {
+    if (!fltsize) {
         return UnallocatedEncoding();
     }
 
     const IR::U32U64 intval = X(intsize, Rn);
+    if (*fltsize == 16) {
+        // Through double, which holds every value that does not overflow half exactly, so the
+        // result rounds once.
+        if (!HalfArithmeticSupported()) {
+            return UnallocatedEncoding();
+        }
+        const auto rounding = ir.current_location->FPCR().RMode();
+        V_scalar(16, Vd, ir.FPDoubleToHalf(ir.FPSignedFixedToDouble(intval, 0, rounding), rounding));
+        return true;
+    }
     IR::U32U64 fltval;
 
     if (*fltsize == 32) {
@@ -34,11 +44,21 @@ bool TranslatorVisitor::SCVTF_float_int(bool sf, Imm<2> type, Reg Rn, Vec Vd) {
 bool TranslatorVisitor::UCVTF_float_int(bool sf, Imm<2> type, Reg Rn, Vec Vd) {
     const size_t intsize = sf ? 64 : 32;
     const auto fltsize = FPGetDataSize(type);
-    if (!fltsize || *fltsize == 16) {
+    if (!fltsize) {
         return UnallocatedEncoding();
     }
 
     const IR::U32U64 intval = X(intsize, Rn);
+    if (*fltsize == 16) {
+        // Through double, which holds every value that does not overflow half exactly, so the
+        // result rounds once.
+        if (!HalfArithmeticSupported()) {
+            return UnallocatedEncoding();
+        }
+        const auto rounding = ir.current_location->FPCR().RMode();
+        V_scalar(16, Vd, ir.FPDoubleToHalf(ir.FPUnsignedFixedToDouble(intval, 0, rounding), rounding));
+        return true;
+    }
     IR::U32U64 fltval;
 
     if (*fltsize == 32) {

@@ -45,8 +45,17 @@ bool TranslatorVisitor::FNEG_float(Imm<2> type, Vec Vn, Vec Vd) {
 
 bool TranslatorVisitor::FSQRT_float(Imm<2> type, Vec Vn, Vec Vd) {
     const auto datasize = FPGetDataSize(type);
-    if (!datasize || *datasize == 16) {
+    if (!datasize) {
         return UnallocatedEncoding();
+    }
+    if (*datasize == 16) {
+        if (!HalfArithmeticSupported()) {
+            return UnallocatedEncoding();
+        }
+        const IR::U16 operand = IR::U16{V_scalar(16, Vn)};
+        const IR::U16 result = HalfResult(IR::U32{ir.FPSqrt(HalfOperand(operand))});
+        V_scalar(16, Vd, HalfNaNs(operand, operand, result, false));
+        return true;
     }
 
     const IR::U32U64 operand = V_scalar(*datasize, Vn);

@@ -64,6 +64,14 @@ struct TranslatorVisitor final {
 
     IR::U32U64 SignExtend(IR::UAny value, size_t to_size);
     IR::U32U64 ZeroExtend(IR::UAny value, size_t to_size);
+
+    // Half-precision (Armv8.2 FP16) arithmetic is computed in single precision: half operands
+    // convert exactly, and rounding the single result of one operation to half gives the half
+    // result. These add what the conversions leave out: FZ16 and the NaN rules of half operands.
+    bool HalfArithmeticSupported();
+    IR::U32 HalfOperand(const IR::U16& value);
+    IR::U16 HalfResult(const IR::U32& value);
+    IR::U16 HalfNaNs(const IR::U16& a, const IR::U16& b, const IR::U16& result, bool numeric);
     IR::U32U64 ShiftReg(size_t bitsize, Reg reg, Imm<2> shift, IR::U8 amount);
     IR::U32U64 ExtendReg(size_t bitsize, Reg reg, Imm<3> option, u8 shift);
 

@@ -289,6 +289,71 @@ IR::U32U64 TranslatorVisitor::SignExtend(IR::UAny value, size_t to_size) {
     UNREACHABLE();
 }
 
+namespace {
+
+/// All ones when `value` is nonzero.
+IR::U32 HalfMaskNonzero(IR::IREmitter& ir, const IR::U32& value) {
+    return IR::U32{ir.ArithmeticShiftRight(ir.Or(value, ir.Sub(ir.Imm32(0), value)), ir.Imm8(31))};
+}
+
+/// `a` where `mask` is set, else `b`.
+IR::U32 HalfSelect(IR::IREmitter& ir, const IR::U32& mask, const IR::U32& a, const IR::U32& b) {
+    return IR::U32{ir.Or(ir.And(a, mask), ir.AndNot(b, mask))};
+}
+
+/// Half bits with a denormal replaced by zero of the same sign.
+IR::U32 HalfFlush(IR::IREmitter& ir, const IR::U32& bits) {
+    const IR::U32 normal = HalfMaskNonzero(ir, IR::U32{ir.And(bits, ir.Imm32(0x7C00))});
+    return HalfSelect(ir, normal, bits, IR::U32{ir.And(bits, ir.Imm32(0x8000))});
+}
+
+/// All ones when the half bits are a NaN.
+IR::U32 HalfNaNMask(IR::IREmitter& ir, const IR::U32& bits) {
+    return IR::U32{ir.ArithmeticShiftRight(ir.Sub(ir.Imm32(0x7C00), ir.And(bits, ir.Imm32(0x7FFF))), ir.Imm8(31))};
+}
+
+}  // Anonymous namespace
+
+bool TranslatorVisitor::HalfArithmeticSupported() {
+    // The result returns to half through a conversion, which alternative half precision changes.
+    return !ir.current_location->FPCR().AHP();
+}
+
+IR::U32 TranslatorVisitor::HalfOperand(const IR::U16& value) {
+    IR::U32 bits = ir.ZeroExtendHalfToWord(value);
+    if (ir.current_location->FPCR().FZ16()) {
+        bits = HalfFlush(ir, bits);
+    }
+    return ir.FPHalfToSingle(ir.LeastSignificantHalf(bits), ir.current_location->FPCR().RMode());
+}
+
+IR::U16 TranslatorVisitor::HalfResult(const IR::U32& value) {
+    const IR::U16 half = ir.FPSingleToHalf(value, ir.current_location->FPCR().RMode());
+    if (!ir.current_location->FPCR().FZ16()) {
+        return half;
+    }
+    return ir.LeastSignificantHalf(HalfFlush(ir, ir.ZeroExtendHalfToWord(half)));
+}
+
+IR::U16 TranslatorVisitor::HalfNaNs(const IR::U16& a16, const IR::U16& b16, const IR::U16& result16, bool numeric) {
+    // Converting to single quiets a signalling NaN, which would lose its priority over a quiet one:
+    // pick the NaN from the half operands. FMAXNM and FMINNM (numeric) still treat a single quiet
+    // NaN as missing data, which the single-precision operation already did.
+    const IR::U32 a = ir.ZeroExtendHalfToWord(a16);
+    const IR::U32 b = ir.ZeroExtendHalfToWord(b16);
+    const IR::U32 nan_a = HalfNaNMask(ir, a);
+    const IR::U32 nan_b = HalfNaNMask(ir, b);
+    const IR::U32 snan_a = IR::U32{ir.AndNot(nan_a, HalfMaskNonzero(ir, IR::U32{ir.And(a, ir.Imm32(0x200))}))};
+    const IR::U32 snan_b = IR::U32{ir.AndNot(nan_b, HalfMaskNonzero(ir, IR::U32{ir.And(b, ir.Imm32(0x200))}))};
+    IR::U32 nan = HalfSelect(ir, snan_a, IR::U32{ir.Or(a, ir.Imm32(0x200))},
+                             HalfSelect(ir, snan_b, IR::U32{ir.Or(b, ir.Imm32(0x200))}, HalfSelect(ir, nan_a, a, b)));
+    if (ir.current_location->FPCR().DN()) {
+        nan = ir.Imm32(0x7E00);
+    }
+    const IR::U32 use_nan = numeric ? IR::U32{ir.Or(ir.Or(snan_a, snan_b), ir.And(nan_a, nan_b))} : IR::U32{ir.Or(nan_a, nan_b)};
+    return ir.LeastSignificantHalf(HalfSelect(ir, use_nan, nan, ir.ZeroExtendHalfToWord(result16)));
+}
+
 IR::U32U64 TranslatorVisitor::ZeroExtend(IR::UAny value, size_t to_size) {
     switch (to_size) {
     case 32:
