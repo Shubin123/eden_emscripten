@@ -4701,13 +4701,36 @@ u64 NextRegionId() {
     return next.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool TrackRegionCode(WasmRegion& region) {
+static u64 CodeBudget() {
     static const u64 budget = [] {
         const char* value = std::getenv("EDEN_JIT_CODE_BUDGET_MB");
         return u64(value ? std::max(16, std::atoi(value)) : 384) << 20;
     }();
+    return budget;
+}
+
+bool TrackRegionCode(WasmRegion& region) {
     region.tracked = true;
-    return g_live_code_bytes.fetch_add(region.wasm.size(), std::memory_order_relaxed) + region.wasm.size() > budget;
+    return g_live_code_bytes.fetch_add(region.wasm.size(), std::memory_order_relaxed) + region.wasm.size() > CodeBudget();
+}
+
+static std::atomic<u64> g_eviction_generation{0};
+static std::atomic<u64> g_last_eviction_us{0};
+
+void RequestEviction() {
+    const u64 now = NowUs();
+    u64 last = g_last_eviction_us.load(std::memory_order_relaxed);
+    if (now - last >= 500'000 && g_last_eviction_us.compare_exchange_strong(last, now)) {
+        g_eviction_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+u64 EvictionGeneration() {
+    return g_eviction_generation.load(std::memory_order_relaxed);
+}
+
+bool CodeOverHardLimit() {
+    return g_live_code_bytes.load(std::memory_order_relaxed) > CodeBudget() + CodeBudget() / 8;
 }
 
 CompiledBlockFn GetThreadFunction(WasmRegion& region) {

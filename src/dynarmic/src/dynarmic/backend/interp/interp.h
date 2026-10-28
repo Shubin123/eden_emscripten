@@ -79,6 +79,9 @@ struct WasmRegion {
     std::vector<const CompiledBlock*> blocks;
     /// Whether `wasm` counts towards the live code budget (see TrackRegionCode).
     bool tracked = false;
+    /// Entered from the dispatcher since the last eviction; regions that were not are dropped
+    /// first when the live code budget runs out.
+    std::atomic<bool> used{true};
     /// Last thread to look up its instance, and that instance's table index, packed as
     /// (thread << 32) | index so both are read together: indices are only valid on their thread.
     std::atomic<u64> last_use{0};

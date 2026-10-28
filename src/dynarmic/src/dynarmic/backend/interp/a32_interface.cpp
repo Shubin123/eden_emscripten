@@ -285,13 +285,32 @@ private:
     }
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
-        if (!Has(hr, HaltReason::CacheInvalidation)) {
+        const u64 eviction = EvictionGeneration();
+        if (!Has(hr, HaltReason::CacheInvalidation) && eviction == seen_eviction) {
             return;
         }
         std::unique_lock lock{invalidation_mutex};
         ClearHalt(HaltReason::CacheInvalidation);
-        if (!invalidate_entire_cache && invalid_cache_ranges.empty()) {
+        const bool evict = eviction != seen_eviction;
+        seen_eviction = eviction;
+        if (!invalidate_entire_cache && invalid_cache_ranges.empty() && !evict) {
             return;
+        }
+        if (evict && !invalidate_entire_cache) {
+            // The live code budget ran out: drop the regions nothing entered since this Jit's
+            // previous eviction, and start over only if the code in use is far over it.
+            for (auto& [_, block] : block_cache) {
+                if (block->region && !block->region->used.load(std::memory_order_relaxed)) {
+                    block->region.reset();
+                    block->entry_count = 0;
+                }
+            }
+            for (auto& [_, block] : block_cache) {
+                if (block->region) {
+                    block->region->used.store(false, std::memory_order_relaxed);
+                }
+            }
+            invalidate_entire_cache = CodeOverHardLimit();
         }
         fast_dispatch.fill({});
         if (invalidate_entire_cache) {
@@ -558,6 +577,9 @@ private:
                 return false;
             }
         }
+        if (!block.region->used.load(std::memory_order_relaxed)) {
+            block.region->used.store(true, std::memory_order_relaxed);
+        }
         const CompiledBlockFn fn = GetThreadFunction(*block.region);
         if (!fn) {
             return false;
@@ -595,7 +617,8 @@ private:
         }
         region->blocks.assign(blocks.begin(), blocks.end());
         if (TrackRegionCode(*region)) {
-            ClearCache();
+            RequestEviction();
+            HaltExecution(HaltReason::CacheInvalidation);
         }
         // Blocks without a region of their own enter this one rather than compiling another
         // copy of the same code.
@@ -792,6 +815,7 @@ private:
     JitTarget jit_target;
     bool wrote_pc = false;
     bool invalidate_entire_cache = false;
+    u64 seen_eviction = 0;
     boost::icl::interval_set<u32> invalid_cache_ranges;
     std::mutex invalidation_mutex;
 };

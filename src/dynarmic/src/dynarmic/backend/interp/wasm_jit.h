@@ -127,10 +127,21 @@ CompiledBlockFn GetThreadFunction(WasmRegion& region);
 u64 NextRegionId();
 
 /// Counts a built region towards the live code budget. Returns true when the live code exceeds
-/// it (EDEN_JIT_CODE_BUDGET_MB, default 384 MB of module bytes), and the caller should clear its
-/// cache: the engine cannot free compiled code that regions still reference, and running out
+/// it (EDEN_JIT_CODE_BUDGET_MB, default 384 MB of module bytes), and the caller should drop
+/// regions: the engine cannot free compiled code that regions still reference, and running out
 /// of wasm code space aborts the process.
 bool TrackRegionCode(WasmRegion& region);
+
+/// Asks every Jit to drop the regions it has not entered since its previous eviction. At most
+/// twice a second, so regions in use have time to be entered again between evictions.
+void RequestEviction();
+
+/// Counts eviction requests; a Jit evicts when this differs from the value it last saw.
+u64 EvictionGeneration();
+
+/// Whether the live code exceeds the budget by more than an eighth even after evictions, so a
+/// Jit has to drop everything to stay clear of the engine's code space limit.
+bool CodeOverHardLimit();
 
 /// Compile and instantiation counts and times since the last call, for the stats report.
 std::string JitStats();
