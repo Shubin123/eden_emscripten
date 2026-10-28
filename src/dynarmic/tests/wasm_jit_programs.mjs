@@ -93,7 +93,41 @@ const PROGRAMS = {
         0x0e0b3c04, 0x0e1a3c25, 0x4e172c46, 0x0e0e2c07, 0x0e1f3c48, 0x5ac00849, 0xdac00c2a, 0x5ac0046b,
         0xdac0086c, 0xdac0044d, 0x8b0401ce, 0xcac521ce, 0x8b0601ce, 0xcac741ce, 0x8b0801ce, 0xcac961ce,
         0x8b0a01ce, 0xcacb81ce, 0x8b0c01ce, 0xcacda1ce, 0x17ffffb4],
+    // Armv8.1 atomics and Armv8.3 LDAPR (Switch 2 code is built for Armv8.2): ldadd, ldclr, ldeor,
+    // ldset, ldsmax, ldsmin, ldumax, ldumin, swp, cas, casp and stadd at every access size and
+    // ordering, a cas whose comparison fails, and Rt == Rs. Each result is checked against plain
+    // instructions in the program itself; x29 counts mismatches and must stay zero.
+    lse: [0xd2a0010a, 0x91278c21, 0xcac13442, 0x8b011442, 0xcac14443, 0x9101dc63, 0xf9000142, 0xf8230144,
+        0xf9400145, 0x8b030046, 0xeb0600bf, 0x1a9f07f4, 0x8b1403bd, 0xeb02009f, 0x1a9f07f4, 0x8b1403bd,
+        0xb9000142, 0xb8e31144, 0xb9400145, 0x0a230046, 0x6b0600bf, 0x1a9f07f4, 0x8b1403bd, 0x6b02009f,
+        0x1a9f07f4, 0x8b1403bd, 0x39000142, 0x38232144, 0x39400145, 0x4a030046, 0x12001cc6, 0x6b0600bf,
+        0x1a9f07f4, 0x8b1403bd, 0x12001c47, 0x6b07009f, 0x1a9f07f4, 0x8b1403bd, 0x79000142, 0x78633144,
+        0x79400145, 0x2a030046, 0x12003cc6, 0x6b0600bf, 0x1a9f07f4, 0x8b1403bd, 0x12003c47, 0x6b07009f,
+        0x1a9f07f4, 0x8b1403bd, 0xb9000142, 0xb8234144, 0xb9400145, 0x6b03005f, 0x1a83c046, 0x6b0600bf,
+        0x1a9f07f4, 0x8b1403bd, 0x39000142, 0x38a35144, 0x39400145, 0x13001c46, 0x13001c67, 0x6b0700df,
+        0x1a87b0c8, 0x12001d08, 0x6b0800bf, 0x1a9f07f4, 0x8b1403bd, 0xf9000142, 0xf8236144, 0xf9400145,
+        0xeb03005f, 0x9a838046, 0xeb0600bf, 0x1a9f07f4, 0x8b1403bd, 0x79000142, 0x78237144, 0x79400145,
+        0x12003c46, 0x12003c67, 0x6b0700df, 0x1a8730c8, 0x6b0800bf, 0x1a9f07f4, 0x8b1403bd, 0x79000142,
+        0x78234144, 0x79400145, 0x13003c46, 0x13003c67, 0x6b0700df, 0x1a87c0c8, 0x12003d08, 0x6b0800bf,
+        0x1a9f07f4, 0x8b1403bd, 0xb9000142, 0xb8237144, 0xb9400145, 0x6b03005f, 0x1a833046, 0x6b0600bf,
+        0x1a9f07f4, 0x8b1403bd, 0xf9000142, 0xf8e38144, 0xf9400145, 0xeb0300bf, 0x1a9f07f4, 0x8b1403bd,
+        0xeb02009f, 0x1a9f07f4, 0x8b1403bd, 0xf9000142, 0xaa0203e4, 0xc8a47d43, 0xf9400145, 0xeb0300bf,
+        0x1a9f07f4, 0x8b1403bd, 0xeb02009f, 0x1a9f07f4, 0x8b1403bd, 0xb9000142, 0x11000444, 0x88e4fd43,
+        0xb9400145, 0x6b0200bf, 0x1a9f07f4, 0x8b1403bd, 0x6b02009f, 0x1a9f07f4, 0x8b1403bd, 0x39000142,
+        0x32181c44, 0x08a47d43, 0x39400145, 0x12001c66, 0x6b0600bf, 0x1a9f07f4, 0x8b1403bd, 0x12001c47,
+        0x6b07009f, 0x1a9f07f4, 0x8b1403bd, 0x79000142, 0x52000044, 0x48a4fd43, 0x79400145, 0x12003c46,
+        0x6b0600bf, 0x1a9f07f4, 0x8b1403bd, 0xa9000d42, 0xaa0203e4, 0xaa0303e5, 0xaa0103e6, 0xca030027,
+        0x48247d46, 0xa9402548, 0xeb06011f, 0x1a9f07f4, 0x8b1403bd, 0xeb07013f, 0x1a9f07f4, 0x8b1403bd,
+        0xeb02009f, 0x1a9f07f4, 0x8b1403bd, 0xeb0300bf, 0x1a9f07f4, 0x8b1403bd, 0x29000d42, 0x2a0203e4,
+        0x11000465, 0x2a0103e6, 0x2a0103e7, 0x0864fd46, 0x29402548, 0x6b02011f, 0x1a9f07f4, 0x8b1403bd,
+        0x6b03013f, 0x1a9f07f4, 0x8b1403bd, 0x6b0300bf, 0x1a9f07f4, 0x8b1403bd, 0x6b02009f, 0x1a9f07f4,
+        0x8b1403bd, 0xf9000142, 0xf823015f, 0xf8bfc145, 0x8b030046, 0xeb0600bf, 0x1a9f07f4, 0x8b1403bd,
+        0xf9000142, 0xaa0303eb, 0xf82b014b, 0xf9400145, 0x8b030046, 0xeb0600bf, 0x1a9f07f4, 0x8b1403bd,
+        0xeb02017f, 0x1a9f07f4, 0x8b1403bd, 0x9100079c, 0x17ffff2d],
 };
+// Programs that check their own results: the register that counts mismatches, which must end at
+// zero, and the one that counts completed rounds, which must not.
+const PROGRAM_SELF_CHECKS = { lse: { errors: 29, rounds: 28 } };
 // FPCR values each program runs under (default: 0). Flush-to-zero, default NaN, alternative half
 // precision and every rounding mode change which float operations the JIT can emit natively.
 const PROGRAM_FPCRS = {
@@ -167,7 +201,13 @@ const programResults = await pool(Object.entries(PROGRAMS).flatMap(([name, words
     const stdin = input(words, START_REGS, fpcr);
     const [interp, jit] = await Promise.all([run(reader, INTERP, stdin), run(reader, JIT, stdin)]);
     const label = fpcr ? `${name} (fpcr ${fpcr.toString(16)})` : name;
-    return { name: label, same: finalState(interp.out) === finalState(jit.out), interp: finalState(interp.out), jit: finalState(jit.out) };
+    const check = PROGRAM_SELF_CHECKS[name];
+    const selfCheck = out => {
+        const regs = out.match(/^final_regs: (.*)$/m)[1].split(' ').map(r => BigInt(`0x${r}`));
+        return regs[check.errors] === 0n && regs[check.rounds] > 0n;
+    };
+    const checked = !check || (selfCheck(interp.out) && selfCheck(jit.out));
+    return { name: label, same: checked && finalState(interp.out) === finalState(jit.out), interp: finalState(interp.out), jit: finalState(jit.out) };
 })));
 for (const r of programResults) {
     if (!r.same) {

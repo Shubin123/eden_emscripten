@@ -81,6 +81,7 @@ bool TranslateSingleInstruction(IR::Block& block, LocationDescriptor descriptor,
 #include "dynarmic/frontend/A64/translate/impl/floating_point_data_processing_two_register.cpp"
 #include "dynarmic/frontend/A64/translate/impl/impl.cpp"
 #include "dynarmic/frontend/A64/translate/impl/impl.h"
+#include "dynarmic/frontend/A64/translate/impl/load_store_atomic.cpp"
 #include "dynarmic/frontend/A64/translate/impl/load_store_exclusive.cpp"
 #include "dynarmic/frontend/A64/translate/impl/load_store_load_literal.cpp"
 #include "dynarmic/frontend/A64/translate/impl/load_store_multiple_structures.cpp"

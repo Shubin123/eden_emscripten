@@ -504,16 +504,10 @@ public:
     virtual bool LDAR(Imm<2> size, Reg Rn, Reg Rt) {
         return false;
     }
+    virtual bool CAS(Imm<2> size, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt) {
+        return false;
+    }
     virtual bool CASP(bool sz, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool CASB(bool L, Reg Rs, bool o0, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool CASH(bool L, Reg Rs, bool o0, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool CAS(bool sz, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt) {
         return false;
     }
 
@@ -625,95 +619,35 @@ public:
         return false;
     }
 
-    // Loads and stores - Atomic memory options
-    virtual bool LDADDB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    // Loads and stores - Atomic memory operations
+    virtual bool LDADD(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool LDCLRB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    virtual bool LDCLR(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool LDEORB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    virtual bool LDEOR(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool LDSETB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    virtual bool LDSET(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool LDSMAXB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    virtual bool LDSMAX(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool LDSMINB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    virtual bool LDSMIN(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool LDUMAXB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    virtual bool LDUMAX(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool LDUMINB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    virtual bool LDUMIN(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool SWPB(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
+    virtual bool SWP(Imm<2> size, bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
         return false;
     }
-    virtual bool LDAPRB(Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDADDH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDCLRH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDEORH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDSETH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDSMAXH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDSMINH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDUMAXH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDUMINH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool SWPH(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDAPRH(Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDADD(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDCLR(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDEOR(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDSET(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDSMAX(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDSMIN(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDUMAX(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDUMIN(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool SWP(bool A, bool R, Reg Rs, Reg Rn, Reg Rt) {
-        return false;
-    }
-    virtual bool LDAPR(Reg Rn, Reg Rt) {
+    virtual bool LDAPR(Imm<2> size, Reg Rn, Reg Rt) {
         return false;
     }
 
