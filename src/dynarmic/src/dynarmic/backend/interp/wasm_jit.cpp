@@ -274,48 +274,6 @@ bool IsInlineOpcode(Opcode op, bool a32) {
     }
 }
 
-bool IsMemoryOp(Opcode op) {
-    switch (op) {
-    case Opcode::A64ReadMemory8:
-    case Opcode::A64ReadMemory16:
-    case Opcode::A64ReadMemory32:
-    case Opcode::A64ReadMemory64:
-    case Opcode::A64WriteMemory8:
-    case Opcode::A64WriteMemory16:
-    case Opcode::A64WriteMemory32:
-    case Opcode::A64WriteMemory64:
-    case Opcode::A64ReadMemory128:
-    case Opcode::A64WriteMemory128:
-    case Opcode::A64ExclusiveReadMemory8:
-    case Opcode::A64ExclusiveReadMemory16:
-    case Opcode::A64ExclusiveReadMemory32:
-    case Opcode::A64ExclusiveReadMemory64:
-    case Opcode::A64ExclusiveWriteMemory8:
-    case Opcode::A64ExclusiveWriteMemory16:
-    case Opcode::A64ExclusiveWriteMemory32:
-    case Opcode::A64ExclusiveWriteMemory64:
-    case Opcode::A32ReadMemory8:
-    case Opcode::A32ReadMemory16:
-    case Opcode::A32ReadMemory32:
-    case Opcode::A32ReadMemory64:
-    case Opcode::A32WriteMemory8:
-    case Opcode::A32WriteMemory16:
-    case Opcode::A32WriteMemory32:
-    case Opcode::A32WriteMemory64:
-    case Opcode::A32ExclusiveReadMemory8:
-    case Opcode::A32ExclusiveReadMemory16:
-    case Opcode::A32ExclusiveReadMemory32:
-    case Opcode::A32ExclusiveReadMemory64:
-    case Opcode::A32ExclusiveWriteMemory8:
-    case Opcode::A32ExclusiveWriteMemory16:
-    case Opcode::A32ExclusiveWriteMemory32:
-    case Opcode::A32ExclusiveWriteMemory64:
-        return true;
-    default:
-        return false;
-    }
-}
-
 /// Guest state the region keeps in locals (A32 only). Values are loaded at entry and written
 /// back at exits and around fallbacks that access the guest state.
 struct RegionLocals {
@@ -461,22 +419,15 @@ private:
                     spill_flags[parent] = true;
                 }
             }
-            const bool slow_path = inline_op[i] && (IsMemoryOp(op.opcode) || GuardedFloat(op));
-            if (inline_op[i] && !slow_path) {
+            if (inline_op[i]) {
                 continue;
             }
             for (size_t a = 0; a < num_args; ++a) {
                 if (op.args[a] < count) {
-                    if (!inline_op[i]) {
-                        spill[op.args[a]] = true;
-                    }
-                } else if (op.args[a] != kNone) {
-                    helper_constants.push_back(op.args[a]);
+                    spill[op.args[a]] = true;
                 }
             }
         }
-        std::sort(helper_constants.begin(), helper_constants.end());
-        helper_constants.erase(std::unique(helper_constants.begin(), helper_constants.end()), helper_constants.end());
 
         for (size_t i = 0; i < count; ++i) {
             const Op& op = block.ops[i];
@@ -792,6 +743,7 @@ private:
         if (touches_state) {
             FlushState();
         }
+        StoreHelperConstants(index, end);
         CallHelperRaw(index, end);
         if (touches_state) {
             ReloadState();
@@ -800,6 +752,33 @@ private:
 
     void CallHelper(size_t index) {
         CallHelper(index, index + 1);
+    }
+
+    /// Stores the constants the ops in [index, end) read into the shared frame, where the
+    /// interpreter fallback looks for them. Other blocks of the region use the same slots, so this
+    /// happens before every call, off the fast path.
+    void StoreHelperConstants(size_t index, size_t end) {
+        const size_t count = block.ops.size();
+        std::vector<u32> stored;
+        for (size_t i = index; i < end; ++i) {
+            const Op& op = block.ops[i];
+            for (size_t a = 0; a < IR::GetNumArgsOf(op.opcode); ++a) {
+                const u32 slot = op.args[a];
+                if (slot < count || slot == kNone || std::find(stored.begin(), stored.end(), slot) != stored.end()) {
+                    continue;
+                }
+                stored.push_back(slot);
+                const Slot& constant = block.constants[slot - block.first_constant];
+                code.Get(kFrame);
+                code.I64Const(constant.lo);
+                code.Mem(Insn::I64Store, u64(slot) * kSlotSize + kLoOffset);
+                if (constant.hi != 0) {
+                    code.Get(kFrame);
+                    code.I64Const(constant.hi);
+                    code.Mem(Insn::I64Store, u64(slot) * kSlotSize + kHiOffset);
+                }
+            }
+        }
     }
 
     void CallHelperRaw(size_t index, size_t end) {
@@ -2918,18 +2897,6 @@ private:
     // Body
 
     void EmitBody() {
-        // Constants read by interpreter fallbacks must be present in the shared frame.
-        for (const u32 slot : helper_constants) {
-            const Slot& constant = block.constants[slot - block.first_constant];
-            code.Get(kFrame);
-            code.I64Const(constant.lo);
-            code.Mem(Insn::I64Store, u64(slot) * kSlotSize + kLoOffset);
-            if (constant.hi != 0) {
-                code.Get(kFrame);
-                code.I64Const(constant.hi);
-                code.Mem(Insn::I64Store, u64(slot) * kSlotSize + kHiOffset);
-            }
-        }
         code.I64Const(0);
         code.Set(wrote_pc_local);
         for (size_t i = 0; i < block.ops.size() && !failed; ++i) {
@@ -4118,7 +4085,6 @@ private:
 
     u32 next_local;
     const RegionLocals* cached;
-    std::vector<u32> helper_constants;
     std::vector<bool> inline_op;
     std::vector<u32> value_local;
     std::vector<u32> carry_local;
