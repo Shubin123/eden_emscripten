@@ -192,6 +192,9 @@ bool IsInlineOpcode(Opcode op, bool a32) {
     case Opcode::ZeroExtendLongToQuad:
     case Opcode::CountLeadingZeros32:
     case Opcode::CountLeadingZeros64:
+    case Opcode::ByteReverseWord:
+    case Opcode::ByteReverseHalf:
+    case Opcode::ByteReverseDual:
     case Opcode::ExtractRegister32:
     case Opcode::ExtractRegister64:
     case Opcode::ReplicateBit32:
@@ -1425,6 +1428,32 @@ private:
         case Opcode::VectorBroadcastLower32:
         case Opcode::VectorLogicalVShift32:
         case Opcode::VectorLogicalVShift64:
+        case Opcode::VectorMaxS8:
+        case Opcode::VectorMaxS16:
+        case Opcode::VectorMaxS32:
+        case Opcode::VectorMaxU8:
+        case Opcode::VectorMaxU16:
+        case Opcode::VectorMaxU32:
+        case Opcode::VectorMinS8:
+        case Opcode::VectorMinS16:
+        case Opcode::VectorMinS32:
+        case Opcode::VectorMinU8:
+        case Opcode::VectorMinU16:
+        case Opcode::VectorMinU32:
+        case Opcode::VectorSignedAbsoluteDifference8:
+        case Opcode::VectorSignedAbsoluteDifference16:
+        case Opcode::VectorSignedAbsoluteDifference32:
+        case Opcode::VectorUnsignedAbsoluteDifference8:
+        case Opcode::VectorUnsignedAbsoluteDifference16:
+        case Opcode::VectorUnsignedAbsoluteDifference32:
+        case Opcode::VectorHalvingAddU8:
+        case Opcode::VectorHalvingAddU16:
+        case Opcode::VectorNarrow16:
+        case Opcode::VectorNarrow32:
+        case Opcode::VectorNarrow64:
+        case Opcode::VectorZeroExtend64:
+        case Opcode::VectorGetElement8:
+        case Opcode::VectorGetElement16:
         case Opcode::VectorDeinterleaveEven8:
         case Opcode::VectorDeinterleaveEven16:
         case Opcode::VectorDeinterleaveEven32:
@@ -2454,6 +2483,7 @@ private:
             StoreV128(index);
             return true;
         case Opcode::VectorZeroUpper:
+        case Opcode::VectorZeroExtend64:
             code.Get(kFrame);
             PushVectorHalf(op, 0, false);
             code.Mem(Insn::I64Store, u64(index) * kSlotSize + kLoOffset);
@@ -2469,20 +2499,24 @@ private:
             code.I64Const(0);
             code.Mem(Insn::I64Store, u64(index) * kSlotSize + kHiOffset);
             return true;
+        case Opcode::VectorGetElement8:
+        case Opcode::VectorGetElement16:
         case Opcode::VectorGetElement32:
         case Opcode::VectorGetElement64: {
-            const bool is64 = op.opcode == Opcode::VectorGetElement64;
+            static constexpr u8 loads[] = {Insn::I64Load8U, Insn::I64Load16U, Insn::I64Load32U, Insn::I64Load};
+            const size_t size_log2 = size_t(op.opcode) - size_t(Opcode::VectorGetElement8);
+            const size_t bytes = size_t(1) << size_log2;
             const u64 element = ConstantValue(op.args[1]);
             const u32 slot = op.args[0];
             if (IsConstant(slot)) {
                 const Slot& constant = block.constants[slot - block.first_constant];
                 u64 lanes[2] = {constant.lo, constant.hi};
-                u64 value;
-                std::memcpy(&value, reinterpret_cast<const u8*>(lanes) + element * (is64 ? 8 : 4), is64 ? 8 : 4);
-                code.I64Const(is64 ? value : u32(value));
+                u64 value = 0;
+                std::memcpy(&value, reinterpret_cast<const u8*>(lanes) + element * bytes, bytes);
+                code.I64Const(value);
             } else {
                 code.Get(kFrame);
-                code.Mem(is64 ? Insn::I64Load : Insn::I64Load32U, u64(slot) * kSlotSize + kLoOffset + element * (is64 ? 8 : 4));
+                code.Mem(loads[size_log2], u64(slot) * kSlotSize + kLoOffset + element * bytes);
             }
             Define(index);
             return true;
@@ -2642,6 +2676,100 @@ private:
                 lanes[i] = u8(j < width ? j : 16 + j - width);
             }
             Shuffle(op, index, lanes, lower);
+            return true;
+        }
+        case Opcode::VectorMaxS8:
+            vint(120);
+            return true;
+        case Opcode::VectorMaxS16:
+            vint(152);
+            return true;
+        case Opcode::VectorMaxS32:
+            vint(184);
+            return true;
+        case Opcode::VectorMaxU8:
+            vint(121);
+            return true;
+        case Opcode::VectorMaxU16:
+            vint(153);
+            return true;
+        case Opcode::VectorMaxU32:
+            vint(185);
+            return true;
+        case Opcode::VectorMinS8:
+            vint(118);
+            return true;
+        case Opcode::VectorMinS16:
+            vint(150);
+            return true;
+        case Opcode::VectorMinS32:
+            vint(182);
+            return true;
+        case Opcode::VectorMinU8:
+            vint(119);
+            return true;
+        case Opcode::VectorMinU16:
+            vint(151);
+            return true;
+        case Opcode::VectorMinU32:
+            vint(183);
+            return true;
+        case Opcode::VectorSignedAbsoluteDifference8:
+        case Opcode::VectorSignedAbsoluteDifference16:
+        case Opcode::VectorSignedAbsoluteDifference32:
+        case Opcode::VectorUnsignedAbsoluteDifference8:
+        case Opcode::VectorUnsignedAbsoluteDifference16:
+        case Opcode::VectorUnsignedAbsoluteDifference32: {
+            // max - min, compared with the operation's signedness, for 8, 16 and 32-bit lanes.
+            static constexpr u32 min_s[] = {118, 150, 182};
+            static constexpr u32 min_u[] = {119, 151, 183};
+            static constexpr u32 max_s[] = {120, 152, 184};
+            static constexpr u32 max_u[] = {121, 153, 185};
+            static constexpr u32 sub[] = {113, 145, 177};
+            const bool is_signed = op.opcode <= Opcode::VectorSignedAbsoluteDifference32;
+            const size_t size_log2 = size_t(op.opcode) - size_t(is_signed ? Opcode::VectorSignedAbsoluteDifference8
+                                                                         : Opcode::VectorUnsignedAbsoluteDifference8);
+            PushV128(op, 0);
+            PushV128(op, 1);
+            SimdOp(is_signed ? max_s[size_log2] : max_u[size_log2]);
+            PushV128(op, 0);
+            PushV128(op, 1);
+            SimdOp(is_signed ? min_s[size_log2] : min_u[size_log2]);
+            SimdOp(sub[size_log2]);
+            StoreV128(index);
+            return true;
+        }
+        case Opcode::VectorHalvingAddU8:
+        case Opcode::VectorHalvingAddU16: {
+            // avgr_u rounds up, so take off the low bit the sum drops when it is odd.
+            const bool is16 = op.opcode == Opcode::VectorHalvingAddU16;
+            PushV128(op, 0);
+            PushV128(op, 1);
+            SimdOp(is16 ? 155 : 123);  // i16x8/i8x16.avgr_u
+            PushV128(op, 0);
+            PushV128(op, 1);
+            SimdOp(81);  // v128.xor
+            V128Splat(is16 ? 0x00010001 : 0x01010101);
+            SimdOp(78);  // v128.and
+            SimdOp(is16 ? 145 : 113);  // i16x8/i8x16.sub
+            StoreV128(index);
+            return true;
+        }
+        case Opcode::VectorNarrow16:
+        case Opcode::VectorNarrow32:
+        case Opcode::VectorNarrow64: {
+            // The low half of each lane, packed into the lower 64 bits.
+            const size_t half = op.opcode == Opcode::VectorNarrow16 ? 1 : op.opcode == Opcode::VectorNarrow32 ? 2 : 4;
+            PushV128(op, 0);
+            PushV128(op, 0);
+            SimdOp(13);  // i8x16.shuffle
+            for (size_t i = 0; i < 16; ++i) {
+                code.Byte(u8(i < 8 ? (i / half) * 2 * half + i % half : 0));
+            }
+            code.I64Const(0);
+            SimdOp(30);  // i64x2.replace_lane
+            code.Byte(1);
+            StoreV128(index);
             return true;
         }
         case Opcode::VectorDeinterleaveEven8:
@@ -3202,6 +3330,28 @@ private:
             code.Byte(Insn::I64Clz);
             define();
             break;
+        case Opcode::ByteReverseWord:
+        case Opcode::ByteReverseHalf:
+        case Opcode::ByteReverseDual: {
+            // Reverse the low bytes of a splat with one shuffle and take them back out.
+            const u32 bytes = op.opcode == Opcode::ByteReverseDual ? 8 : op.opcode == Opcode::ByteReverseWord ? 4 : 2;
+            arg(0);
+            SimdOp(18);  // i64x2.splat
+            code.Set(kV128B);
+            code.Get(kV128B);
+            code.Get(kV128B);
+            SimdOp(13);  // i8x16.shuffle
+            for (u32 i = 0; i < 16; ++i) {
+                code.Byte(u8(i < bytes ? bytes - 1 - i : i));
+            }
+            SimdOp(29);  // i64x2.extract_lane
+            code.Byte(0);
+            if (bytes < 8) {
+                And((u64(1) << (8 * bytes)) - 1);
+            }
+            define();
+            break;
+        }
         case Opcode::ExtractRegister32:
         case Opcode::ExtractRegister64: {
             const bool is32 = op.opcode == Opcode::ExtractRegister32;
