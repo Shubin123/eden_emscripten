@@ -28,6 +28,11 @@ namespace WebGPU {
 using VideoCommon::Offset2D;
 using VideoCommon::Region2D;
 
+namespace {
+/// Samples each draw passes for occlusion queries, enough for any object to count as visible.
+constexpr u64 SAMPLES_PER_DRAW = 1ULL << 16;
+} // Anonymous namespace
+
 AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_) : buffer_cache{buffer_cache_} {}
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
@@ -86,7 +91,25 @@ void RasterizerWebGPU::BindDrawInfoGroup() {
 RasterizerWebGPU::~RasterizerWebGPU() = default;
 
 void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
+    DrawCommon(is_indexed, instance_count, false);
+}
+
+void RasterizerWebGPU::DrawIndirect() {
+    const auto& params = maxwell3d->draw_manager.indirect_state;
+    // Byte-count draws need transform feedback, and WebGPU has no draw count read from a buffer.
+    if (params.is_byte_count || params.include_count || params.max_draw_counts == 0) {
+        return;
+    }
+    buffer_cache.SetDrawIndirect(&params);
+    DrawCommon(params.is_indexed, 1, true);
+    buffer_cache.SetDrawIndirect(nullptr);
+}
+
+void RasterizerWebGPU::DrawCommon(bool is_indexed, u32 instance_count, bool indirect) {
     ++stats.draws;
+    if (maxwell3d->regs.zpass_pixel_count_enable) {
+        samples_passed += SAMPLES_PER_DRAW;
+    }
     GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
     if (!pipeline) {
         return;
@@ -109,6 +132,10 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     u32 first = is_indexed ? draw_state.index_buffer.first : draw_state.vertex_buffer.first;
     s32 base_vertex = is_indexed ? static_cast<s32>(draw_state.base_index) : 0;
     const bool needs_conversion = MaxwellToWGPU::NeedsIndexConversion(draw_state.topology);
+    if (indirect && needs_conversion) {
+        // Rewritten index lists cannot follow parameters the GPU wrote.
+        return;
+    }
     if (!is_indexed && needs_conversion) {
         if (draw_state.topology != Maxwell::PrimitiveTopology::Quads &&
             draw_state.topology != Maxwell::PrimitiveTopology::QuadStrip) {
@@ -121,7 +148,7 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         count = runtime.index.count;
         first = 0;
     }
-    if (count == 0 || instance_count == 0) {
+    if (!indirect && (count == 0 || instance_count == 0)) {
         return;
     }
 
@@ -187,6 +214,24 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
     }
     if (indexed && runtime.index.buffer) {
         read_buffers.push_back(runtime.index.buffer.Get());
+    }
+    // Indirect draws read count, first and base parameters from the GPU buffer the guest wrote
+    // them to, at a fixed stride.
+    const auto& indirect_params = maxwell3d->draw_manager.indirect_state;
+    const u64 args_size = indexed ? 5 * sizeof(u32) : 4 * sizeof(u32);
+    const u64 args_stride = indirect_params.stride != 0 ? indirect_params.stride : args_size;
+    wgpu::Buffer args_buffer;
+    u64 args_offset = 0;
+    if (indirect) {
+        const auto [buffer, offset] = buffer_cache.GetDrawIndirectBuffer();
+        args_buffer = buffer->Handle();
+        args_offset = offset;
+        if (!args_buffer || args_offset % 4 != 0 || args_stride % 4 != 0 ||
+            args_offset + args_stride * (indirect_params.max_draw_counts - 1) + args_size >
+                args_buffer.GetSize()) {
+            return;
+        }
+        read_buffers.push_back(args_buffer.Get());
     }
     // Vertex buffers past WebGPU's slots are read by the shader as storage buffers. Storage
     // bindings start at 256-byte aligned offsets; the shader adds the remainder.
@@ -291,6 +336,28 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
             return;
         }
     }
+    // Shaders read the base vertex and instance from the draw info: copy them out of the
+    // indirect parameters, one draw info per draw.
+    boost::container::small_vector<u32, 4> draw_offsets{draw_offset};
+    if (indirect && pipeline->ReadsDrawParameters()) {
+        for (size_t i = 1; i < indirect_params.max_draw_counts; ++i) {
+            draw_offsets.push_back(uniform_ring.Push(
+                std::span<const u8>(reinterpret_cast<const u8*>(&info), sizeof(info))));
+        }
+        wgpu::CommandEncoder& encoder = scheduler.Encoder();
+        for (size_t i = 0; i < draw_offsets.size(); ++i) {
+            const u64 args = args_offset + args_stride * i + 3 * sizeof(u32);
+            if (indexed) {
+                encoder.CopyBufferToBuffer(args_buffer, args, uniform_ring.Buffer(),
+                                           draw_offsets[i] + offsetof(Shader::Backend::WGSL::DrawInfo, base_vertex),
+                                           2 * sizeof(u32));
+            } else {
+                encoder.CopyBufferToBuffer(args_buffer, args, uniform_ring.Buffer(),
+                                           draw_offsets[i] + offsetof(Shader::Backend::WGSL::DrawInfo, base_instance),
+                                           sizeof(u32));
+            }
+        }
+    }
     if (scheduler.InRenderPass() && scheduler.PassConflicts(written_buffers, read_buffers)) {
         scheduler.EndRenderPass();
     }
@@ -323,7 +390,9 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
         }
         const u64 available = binding.buffer.GetSize() - (binding.offset & ~3ULL);
         u64 needed = 0;
-        if (use.per_instance) {
+        if (indirect) {
+            // WebGPU bounds the vertex fetches of indirect draws itself.
+        } else if (use.per_instance) {
             needed = static_cast<u64>(draw_state.base_instance + instance_count) * use.stride;
         } else if (!indexed) {
             needed = static_cast<u64>(first + count) * use.stride;
@@ -356,8 +425,9 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
             return;
         }
         const u64 available = index.buffer.GetSize() - index_offset;
-        const u64 needed = (static_cast<u64>(first) + count) *
-                           (index.format == wgpu::IndexFormat::Uint16 ? 2 : 4);
+        const u64 needed = indirect ? 0
+                                    : (static_cast<u64>(first) + count) *
+                                          (index.format == wgpu::IndexFormat::Uint16 ? 2 : 4);
         if (needed > available) {
             static u32 logged = 0;
             if (logged++ < 8) {
@@ -367,15 +437,31 @@ void RasterizerWebGPU::Draw(bool is_indexed, u32 instance_count) {
             }
             return;
         }
-        const u64 index_size = std::min(available, std::max(needed, static_cast<u64>(index.size)));
+        const u64 index_size =
+            indirect ? available : std::min(available, std::max(needed, static_cast<u64>(index.size)));
         pass.SetIndexBuffer(index.buffer, index.format, index_offset, index_size);
-        pass.DrawIndexed(count, instance_count, first, index.converted && !is_indexed ? 0 : base_vertex,
-                         draw_state.base_instance);
-        ++stats.actual_draws;
-    } else {
+        if (!indirect) {
+            pass.DrawIndexed(count, instance_count, first,
+                             index.converted && !is_indexed ? 0 : base_vertex,
+                             draw_state.base_instance);
+        }
+    } else if (!indirect) {
         pass.Draw(count, instance_count, first, draw_state.base_instance);
-        ++stats.actual_draws;
     }
+    if (indirect) {
+        for (size_t i = 0; i < indirect_params.max_draw_counts; ++i) {
+            if (i != 0 && i < draw_offsets.size()) {
+                pass.SetBindGroup(1, draw_info_group, 1, &draw_offsets[i]);
+            }
+            const u64 offset = args_offset + args_stride * i;
+            if (indexed) {
+                pass.DrawIndexedIndirect(args_buffer, offset);
+            } else {
+                pass.DrawIndirect(args_buffer, offset);
+            }
+        }
+    }
+    ++stats.actual_draws;
     if (!shadow_copies.empty()) {
         wgpu::CommandEncoder& encoder = scheduler.Encoder();
         for (const auto& copy : shadow_copies) {
@@ -498,18 +584,29 @@ void RasterizerWebGPU::DispatchCompute() {
         }
     }
 }
-void RasterizerWebGPU::ResetCounter(VideoCommon::QueryType type) {}
+void RasterizerWebGPU::ResetCounter(VideoCommon::QueryType type) {
+    if (type == VideoCommon::QueryType::ZPassPixelCount64) {
+        samples_passed = 0;
+    }
+}
 void RasterizerWebGPU::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                            VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     if (!gpu_memory) {
         return;
     }
+    // Games render conditionally on two sample counts differing (NieR's flares and effects),
+    // so a constant payload would hide everything behind an occlusion query.
+    u64 value = payload;
+    if (type == VideoCommon::QueryType::ZPassPixelCount ||
+        type == VideoCommon::QueryType::ZPassPixelCount64) {
+        value = samples_passed;
+    }
     if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
         u64 ticks = m_gpu.GetTicks();
         gpu_memory->Write<u64>(gpu_addr + 8, ticks);
-        gpu_memory->Write<u64>(gpu_addr, static_cast<u64>(payload));
+        gpu_memory->Write<u64>(gpu_addr, value);
     } else {
-        gpu_memory->Write<u32>(gpu_addr, payload);
+        gpu_memory->Write<u32>(gpu_addr, static_cast<u32>(value));
     }
 }
 void RasterizerWebGPU::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
@@ -523,7 +620,13 @@ void RasterizerWebGPU::FlushAll() {}
 void RasterizerWebGPU::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
     // GPU-to-guest readback is not implemented yet.
 }
-bool RasterizerWebGPU::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+bool RasterizerWebGPU::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    // Nothing is read back yet, but this tells macros that draw parameters were written by the
+    // GPU and must be read from there.
+    if (True(which & VideoCommon::CacheType::BufferCache)) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        return buffer_cache.IsRegionGpuModified(addr, size);
+    }
     return false;
 }
 void RasterizerWebGPU::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {

@@ -51,6 +51,7 @@ public:
     ~RasterizerWebGPU() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
+    void DrawIndirect() override;
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
@@ -132,8 +133,14 @@ private:
     /// Copies of storage ranges a draw writes while reading the same host buffer.
     wgpu::Buffer shadow_buffer;
     AccelerateDMA m_accelerate_dma;
+    /// Samples counted for the guest's occlusion queries. Host results are not read back, so
+    /// every draw made while counting is enabled passes a fixed number of samples.
+    u64 samples_passed = 0;
 
     void BindDrawInfoGroup();
+    /// Draws with the parameters in the draw state, or with those of the indirect state in GPU
+    /// memory when `indirect`.
+    void DrawCommon(bool is_indexed, u32 instance_count, bool indirect);
 };
 
 } // namespace WebGPU

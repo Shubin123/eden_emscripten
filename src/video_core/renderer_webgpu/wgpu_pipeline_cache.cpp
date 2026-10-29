@@ -995,6 +995,13 @@ GraphicsPipeline::Variant* GraphicsPipeline::FindVariant(const VariantKey& varia
     return last_variant;
 }
 
+bool GraphicsPipeline::ReadsDrawParameters() const {
+    return std::ranges::any_of(stage_infos, [](const Shader::Info& info) {
+        return info.loads[Shader::IR::Attribute::BaseVertex] ||
+               info.loads[Shader::IR::Attribute::BaseInstance];
+    });
+}
+
 bool GraphicsPipeline::Configure(bool is_indexed) {
     auto& texture_cache = cache.texture_cache;
     auto& buffer_cache = cache.buffer_cache;

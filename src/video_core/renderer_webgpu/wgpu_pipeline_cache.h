@@ -122,6 +122,9 @@ public:
         return valid;
     }
 
+    /// Whether a stage reads the base vertex or base instance of the draw.
+    bool ReadsDrawParameters() const;
+
 private:
     struct Variant {
         /// Set once asynchronous creation succeeded.
