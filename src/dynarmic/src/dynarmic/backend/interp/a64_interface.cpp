@@ -61,8 +61,9 @@ struct A64State {
     /// Reservation of the local exclusive monitor (Unsafe_IgnoreGlobalMonitor).
     u64 exclusive_address = 0;
     u64 exclusive_value = 0;
-    /// Dispatch table of the thread running the Jit, read by compiled regions.
+    /// Dispatch table of the thread running the Jit and its index mask, read by compiled regions.
     DispatchEntry* dispatch_table = nullptr;
+    u64 dispatch_mask = 0;
 
     IR::LocationDescriptor Location() const {
         return A64::LocationDescriptor{pc, FP::FPCR{fpcr}, false};
@@ -85,7 +86,9 @@ struct Jit::Impl final {
         ASSERT(!is_executing);
         PerformRequestedCacheInvalidation(HaltReason(Atomic::Load(&state.halt_reason)));
         is_executing = true;
-        state.dispatch_table = dispatch_tables.ForThisThread();
+        thread_dispatch_table = &dispatch_tables.ForThisThread();
+        state.dispatch_table = thread_dispatch_table->entries.get();
+        state.dispatch_mask = thread_dispatch_table->mask;
 
         const auto started = std::chrono::steady_clock::now();
         cycles_to_run = conf.enable_cycle_counting ? s64(conf.callbacks->GetTicksRemaining()) : std::numeric_limits<s64>::max();
@@ -549,7 +552,10 @@ private:
         if (!fn) {
             return false;
         }
-        state.dispatch_table[DispatchTables::IndexOf(block.location.Value())] = {block.location.Value(), reinterpret_cast<uintptr_t>(fn), block.region_index, 0};
+        if (dispatch_tables.Insert(*thread_dispatch_table, {block.location.Value(), u32(reinterpret_cast<uintptr_t>(fn)), u32(block.region_index)})) {
+            state.dispatch_table = thread_dispatch_table->entries.get();
+            state.dispatch_mask = thread_dispatch_table->mask;
+        }
         fn(&state, frame.data(), this, reinterpret_cast<void*>(uintptr_t{block.region_index}));
         if (SamplePC(state.pc)) {
             DumpBlock(state.Location());
@@ -669,6 +675,7 @@ private:
         target.chain_regions = true;
         target.fpcr_offset = offsetof(A64State, fpcr);
         target.dispatch_table_offset = offsetof(A64State, dispatch_table);
+        target.dispatch_mask_offset = offsetof(A64State, dispatch_mask);
         target.local_exclusive_monitor = LocalMonitor();
         target.exclusive_state_offset = offsetof(A64State, exclusive_state);
         target.exclusive_address_offset = offsetof(A64State, exclusive_address);
@@ -755,6 +762,8 @@ private:
     };
     std::array<FastDispatchEntry, 4096> fast_dispatch{};
     DispatchTables dispatch_tables;
+    /// The running thread's table in dispatch_tables.
+    DispatchTables::Table* thread_dispatch_table = nullptr;
     Backend::BlockRangeInformation<u64> block_ranges;
     std::vector<Slot> frame;
     s64 cycles_to_run = 0;

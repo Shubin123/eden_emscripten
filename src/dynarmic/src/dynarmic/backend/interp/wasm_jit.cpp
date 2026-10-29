@@ -4309,9 +4309,10 @@ private:
         code.Byte(Insn::I64Xor);
         code.I64Const(2);
         code.Byte(Insn::I64ShrU);
-        code.I64Const(DispatchTables::kEntries - 1);
+        code.Get(kState);
+        code.Mem(Insn::I64Load, target.dispatch_mask_offset);
         code.Byte(Insn::I64And);
-        code.I64Const(5);
+        code.I64Const(4);
         code.Byte(Insn::I64Shl);
         code.Byte(Insn::I64Add);
         code.Set(kEntryAddress);
@@ -4324,9 +4325,9 @@ private:
         code.Get(kFrame);
         code.Get(kImpl);
         code.Get(kEntryAddress);
-        code.Mem(Insn::I64Load, offsetof(DispatchEntry, index));
+        code.Mem(Insn::I64Load32U, offsetof(DispatchEntry, index));
         code.Get(kEntryAddress);
-        code.Mem(Insn::I64Load, offsetof(DispatchEntry, function));
+        code.Mem(Insn::I64Load32U, offsetof(DispatchEntry, function));
         code.Byte(0x13);  // return_call_indirect
         code.U32(0);      // region type
         code.U32(0);      // table
@@ -4747,21 +4748,52 @@ u64 DispatchTables::NextId() {
     return next.fetch_add(1, std::memory_order_relaxed);
 }
 
-DispatchEntry* DispatchTables::ForThisThread() {
-    thread_local std::unordered_map<u64, DispatchEntry*> by_owner;
-    DispatchEntry*& table = by_owner[id];
+DispatchTables::Table& DispatchTables::ForThisThread() {
+    thread_local std::unordered_map<u64, Table*> by_owner;
+    Table*& table = by_owner[id];
     if (!table) {
         std::scoped_lock lock{mutex};
         tables.push_back(std::make_unique<Table>());
-        table = tables.back()->data();
+        table = tables.back().get();
+        table->entries = std::make_unique<DispatchEntry[]>(kMinEntries);
+        table->mask = kMinEntries - 1;
     }
-    return table;
+    return *table;
+}
+
+bool DispatchTables::Insert(Table& table, const DispatchEntry& entry) {
+    bool grew = false;
+    const u64 size = table.mask + 1;
+    const u64 previous = table.entries[IndexOf(entry.location, table.mask)].location;
+    if (previous != 0 && previous != entry.location && ++table.displaced > 2 * size && size < kMaxEntries) {
+        // Most recent insertions displaced another entry: the hot entry points do not fit.
+        const u64 new_size = std::min<u64>(size * 4, kMaxEntries);
+        auto entries = std::make_unique<DispatchEntry[]>(new_size);
+        for (u64 i = 0; i < size; ++i) {
+            if (const DispatchEntry& old = table.entries[i]; old.location != 0) {
+                entries[IndexOf(old.location, new_size - 1)] = old;
+            }
+        }
+        std::scoped_lock lock{mutex};
+        table.entries = std::move(entries);
+        table.mask = new_size - 1;
+        table.displaced = 0;
+        table.inserts = 0;
+        grew = true;
+    }
+    // Displacements only count while they are frequent.
+    if (++table.inserts > 16 * (table.mask + 1)) {
+        table.inserts = 0;
+        table.displaced = 0;
+    }
+    table.entries[IndexOf(entry.location, table.mask)] = entry;
+    return grew;
 }
 
 void DispatchTables::Clear() {
     std::scoped_lock lock{mutex};
     for (const auto& table : tables) {
-        table->fill({});
+        std::fill_n(table->entries.get(), table->mask + 1, DispatchEntry{});
     }
 }
 

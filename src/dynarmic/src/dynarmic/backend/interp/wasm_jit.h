@@ -70,6 +70,7 @@ struct JitTarget {
     bool chain_regions = false;
     u32 fpcr_offset = 0;
     u32 dispatch_table_offset = 0;
+    u32 dispatch_mask_offset = 0;
 
     /// Exclusive accesses with a per-core reservation (Unsafe_IgnoreGlobalMonitor).
     bool local_exclusive_monitor = false;
@@ -85,30 +86,42 @@ struct JitTarget {
 /// thread that owns the table.
 struct DispatchEntry {
     u64 location;
-    u64 function;
-    u64 index;
-    u64 padding;
+    u32 function;  ///< Index in the function table.
+    u32 index;
 };
-static_assert(sizeof(DispatchEntry) == 32);
+static_assert(sizeof(DispatchEntry) == 16);
 
 /// Direct-mapped tables of compiled regions, one per thread that runs a Jit. Region code looks up
-/// the next location there and tail-calls its region while there is budget left.
+/// the next location there and tail-calls its region while there is budget left. A table starts
+/// small and grows while its entries keep displacing each other: the hot code of a game like
+/// Silksong has far more entry points than threads that run little code ever touch.
 class DispatchTables {
 public:
-    static constexpr size_t kEntries = 8192;
+    static constexpr size_t kMinEntries = 2048;
+    static constexpr size_t kMaxEntries = 65536;
 
-    static size_t IndexOf(u64 location) {
-        return ((location ^ (location >> 32)) >> 2) % kEntries;
+    struct Table {
+        std::unique_ptr<DispatchEntry[]> entries;
+        u64 mask = 0;
+        u64 inserts = 0;
+        u64 displaced = 0;
+    };
+
+    static size_t IndexOf(u64 location, u64 mask) {
+        return ((location ^ (location >> 32)) >> 2) & mask;
     }
 
     /// The calling thread's table.
-    DispatchEntry* ForThisThread();
+    Table& ForThisThread();
+
+    /// Records `entry` in the calling thread's `table`. Returns true when the table grew, which
+    /// replaces its entries and mask.
+    bool Insert(Table& table, const DispatchEntry& entry);
 
     /// Clears every thread's table, for when regions are dropped.
     void Clear();
 
 private:
-    using Table = std::array<DispatchEntry, kEntries>;
     const u64 id = NextId();
     std::mutex mutex;
     std::vector<std::unique_ptr<Table>> tables;
