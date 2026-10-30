@@ -90,6 +90,8 @@ constexpr u32 kF64B = 28;
 constexpr u32 kV128A = 29;
 constexpr u32 kV128B = 30;
 constexpr u32 kV128C = 31;
+/// v128 locals a block can keep 128-bit values in; the rest live in the frame.
+constexpr u32 kVectorLocals = 16;
 
 // Function parameters.
 constexpr u32 kState = 0;
@@ -109,7 +111,7 @@ bool IsFlagPseudoOp(Opcode op) {
     }
 }
 
-/// Operations whose result is a 128-bit value; those always live in the frame.
+/// Operations whose result is a 128-bit value.
 bool ProducesVectorInFrame(Opcode op) {
     switch (op) {
     case Opcode::ZeroExtendLongToQuad:
@@ -302,8 +304,9 @@ bool HelperTouchesState(Opcode op) {
 /// `local_base`; values do not live across blocks, so regions reuse the same range.
 class BlockCompiler {
 public:
-    BlockCompiler(const CompiledBlock& block_, const JitTarget& target_, Code& code_, u32 local_base, const RegionLocals* cached_)
-        : block{block_}, target{target_}, code{code_}, next_local{local_base}, cached{cached_} {}
+    BlockCompiler(const CompiledBlock& block_, const JitTarget& target_, Code& code_, u32 local_base, const RegionLocals* cached_,
+                  u32 vector_base_ = 0)
+        : block{block_}, target{target_}, code{code_}, next_local{local_base}, cached{cached_}, vector_base{vector_base_} {}
 
     /// Writes the cached guest state back to memory.
     void FlushState() {
@@ -356,6 +359,11 @@ public:
 
     u32 LocalsEnd() const {
         return next_local;
+    }
+
+    /// Number of v128 locals from the vector base the block uses.
+    u32 VectorLocalsUsed() const {
+        return vector_locals_used;
     }
 
     /// Pushes the i32 result of evaluating `cond` against the guest NZCV.
@@ -449,6 +457,44 @@ private:
         tmp3 = NewLocal();
         nzcv_tmp = NewLocal();
         wrote_pc_local = NewLocal();
+        AllocateVectorLocals();
+    }
+
+    /// Gives the 128-bit results of inline ops v128 locals, each freed after its last use.
+    void AllocateVectorLocals() {
+        const size_t count = block.ops.size();
+        vector_local.assign(count, kNone);
+        vector_defined.assign(count, false);
+        std::vector<size_t> last_use(count, 0);
+        for (size_t i = 0; i < count; ++i) {
+            const Op& op = block.ops[i];
+            for (size_t a = 0; a < IR::GetNumArgsOf(op.opcode); ++a) {
+                if (op.args[a] < count) {
+                    last_use[op.args[a]] = i;
+                }
+            }
+        }
+        std::vector<u32> free;
+        for (u32 local = vector_base + kVectorLocals; local-- > vector_base;) {
+            free.push_back(local);
+        }
+        std::vector<std::pair<size_t, u32>> held;
+        for (size_t i = 0; i < count; ++i) {
+            std::erase_if(held, [&](const auto& value) {
+                if (value.first >= i) {
+                    return false;
+                }
+                free.push_back(value.second);
+                return true;
+            });
+            if (!inline_op[i] || last_use[i] == 0 || free.empty() || IR::GetTypeOf(block.ops[i].opcode) != IR::Type::U128) {
+                continue;
+            }
+            vector_local[i] = free.back();
+            free.pop_back();
+            held.emplace_back(last_use[i], vector_local[i]);
+            vector_locals_used = std::max(vector_locals_used, vector_local[i] - vector_base + 1);
+        }
     }
 
     u32 NewLocal() {
@@ -469,6 +515,10 @@ private:
         const u32 slot = op.args[index];
         if (IsConstant(slot)) {
             code.I64Const(ConstantValue(slot));
+        } else if (vector_local[slot] != kNone) {
+            code.Get(vector_local[slot]);
+            SimdOp(29);  // i64x2.extract_lane
+            code.Byte(0);
         } else if (value_local[slot] != kNone) {
             code.Get(value_local[slot]);
         } else {
@@ -744,9 +794,42 @@ private:
             FlushState();
         }
         StoreHelperConstants(index, end);
+        SpillVectorArgs(index, end);
         CallHelperRaw(index, end);
         if (touches_state) {
             ReloadState();
+        }
+        for (size_t current = index; current < end; ++current) {
+            if (vector_local[current] != kNone) {
+                code.Get(kFrame);
+                SimdOp(0);  // v128.load
+                code.U32(0);
+                code.U64(u64(current) * kSlotSize + kLoOffset);
+                code.Set(vector_local[current]);
+                vector_defined[current] = true;
+            }
+        }
+    }
+
+    /// Stores the vector arguments of the ops in [index, end) that live in locals into their frame
+    /// slots for the interpreter fallback.
+    void SpillVectorArgs(size_t index, size_t end) {
+        const size_t count = block.ops.size();
+        std::vector<u32> stored;
+        for (size_t i = index; i < end; ++i) {
+            const Op& op = block.ops[i];
+            for (size_t a = 0; a < IR::GetNumArgsOf(op.opcode); ++a) {
+                const u32 slot = op.args[a];
+                if (slot >= count || vector_local[slot] == kNone || spill[slot] || std::find(stored.begin(), stored.end(), slot) != stored.end()) {
+                    continue;
+                }
+                stored.push_back(slot);
+                code.Get(kFrame);
+                code.Get(vector_local[slot]);
+                SimdOp(11);  // v128.store
+                code.U32(0);
+                code.U64(u64(slot) * kSlotSize + kLoOffset);
+            }
         }
     }
 
@@ -949,14 +1032,11 @@ private:
         }
         code.Else();
         {
-            code.Get(kFrame);
             code.Get(tmp1);
             SimdOp(0);  // v128.load
             code.U32(0);
             code.U64(0);
-            SimdOp(11);  // v128.store
-            code.U32(0);
-            code.U64(u64(index) * kSlotSize + kLoOffset);
+            StoreV128(index);
         }
         code.End();
     }
@@ -1650,6 +1730,10 @@ private:
             }
             return;
         }
+        if (vector_local[slot] != kNone) {
+            code.Get(vector_local[slot]);
+            return;
+        }
         code.Get(kFrame);
         SimdOp(0);  // v128.load
         code.U32(0);
@@ -1658,9 +1742,16 @@ private:
 
     /// Stores the v128 on the stack as the result of op `index`.
     void StoreV128(size_t index) {
-        code.Set(kV128A);
+        const u32 local = vector_local[index] != kNone ? vector_local[index] : kV128A;
+        code.Set(local);
+        if (vector_local[index] != kNone) {
+            vector_defined[index] = true;
+            if (!spill[index]) {
+                return;
+            }
+        }
         code.Get(kFrame);
-        code.Get(kV128A);
+        code.Get(local);
         SimdOp(11);  // v128.store
         code.U32(0);
         code.U64(u64(index) * kSlotSize + kLoOffset);
@@ -2463,20 +2554,15 @@ private:
             return true;
         case Opcode::VectorZeroUpper:
         case Opcode::VectorZeroExtend64:
-            code.Get(kFrame);
-            PushVectorHalf(op, 0, false);
-            code.Mem(Insn::I64Store, u64(index) * kSlotSize + kLoOffset);
-            code.Get(kFrame);
+            PushV128(op, 0);
             code.I64Const(0);
-            code.Mem(Insn::I64Store, u64(index) * kSlotSize + kHiOffset);
+            SimdOp(30);  // i64x2.replace_lane
+            code.Byte(1);
+            StoreV128(index);
             return true;
         case Opcode::ZeroVector:
-            code.Get(kFrame);
-            code.I64Const(0);
-            code.Mem(Insn::I64Store, u64(index) * kSlotSize + kLoOffset);
-            code.Get(kFrame);
-            code.I64Const(0);
-            code.Mem(Insn::I64Store, u64(index) * kSlotSize + kHiOffset);
+            V128Splat64(0);
+            StoreV128(index);
             return true;
         case Opcode::VectorGetElement8:
         case Opcode::VectorGetElement16:
@@ -2493,6 +2579,14 @@ private:
                 u64 value = 0;
                 std::memcpy(&value, reinterpret_cast<const u8*>(lanes) + element * bytes, bytes);
                 code.I64Const(value);
+            } else if (vector_local[slot] != kNone) {
+                static constexpr u32 extract[] = {22, 25, 27, 29};  // i8x16/i16x8 extract_lane_u, i32x4/i64x2 extract_lane
+                code.Get(vector_local[slot]);
+                SimdOp(extract[size_log2]);
+                code.Byte(u8(element));
+                if (size_log2 != 3) {
+                    code.Byte(Insn::I64ExtendI32U);
+                }
             } else {
                 code.Get(kFrame);
                 code.Mem(loads[size_log2], u64(slot) * kSlotSize + kLoOffset + element * bytes);
@@ -2504,14 +2598,17 @@ private:
         case Opcode::VectorSetElement16:
         case Opcode::VectorSetElement32:
         case Opcode::VectorSetElement64: {
-            static constexpr u8 stores[] = {Insn::I64Store8, Insn::I64Store16, Insn::I64Store32, Insn::I64Store};
+            static constexpr u32 replace[] = {23, 26, 28, 30};  // i8x16/i16x8/i32x4/i64x2 replace_lane
             const size_t size_log2 = size_t(op.opcode) - size_t(Opcode::VectorSetElement8);
             const u64 element = ConstantValue(op.args[1]);
             PushV128(op, 0);
-            StoreV128(index);
-            code.Get(kFrame);
             PushArg(op, 2);
-            code.Mem(stores[size_log2], u64(index) * kSlotSize + kLoOffset + (element << size_log2));
+            if (size_log2 != 3) {
+                code.Byte(Insn::I32WrapI64);
+            }
+            SimdOp(replace[size_log2]);
+            code.Byte(u8(element));
+            StoreV128(index);
             return true;
         }
         case Opcode::VectorTranspose8:
@@ -2880,12 +2977,12 @@ private:
             SimdOp(extract[size]);
             code.Byte(u8(ConstantValue(op.args[1]) & ((16 >> size) - 1)));
             SimdOp(splat[size]);
-            StoreV128(index);
             if (lower) {
-                code.Get(kFrame);
                 code.I64Const(0);
-                code.Mem(Insn::I64Store, u64(index) * kSlotSize + kHiOffset);
+                SimdOp(30);  // i64x2.replace_lane
+                code.Byte(1);
             }
+            StoreV128(index);
             return true;
         }
         default:
@@ -2911,6 +3008,8 @@ private:
                 }
                 EmitInline(i);
                 SpillFlags(i);
+                // A 128-bit result written straight to the frame would leave its local stale.
+                failed |= vector_local[i] != kNone && !vector_defined[i];
             } else {
                 size_t end = i + 1;
                 while (end < block.ops.size() && !inline_op[end]) {
@@ -2939,8 +3038,6 @@ private:
             }
             define();
         };
-        const u64 frame_lo = u64(index) * kSlotSize + kLoOffset;
-        const u64 frame_hi = u64(index) * kSlotSize + kHiOffset;
 
         switch (op.opcode) {
         case Opcode::Void:
@@ -3277,12 +3374,11 @@ private:
             define();
             break;
         case Opcode::ZeroExtendLongToQuad:
-            code.Get(kFrame);
+            V128Splat64(0);
             arg(0);
-            code.Mem(Insn::I64Store, frame_lo);
-            code.Get(kFrame);
-            code.I64Const(0);
-            code.Mem(Insn::I64Store, frame_hi);
+            SimdOp(30);  // i64x2.replace_lane
+            code.Byte(0);
+            StoreV128(index);
             break;
         case Opcode::CountLeadingZeros32:
             arg(0);
@@ -3408,18 +3504,12 @@ private:
         case Opcode::A64GetD:
         case Opcode::A64GetQ: {
             const u64 vec = target.ext_offset + 16 * ConstantValue(op.args[0]);
-            code.Get(kFrame);
             code.Get(kState);
-            code.Mem(op.opcode == Opcode::A64GetS ? Insn::I64Load32U : Insn::I64Load, vec);
-            code.Mem(Insn::I64Store, frame_lo);
-            code.Get(kFrame);
-            if (op.opcode == Opcode::A64GetQ) {
-                code.Get(kState);
-                code.Mem(Insn::I64Load, vec + 8);
-            } else {
-                code.I64Const(0);
-            }
-            code.Mem(Insn::I64Store, frame_hi);
+            // v128.load32_zero, v128.load64_zero, v128.load
+            SimdOp(op.opcode == Opcode::A64GetS ? 92 : op.opcode == Opcode::A64GetD ? 93 : 0);
+            code.U32(0);
+            code.U64(vec);
+            StoreV128(index);
             break;
         }
         case Opcode::A64GetSP:
@@ -3443,18 +3533,18 @@ private:
         case Opcode::A64SetQ: {
             const u64 vec = target.ext_offset + 16 * ConstantValue(op.args[0]);
             code.Get(kState);
-            PushVectorHalf(op, 1, false);
-            if (op.opcode == Opcode::A64SetS) {
-                Mask32();
+            PushV128(op, 1);
+            if (op.opcode != Opcode::A64SetQ) {
+                // S and D writes clear the rest of the register.
+                SimdOp(12);  // v128.const
+                for (int i = 0; i < 16; ++i) {
+                    code.Byte(i < (op.opcode == Opcode::A64SetS ? 4 : 8) ? 0xFF : 0);
+                }
+                SimdOp(78);  // v128.and
             }
-            code.Mem(Insn::I64Store, vec);
-            code.Get(kState);
-            if (op.opcode == Opcode::A64SetQ) {
-                PushVectorHalf(op, 1, true);
-            } else {
-                code.I64Const(0);
-            }
-            code.Mem(Insn::I64Store, vec + 8);
+            SimdOp(11);  // v128.store
+            code.U32(0);
+            code.U64(vec);
             break;
         }
         case Opcode::A64SetSP:
@@ -3575,18 +3665,11 @@ private:
             const bool is_double = A32::IsDoubleExtReg(reg);
             const u64 offset = is_double ? target.ext_offset + 8 * (u64(reg) - u64(A32::ExtReg::D0))
                                          : target.ext_offset + 16 * (u64(reg) - u64(A32::ExtReg::Q0));
-            code.Get(kFrame);
             code.Get(kState);
-            code.Mem(Insn::I64Load, offset);
-            code.Mem(Insn::I64Store, frame_lo);
-            code.Get(kFrame);
-            if (is_double) {
-                code.I64Const(0);
-            } else {
-                code.Get(kState);
-                code.Mem(Insn::I64Load, offset + 8);
-            }
-            code.Mem(Insn::I64Store, frame_hi);
+            SimdOp(is_double ? 93 : 0);  // v128.load64_zero, v128.load
+            code.U32(0);
+            code.U64(offset);
+            StoreV128(index);
             break;
         }
         case Opcode::A32SetVector: {
@@ -3766,6 +3849,12 @@ private:
         if (IsConstant(slot)) {
             const Slot& constant = block.constants[slot - block.first_constant];
             code.I64Const(high ? constant.hi : constant.lo);
+            return;
+        }
+        if (vector_local[slot] != kNone) {
+            code.Get(vector_local[slot]);
+            SimdOp(29);  // i64x2.extract_lane
+            code.Byte(high ? 1 : 0);
             return;
         }
         code.Get(kFrame);
@@ -4085,8 +4174,12 @@ private:
 
     u32 next_local;
     const RegionLocals* cached;
+    u32 vector_base;
+    u32 vector_locals_used = 0;
     std::vector<bool> inline_op;
     std::vector<u32> value_local;
+    std::vector<u32> vector_local;
+    std::vector<bool> vector_defined;
     std::vector<u32> carry_local;
     std::vector<u32> overflow_local;
     std::vector<bool> spill;
@@ -4133,7 +4226,6 @@ public:
 
     bool CompileImpl(std::vector<u8>& out) {
         const u32 n = u32(blocks.size());
-        u32 locals_end = kLocalBase;
 
         if (target.a32) {
             // Guest registers, flags and the cycle budget live in locals for the whole region.
@@ -4149,6 +4241,14 @@ public:
             loader.ReloadState();
         }
         const RegionLocals* cached_ptr = cached ? &*cached : nullptr;
+        // The v128 locals of block values follow the i64 locals of the block that needs the most.
+        u32 locals_end = kLocalBase;
+        for (const CompiledBlock* block : blocks) {
+            BlockCompiler probe{*block, target, code, kLocalBase, cached_ptr};
+            probe.Prepare();
+            locals_end = std::max(locals_end, probe.LocalsEnd());
+        }
+        u32 vector_locals = 0;
 
         // Regions may be entered at any of their blocks: the loop dispatches on kCurrent to the
         // block's label, for entries and backward edges. Block i's code follows the end of label
@@ -4184,7 +4284,7 @@ public:
                 code.LoopStart();
                 self_loop_nest = code.nest;
             }
-            BlockCompiler compiler{block, target, code, kLocalBase, cached_ptr};
+            BlockCompiler compiler{block, target, code, kLocalBase, cached_ptr, locals_end};
             compiler.Prepare();
             if (block.cond != IR::Cond::AL) {
                 // Conditional A32 block: skip the body when the condition fails.
@@ -4198,7 +4298,7 @@ public:
             if (!compiler.Emit()) {
                 return false;
             }
-            locals_end = std::max(locals_end, compiler.LocalsEnd());
+            vector_locals = std::max(vector_locals, compiler.VectorLocalsUsed());
             SubtractCycles(block.cycle_count);
             EmitTerminal(compiler, block.terminal);
             Exit();
@@ -4216,7 +4316,7 @@ public:
             EmitChain();
         }
 
-        BuildModule(out, locals_end);
+        BuildModule(out, locals_end, vector_locals);
         return true;
     }
 
@@ -4476,7 +4576,7 @@ private:
         return loop_nest + block_count - index;
     }
 
-    void BuildModule(std::vector<u8>& out, u32 locals_end) {
+    void BuildModule(std::vector<u8>& out, u32 locals_end, u32 vector_locals) {
         Writer module;
         module.bytes = {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00};
 
@@ -4527,9 +4627,9 @@ private:
         exports.U32(0);
         Section(module, 7, exports);
 
-        // Local groups: i64 current + cached state, f32, f64, v128 scratch, then i64 values.
+        // Local groups: i64 current + cached state, f32, f64, v128 scratch, i64 values, v128 values.
         Writer body;
-        body.U32(5);
+        body.U32(vector_locals ? 6 : 5);
         body.U32(kF32A - 4);
         body.Byte(u8(ValType::I64));
         body.U32(2);
@@ -4540,6 +4640,10 @@ private:
         body.Byte(0x7B);  // v128
         body.U32(locals_end - kLocalBase);
         body.Byte(u8(ValType::I64));
+        if (vector_locals) {
+            body.U32(vector_locals);
+            body.Byte(0x7B);  // v128
+        }
         const u32 code_start = u32(body.bytes.size());
         body.Append(code);
         body.Byte(Insn::End);
